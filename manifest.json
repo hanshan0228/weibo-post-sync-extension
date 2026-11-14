@@ -1,0 +1,50 @@
+{
+  "manifest_version": 3,
+  "name": "Weibo Doc Sync Assistant",
+  "version": "1.0.44",
+  "description": "Auto fetch pending posts and images from Tencent/DingTalk Docs runtime, publish to Weibo AI Platform, and write back post URLs with Schedule Management.",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "Weibo Doc Sync Assistant"
+  },
+  "permissions": [
+    "tabs",
+    "activeTab",
+    "storage",
+    "scripting",
+    "alarms",
+    "declarativeNetRequest",
+    "debugger"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background/service_worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://docs.qq.com/*",
+        "*://alidocs.dingtalk.com/*"
+      ],
+      "js": ["content_scripts/doc_parser.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "*://ai-publish-platform.weibo.com/*",
+        "*://weibo.com/*",
+        "*://www.weibo.com/*",
+        "*://m.weibo.cn/*"
+      ],
+      "js": ["content_scripts/weibo_poster.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>微博与云文档同步助手</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- 顶部品牌与导航栏 -->
+    <header class="app-header">
+      <div class="brand">
+        <div class="logo-dot"></div>
+        <h1>云文档 ⇄ 微博发稿中台</h1>
+      </div>
+      <div class="header-right" style="display:flex;align-items:center;gap:6px;">
+        <button id="btnGlobalStop" class="btn-global-stop" style="display:none;" title="立即停止当前正在执行的任务流水线">⏹ 停止任务</button>
+        <button id="btnOpenInTab" class="btn-icon-link" title="在新标签页以独立大屏模式打开">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+            <polyline points="15 3 21 3 21 9"></polyline>
+            <line x1="10" y1="14" x2="21" y2="3"></line>
+          </svg>
+          大屏模式
+        </button>
+      </div>
+    </header>
+
+    <!-- 统一全局 Segmented 导航栏 -->
+    <nav class="nav-tabs" aria-label="主功能导航">
+      <button class="nav-tab active" id="tabNavSync">📋 同步发布</button>
+      <button class="nav-tab" id="tabNavSchedule">
+        ⏰ 定时管理 <span class="nav-badge" id="schedBadge" style="display:none;">0</span>
+      </button>
+      <button class="nav-tab" id="tabNavParser">✨ 任务解析</button>
+      <button class="nav-tab" id="tabNavLedger">📚 发博账本</button>
+      <button class="nav-tab" id="tabNavSettings">⚙️ 系统设置</button>
+    </nav>
+
+    <!-- 面板 1：同步发布 -->
+    <main id="panelSync" class="tab-panel active">
+      <section class="card config-card">
+        <div class="section-header">
+          <div class="section-title-group">
+            <span class="section-title">📚 多文档发布卡槽</span>
+            <span class="count-pill" id="docSlotsCount">2 个卡槽</span>
+          </div>
+          <div class="section-actions">
+            <button type="button" id="btnToggleDocSlots" class="btn-xs btn-outline" title="折叠或展开文档卡槽配置">🔼 收起</button>
+            <button type="button" id="btnAddDocSlot" class="btn-xs btn-outline">＋ 添加卡槽</button>
+          </div>
+        </div>
+
+        <div class="doc-slots-container" id="docSlotsContainer"></div>
+      </section>
+
+      <!-- 待发任务清单 (大面积舒展) -->
+      <section class="card task-card" id="taskSection">
+        <div class="section-header">
+          <div class="section-title-group">
+            <span class="section-title">待发任务清单</span>
+            <span class="count-pill" id="taskCountBadge">未扫描</span>
+          </div>
+          <div class="section-actions">
+            <button id="btnToggleSelectAll" class="btn-xs btn-outline" style="display: none;">全选/反选</button>
+            <button id="btnScanTasks" class="btn-sm btn-primary-outline">🔍 扫描全部文档</button>
+          </div>
+        </div>
+
+        <div id="taskFilterBar" style="display: none; margin-bottom: 8px;">
+          <input type="text" id="taskSearchInput" class="ui-input" style="height: 28px;" placeholder="🔍 搜索账号、来源文档或正文关键词...">
+          <div id="taskDocFilterChips" class="filter-chips-bar" style="display: none; margin-top: 6px;"></div>
+        </div>
+
+        <div class="list-scroll large-list" id="taskListContainer" style="max-height: 270px;">
+          <div class="empty-placeholder" id="taskEmptyPlaceholder">
+            填入在线表格链接后点击【🔍 扫描全部文档】<br>自动识别表头、账号、正文与九宫格配图素材
+          </div>
+        </div>
+      </section>
+
+      <!-- 控制按钮与进度条 -->
+      <section class="card action-card">
+        <div id="dryRunActiveBanner" style="display: none; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 10px; margin-bottom: 10px; background: #FEF3C7; border: 1px solid #F59E0B; border-radius: 6px; font-size: 11px; color: #92400E;">
+          <span>🛡️ 当前处于<b>【安全演练调试模式】</b>，不会真实发博</span>
+          <button type="button" id="btnDisableDryRunQuick" class="btn-xs btn-outline" style="background: #FFFFFF; border-color: #F59E0B; color: #92400E;">关闭演练</button>
+        </div>
+        <div class="btn-group">
+          <button id="btnAddToSchedule" class="btn btn-primary" title="将当前勾选任务加入定时队列">
+            ⏰ 定时发布
+          </button>
+          <button id="btnStart" class="btn btn-outline">
+            <span id="btnStartText">🚀 立即发布</span>
+          </button>
+          <button id="btnStop" class="btn btn-danger-outline" disabled>
+            ⏹ 停止
+          </button>
+        </div>
+
+        <div class="progress-wrap" id="progressWrap" style="display: none;">
+          <div class="progress-header">
+            <span id="progressStage">准备就绪</span>
+            <span id="progressPct">0%</span>
+          </div>
+          <div class="progress-track">
+            <div class="progress-bar" id="progressBar" style="width: 0%;"></div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- 面板 2：定时管理 -->
+    <main id="panelSchedule" class="tab-panel" style="display: none;">
+      <section class="card sched-queue-card">
+        <div class="section-header">
+          <div class="section-title-group">
+            <span class="section-title">⏰ 定时任务队列</span>
+            <span class="count-pill" id="schedQueueCount">0 条</span>
+          </div>
+          <div class="section-actions">
+            <button id="btnTogglePauseSched" class="btn-xs btn-outline" title="一键暂停或恢复所有定时任务自动触发">⏸ 暂停定时</button>
+            <button id="btnRefreshSched" class="btn-xs btn-outline">🔄 刷新</button>
+            <button id="btnClearDoneSched" class="btn-xs btn-outline" title="清理已完成的普通历史记录（保留需补写文档的条目）">🧹 清理已完成</button>
+            <button id="btnClearAllSched" class="btn-xs btn-outline danger-text" title="清空全部定时任务及后台闹钟">🗑️ 清空</button>
+          </div>
+        </div>
+
+        <!-- 定时队列全局挂起提示条 -->
+        <div id="schedPausedBanner" class="notice-banner warning" style="display: none;">
+          <span>⏸️ <b>定时队列已全局暂停</b>：到期任务暂不会自动触发</span>
+          <button id="btnResumeSchedQuick" class="btn-xs btn-primary">▶ 立即恢复</button>
+        </div>
+
+        <!-- 状态过滤与来源文档筛选 -->
+        <div class="filter-toolbar">
+          <div class="filter-chips" id="schedFilterChips">
+            <span class="filter-chip active" data-filter="pending">待触发 (0)</span>
+            <span class="filter-chip" data-filter="error">异常 (0)</span>
+            <span class="filter-chip" data-filter="done">已完成 (0)</span>
+            <span class="filter-chip" data-filter="all">全部 (0)</span>
+          </div>
+          <select id="schedDocFilter" class="ui-select" title="按来源文档筛选">
+            <option value="all">全部来源文档</option>
+          </select>
+        </div>
+
+        <div style="margin-bottom: 8px;">
+          <input type="text" id="schedSearchInput" class="ui-input" style="height: 28px;" placeholder="🔍 搜索账号、来源文档或正文关键词...">
+        </div>
+
+        <!-- 批量管理操作栏（平时仅显示全选/反选，勾选后展开批量操作按钮） -->
+        <div class="batch-toolbar" id="schedBatchToolbar">
+          <div class="batch-left">
+            <label class="checkbox-label">
+              <input type="checkbox" id="schedSelectAllCb">
+              <span>全选</span>
+            </label>
+            <button type="button" class="btn-xs btn-outline" id="btnSchedInvertSelect">反选</button>
+            <span class="batch-tip">已选 <strong id="schedSelectedCount">0</strong> 项</span>
+          </div>
+          <div class="batch-actions" id="schedBatchActions" style="display: none;">
+            <button type="button" class="btn-xs btn-outline" id="btnBatchDelay15" disabled title="将所选待触发/异常任务顺延15分钟">⏰ +15分</button>
+            <button type="button" class="btn-xs btn-outline" id="btnBatchDelay30" disabled title="将所选待触发/异常任务顺延30分钟">⏰ +30分</button>
+            <button type="button" class="btn-xs btn-primary-outline" id="btnBatchFireSched" disabled>
+              🚀 立即发布 (<span id="batchFireCount">0</span>)
+            </button>
+            <button type="button" class="btn-xs btn-danger-outline" id="btnBatchDeleteSched" disabled>
+              🗑️ 删除 (<span id="batchDelCount">0</span>)
+            </button>
+          </div>
+        </div>
+
+        <div class="list-scroll large-list" id="schedListContainer">
+          <div class="empty-placeholder">暂无待触发定时任务，可在【📋 同步发布】或【✨ 任务解析】中加入</div>
+        </div>
+      </section>
+    </main>
+
+    <!-- 面板 3：任务解析 -->
+    <main id="panelParser" class="tab-panel" style="display: none;">
+      <section class="card parser-card">
+        <div class="section-header">
+          <div class="section-title-group">
+            <span class="section-title">✨ 智能任务解析</span>
+            <span class="count-pill" id="parserCountBadge">尚未解析</span>
+          </div>
+          <div class="section-actions">
+            <button id="btnToggleParserInput" class="btn-xs btn-outline" title="收起或展开派单原文输入框">🔼 收起原文</button>
+            <button id="btnGoToSettingsFromParser" class="btn-xs btn-outline">过滤词/投票设置 ⚙️</button>
+            <button id="btnClearParser" class="btn-xs btn-outline">🗑️ 清空输入</button>
+          </div>
+        </div>
+
+        <textarea id="taskParserInput" rows="7" class="ui-textarea" placeholder="粘贴整段群聊派单文案，或单条微博投票链接 (https://weibo.com/UID/MID)..."></textarea>
+
+        <div class="parser-options-row" style="margin-top: 8px;">
+          <label class="checkbox-label highlight">
+            <input type="checkbox" id="taskParserPollQuickToggle">
+            <span>📊 优先作为投票任务解析</span>
+          </label>
+          <button id="btnParseTasks" class="btn-sm btn-primary">🔍 智能解析预览</button>
+        </div>
+
+        <div class="list-scroll large-list" id="parsedTasksPreviewContainer">
+          <div class="empty-placeholder">粘贴任务文本或微博投票链接后，点击【🔍 智能解析预览】</div>
+        </div>
+
+        <div class="btn-group mt-10">
+          <button id="btnParserToSchedule" class="btn btn-secondary" disabled>⏰ 一键转入定时队列</button>
+          <button id="btnParserRunNow" class="btn btn-primary" disabled>🚀 立即批量执行</button>
+        </div>
+      </section>
+    </main>
+
+    <!-- 面板 4：发博账本 -->
+    <main id="panelLedger" class="tab-panel" style="display: none;">
+      <section class="card ledger-card">
+        <div class="section-header">
+          <div class="section-title-group">
+            <span class="section-title">📚 历史发博流水账本</span>
+            <span class="count-pill" id="ledgerCountBadge">0 条记录</span>
+          </div>
+          <div class="section-actions">
+            <button id="btnCopyLedgerLinks" class="btn-xs btn-outline">📋 复制账号与链接</button>
+            <button id="btnExportLedgerCsv" class="btn-xs btn-outline">📥 导出 CSV</button>
+            <button id="btnClearLedger" class="btn-xs btn-outline danger-text">🗑️ 清空</button>
+          </div>
+        </div>
+
+        <div class="filter-toolbar" style="margin-bottom: 6px;">
+          <div class="filter-chips" id="ledgerFilterChips">
+            <span class="filter-chip active" data-ledger-filter="all">全部</span>
+            <span class="filter-chip" data-ledger-filter="live">真实发布</span>
+            <span class="filter-chip" data-ledger-filter="writeback_fail">回写失败</span>
+          </div>
+          <select id="ledgerDocFilter" class="ui-select">
+            <option value="all">全部来源文档</option>
+          </select>
+        </div>
+        <div style="margin-bottom: 8px;">
+          <input type="text" id="ledgerSearchInput" class="ui-input" style="height: 28px;" placeholder="🔍 搜索账号、来源文档或正文关键词...">
+        </div>
+
+        <div class="list-scroll large-list" id="ledgerListContainer">
+          <div class="empty-placeholder">暂无历史发博记录</div>
+        </div>
+      </section>
+    </main>
+
+    <!-- 面板 5：系统设置中心 (统一收拢全部功能开关与规则) -->
+    <main id="panelSettings" class="tab-panel" style="display: none;">
+      <!-- 卡片 1：全局发博与安全运行开关 -->
+      <section class="card settings-card mb-10">
+        <div class="section-header">
+          <span class="section-title">⚙️ 核心运行与安全策略</span>
+          <span class="count-pill">全局生效</span>
+        </div>
+
+        <div class="switches-group" style="margin-top: 0; padding-top: 0; border-top: none;">
+          <div class="switch-row">
+            <div class="switch-label-group">
+              <span class="switch-title">🛠️ 安全演练模式 (调试)</span>
+              <span class="switch-desc" id="dryRunDesc">调试专用：开启后仅验证文档抓取与中台装配，绝不向微博点击发送</span>
+            </div>
+            <label class="toggle-switch">
+              <input type="checkbox" id="dryRunToggle">
+              <span class="slider"></span>
+            </label>
+          </div>
+
+          <div class="switch-row">
+            <div class="switch-label-group">
+              <span class="switch-title">🔕 静默发布 (免打扰模式)</span>
+              <span class="switch-desc">普通图文在离屏小窗完成发博，不抢占主屏焦点（投票任务自动前台可见）</span>
+            </div>
+            <label class="toggle-switch">
+              <input type="checkbox" id="silentModeToggle" checked>
+              <span class="slider"></span>
+            </label>
+          </div>
+
+          <div class="switch-row">
+            <div class="switch-label-group">
+              <span class="switch-title">⏸️ 定时队列全局总闸</span>
+              <span class="switch-desc">紧急急停开关：开启后所有排程闹钟全部暂停触发</span>
+            </div>
+            <label class="toggle-switch">
+              <input type="checkbox" id="schedulePauseToggle">
+              <span class="slider"></span>
+            </label>
+          </div>
+        </div>
+      </section>
+
+      <!-- 卡片 2：任务解析过滤词库 -->
+      <section class="card filter-words-card mb-10">
+        <div class="section-header">
+          <span class="section-title">🧹 任务解析过滤清理词库</span>
+          <span class="count-pill">自动剔除</span>
+        </div>
+        <p style="font-size: 11px; color: var(--text-sub); margin-bottom: 6px;">解析群聊派单时，自动剔除以下干扰口癖（每行一个，正文原样保留）：</p>
+        <textarea id="taskParserStripKeywords" rows="3" class="ui-textarea" placeholder="输入需剔除的口癖，如：&#10;辛苦老师发布&#10;麻烦尽快发一下&#10;已核对"></textarea>
+      </section>
+
+      <!-- 卡片 3：账号别名字典 -->
+      <section class="card accounts-card">
+        <div class="section-header">
+          <div class="section-title-group">
+            <span class="section-title">🏷️ 账号别名智能映射</span>
+            <span class="count-pill" id="aliasCountBadge">0 个映射</span>
+          </div>
+          <div class="section-actions">
+            <button id="btnResetDefaultAliases" class="btn-xs btn-outline">🔄 恢复默认</button>
+            <button id="btnAddAliasRow" class="btn-xs btn-primary">＋ 新增映射</button>
+          </div>
+        </div>
+
+        <div class="notice-banner info">
+          <span>💡 解决表格简称（如 <code>BOOM</code>）与中台全称（如 <code>BOOM视频</code>）不一致问题</span>
+        </div>
+
+        <div class="quick-chips-row mb-10" id="quickAliasChips">
+          <span class="chips-label">快捷预设：</span>
+          <button type="button" class="chip" data-alias-from="对焦" data-alias-to="对焦Focus">对焦 → 对焦Focus</button>
+          <button type="button" class="chip" data-alias-from="BOOM" data-alias-to="BOOM视频">BOOM → BOOM视频</button>
+          <button type="button" class="chip" data-alias-from="军事" data-alias-to="新浪军事">军事 → 新浪军事</button>
+          <button type="button" class="chip" data-alias-from="健康派" data-alias-to="新浪健康派">健康派 → 新浪健康派</button>
+          <button type="button" class="chip" data-alias-from="手机" data-alias-to="新浪手机">手机 → 新浪手机</button>
+          <button type="button" class="chip" data-alias-from="出行" data-alias-to="新浪出行">出行 → 新浪出行</button>
+        </div>
+
+        <div class="list-scroll large-list" id="aliasListContainer" style="max-height: 180px;"></div>
+      </section>
+    </main>
+
+    <!-- 编辑定时任务模态弹窗 -->
+    <div class="modal-overlay" id="scheduleEditModal" style="display: none;">
+      <div class="modal-dialog">
+        <div class="modal-header">
+          <h3 class="modal-title">✏️ 编辑定时任务</h3>
+          <button type="button" class="modal-close-btn" id="btnEditModalClose">✕</button>
+        </div>
+        <div class="modal-body">
+          <input type="hidden" id="editModalTaskId">
+
+          <div class="modal-form-group">
+            <label class="modal-form-label">目标发布账号</label>
+            <input type="text" id="editModalAccount" class="ui-input" placeholder="输入中台目标账号名称...">
+          </div>
+
+          <div class="modal-form-group">
+            <label class="modal-form-label">计划发布时间</label>
+            <input type="datetime-local" id="editModalDateTime" class="ui-input">
+            <div class="quick-chips-row">
+              <span class="chips-label">快捷推迟：</span>
+              <button type="button" class="chip" data-edit-min="10">+10分</button>
+              <button type="button" class="chip" data-edit-min="30">+30分</button>
+              <button type="button" class="chip" data-edit-min="60">+1小时</button>
+              <button type="button" class="chip" data-edit-preset="tomorrow-10">明天 10:00</button>
+              <button type="button" class="chip" data-edit-preset="tomorrow-15">明天 15:00</button>
+            </div>
+          </div>
+
+          <div class="modal-form-group">
+            <label class="modal-form-label">执行模式</label>
+            <div class="sched-mode-radios">
+              <label class="mode-radio-pill is-dry"><input type="radio" name="editModalDryRun" value="true" checked> 🛡️ 安全演练</label>
+              <label class="mode-radio-pill is-live"><input type="radio" name="editModalDryRun" value="false"> 🚀 真实发博</label>
+            </div>
+          </div>
+
+          <div class="modal-form-group">
+            <div class="form-label-split">
+              <label class="modal-form-label">发博文案</label>
+              <span id="editModalCharCount" class="char-counter">0 字</span>
+            </div>
+            <textarea id="editModalContent" rows="5" class="ui-textarea" placeholder="输入微博正文内容..."></textarea>
+          </div>
+
+          <div class="modal-form-group" id="editModalImagesGroup" style="display: none;">
+            <label class="modal-form-label">已绑定的素材图片</label>
+            <div class="modal-images-row" id="editModalImagesList"></div>
+          </div>
+
+          <details class="collapsible-box">
+            <summary>📊 附加投票活动（可选 · 点击展开）</summary>
+            <div class="poll-fields-grid">
+              <input type="text" id="editModalPollTitle" class="ui-input" placeholder="投票标题说明 (留空则不挂载投票)...">
+              <div class="poll-opts-grid">
+                <input type="text" id="editModalPollOpt1" class="ui-input" placeholder="选项 1">
+                <input type="text" id="editModalPollOpt2" class="ui-input" placeholder="选项 2">
+                <input type="text" id="editModalPollOpt3" class="ui-input" placeholder="选项 3 (选填)">
+                <input type="text" id="editModalPollOpt4" class="ui-input" placeholder="选项 4 (选填)">
+              </div>
+              <div class="poll-days-row">
+                <span>投票周期：</span>
+                <label><input type="radio" name="editPollDays" value="1"> 1 天</label>
+                <label><input type="radio" name="editPollDays" value="3"> 3 天</label>
+                <label><input type="radio" name="editPollDays" value="7"> 7 天</label>
+                <label><input type="radio" name="editPollDays" value="30" checked> 一个月</label>
+              </div>
+            </div>
+          </details>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-outline" id="btnEditModalCancel">取消</button>
+          <button type="button" class="btn btn-secondary" id="btnEditModalSave">💾 保存修改</button>
+          <button type="button" class="btn btn-primary" id="btnEditModalFireNow">🚀 立即发布</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 加入定时队列确认弹窗 -->
+    <div class="modal-overlay" id="enqueueScheduleModal" style="display: none;">
+      <div class="modal-dialog enqueue-modal-dialog">
+        <div class="modal-header">
+          <h3 class="modal-title">⏰ 加入定时队列</h3>
+          <button type="button" class="modal-close-btn" id="btnEnqueueModalClose">✕</button>
+        </div>
+        <div class="modal-body">
+          <div class="notice-banner info" id="enqueueSummaryBanner" style="margin-bottom: 2px;">
+            <span>即将排入 <b id="enqueueTaskCount">0</b> 条任务到定时队列</span>
+          </div>
+
+          <div class="modal-form-group">
+            <label class="modal-form-label">排程时间规则</label>
+            <div class="sched-mode-radios" id="enqueueModeRadiosSync">
+              <label><input type="radio" name="schedMode" value="table" checked> 按表格标注时间（无时间默认+15分）</label>
+              <label><input type="radio" name="schedMode" value="custom"> 统一设定时刻</label>
+            </div>
+            <div class="sched-mode-radios" id="enqueueModeRadiosParser" style="display: none;">
+              <label><input type="radio" name="parserSchedMode" value="stagger" checked> 错峰依次发布（每条间隔5分钟）</label>
+              <label><input type="radio" name="parserSchedMode" value="custom"> 统一设定时刻</label>
+            </div>
+
+            <div id="customTimePickerWrap" class="sub-panel-box" style="display: none; margin-top: 6px;">
+              <div class="form-row">
+                <label class="form-label-inline">指定触发时间：</label>
+                <input type="datetime-local" id="customScheduleTime" class="ui-input flex-1">
+              </div>
+              <div class="quick-chips-row" style="margin-top: 6px;">
+                <span class="chips-label">快捷设定：</span>
+                <button type="button" class="chip" data-min="10">+10分钟</button>
+                <button type="button" class="chip" data-min="30">+30分钟</button>
+                <button type="button" class="chip" data-min="60">+1小时</button>
+                <button type="button" class="chip" data-min="120">+2小时</button>
+              </div>
+              <div class="form-row" style="margin-top: 8px;">
+                <label class="checkbox-label" style="font-size: 11.5px;">
+                  <input type="checkbox" id="customStaggerToggle">
+                  <span>自动错峰（多条任务依次顺延）</span>
+                </label>
+                <select id="customStaggerMinutes" class="ui-select" style="height: 24px; min-width: 78px;">
+                  <option value="2">每条 +2分</option>
+                  <option value="5" selected>每条 +5分</option>
+                  <option value="10">每条 +10分</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div class="modal-form-group">
+            <label class="modal-form-label">入队执行模式（可在此二次确认）</label>
+            <div class="sched-mode-radios">
+              <label class="mode-radio-pill is-dry"><input type="radio" name="enqueueDryRun" value="true" checked> 🛡️ 安全演练（不真实发博）</label>
+              <label class="mode-radio-pill is-live"><input type="radio" name="enqueueDryRun" value="false"> 🚀 真实发博（实盘发布）</label>
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-outline" id="btnEnqueueCancel">取消</button>
+          <button type="button" class="btn btn-primary" id="btnEnqueueConfirm">⏰ 确认加入定时队列</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 图片放大预览弹窗 (Lightbox) -->
+    <div class="modal-overlay image-preview-overlay" id="imagePreviewModal" style="display: none;">
+      <div class="image-preview-dialog">
+        <div class="image-preview-header">
+          <span class="image-preview-counter" id="imagePreviewCounter">1 / 1</span>
+          <button type="button" class="modal-close-btn image-preview-close" id="btnImagePreviewClose" title="关闭预览 (Esc)">✕</button>
+        </div>
+        <div class="image-preview-stage">
+          <button type="button" class="image-preview-nav prev" id="btnImagePreviewPrev" title="上一张">‹</button>
+          <img id="imagePreviewImg" class="image-preview-img" referrerpolicy="no-referrer" alt="配图放大预览">
+          <button type="button" class="image-preview-nav next" id="btnImagePreviewNext" title="下一张">›</button>
+        </div>
+        <div class="image-preview-caption" id="imagePreviewCaption"></div>
+      </div>
+    </div>
+
+    <!-- 底部可折叠日志视窗 -->
+    <section class="card log-card collapsible" id="logSection">
+      <div class="log-header" id="logHeaderToggle">
+        <div class="log-header-left">
+          <span class="log-collapse-arrow collapsed" id="logArrow">▼</span>
+          <span>运行状态日志</span>
+          <span class="log-status-peek" id="logStatusPeek">就绪</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <button id="btnCopyLog" class="btn-text" title="复制全部运行日志">📋 复制</button>
+          <button id="btnClearLog" class="btn-text">清空</button>
+        </div>
+      </div>
+      <div class="log-window collapsed" id="logWindow">
+        <div class="log-item info">系统已就绪，支持在线表格直读、发稿中台图文分发与微博首页投票准备。</div>
+      </div>
+    </section>
+
+    <footer class="app-footer">
+      <span>云文档直读 · 中台静默发博 · 原生闹钟调度</span>
+    </footer>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
