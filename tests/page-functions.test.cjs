@@ -612,7 +612,7 @@ test('跳转到wb-list导致window上下文丢失时，可通过sessionStorage._
         : null,
     },
     window: {},
-    document: { body: {}, querySelectorAll: () => [row], addEventListener() {}, removeEventListener() {} },
+    document: { body: {}, querySelectorAll: (sel) => sel.includes('columnheader') ? [{ innerText: '发布账号' }] : [row], addEventListener() {}, removeEventListener() {} },
   });
   const res = await c.directRecoverPublishedWeiboUrl('Mock账号', '目标正文');
   assert.equal(res.ok, true);
@@ -782,7 +782,7 @@ test('若接口和DOM最多仅拿到3项且存在vote.weibo.com，触发独立�
   assert.equal(res.fallbackResult.pollOptions.length, 3);
 });
 
-test('微博列表无账号列且正文末尾附带t.cn短链时可正确核对并提取回执短链', async () => {
+test('微博列表无账号列时不能将相同正文的链接归属到目标账号', async () => {
   const targetContent = '#热知识点#测试正文内容，附带原链 http://t.cn/ORIG999 看看效果';
   const now = new Date(1_002_000);
   const pad = (n) => String(n).padStart(2, '0');
@@ -833,8 +833,8 @@ test('微博列表无账号列且正文末尾附带t.cn短链时可正确核对�
     },
   });
   const res = await c.directRecoverPublishedWeiboUrl('虚构测试账号', targetContent);
-  assert.equal(res.ok, true);
-  assert.equal(res.postUrl, 'http://t.cn/MOCK1234');
+  assert.equal(res.ok, false);
+  assert.notEqual(res.postUrl, 'http://t.cn/MOCK1234');
 });
 
 
@@ -1547,6 +1547,20 @@ test('directPostToWeiboPlatform支持跨Tab一次勾选多账号并精准映射�
   assert.equal(res.postUrlsByAccount['虚构主号'], 'https://weibo.com/111111/MAIN01');
   assert.equal(res.postUrlsByAccount['虚构小号A'], 'https://weibo.com/222222/SUBA02');
   assert.equal(res.postUrlsByAccount['虚构小号B'], 'https://weibo.com/333333/SUBB03');
+});
+
+test('群发非首账号可凭提交上下文恢复，正文自带旧直链不可充当回执', async () => {
+  const content = '正文 https://weibo.com/123456/OLD';
+  const old = 'https://weibo.com/123456/OLD';
+  const cells = [{ innerText: content, getAttribute: () => null }, { innerText: '虚构小号', getAttribute: () => null }, { innerText: '1970-01-01 00:16:42', getAttribute: () => null }];
+  const row = { innerText: content, innerHTML: `<a href="${old}">${old}</a>`, closest: () => null,
+    querySelector: (sel) => sel.includes('a[href') ? { href: old } : null,
+    querySelectorAll: (sel) => sel.includes('td') ? cells : [] };
+  const c = load({ window: { __weiboSyncSubmission: { account: '虚构主号', accounts: ['虚构主号', '虚构小号'], content, submitted: true, startedAt: 1_000_000 } },
+    document: { body: {}, addEventListener() {}, removeEventListener() {}, querySelectorAll: (sel) => sel.includes('columnheader') ? [{ innerText: '发布账号' }] : [row] } });
+  const result = await c.directRecoverPublishedWeiboUrl('虚构小号', content);
+  assert.equal(result.ok, false);
+  assert.doesNotMatch(result.error, /缺少本次提交上下文/);
 });
 
 

@@ -39,7 +39,8 @@ function harness(initial = {}) {
 }
 function stubPipeline(h, result = { ok: true, postUrl: 'https://weibo.com/123456/Abc123', dryRun: false }) {
   h.context.testResult = result;
-  h.run(`findOrCreateTab = async () => ({ id: 7 });
+  h.run(`verifyCurrentDocumentTasks = async () => {};
+    findOrCreateTab = async () => ({ id: 7 });
     waitForTabLoaded = async () => ({ id: 7, url: 'https://ai-publish-platform.weibo.com/#/post', status: 'complete' });
     createSilentRunnerWindow = async () => ({ window: { id: 8 }, tab: { id: 7 } });
     executeInTabDirect = async (id, func) => {
@@ -51,6 +52,27 @@ function stubPipeline(h, result = { ok: true, postUrl: 'https://weibo.com/123456
 }
 const task = { id: 'parsed_1', account: 'Mock账号', content: 'Mock正文', row: 2, docId: 'slot_1',
   docUrl: 'https://docs.qq.com/sheet/MOCK', targetCell: 'E2', targetSheetId: 'mock_sheet' };
+
+test('清空账本串行保留全部待回写和待核对证据', async () => {
+  const retained = Array.from({ length: 650 }, (_, i) => ({ id: `r${i}`, mode: '真实发布', postUrl: `https://weibo.com/detail/${i}`, writeBackOk: false }));
+  const h = harness({ publishLedger: [{ id: 'pending', mode: '真实发布', submittedWithoutReceipt: true }, retained[0]], __unwrittenReceipts__: retained });
+  const response = await h.send({ action: 'CLEAR_PUBLISH_LEDGER' });
+  assert.equal(response.ok, true);
+  assert.equal(h.data.publishLedger.length, 0);
+  assert.equal(h.data.__unwrittenReceipts__.length, 651);
+  assert.equal(new Set(h.data.__unwrittenReceipts__.map(item => item.id)).size, 651);
+});
+
+test('清空与后台新增回执并发时不丢失新记录', async () => {
+  const h = harness({ publishLedger: [], __unwrittenReceipts__: [] });
+  const add = h.run(`withScheduleMutation(async () => {
+    const { publishLedger = [] } = await chrome.storage.local.get(['publishLedger']);
+    await chrome.storage.local.set({ publishLedger: [{ id: 'new', mode: '真实发布', postUrl: 'https://weibo.com/detail/MOCK', writeBackOk: false }, ...publishLedger] });
+  })`);
+  const clear = h.send({ action: 'CLEAR_PUBLISH_LEDGER' });
+  await Promise.all([add, clear]);
+  assert.ok([...h.data.publishLedger, ...h.data.__unwrittenReceipts__].some(item => item.id === 'new'));
+});
 
 test('STOP只请求取消，不提前释放流水线排他锁', async () => {
   const h = harness();
@@ -68,6 +90,31 @@ test('演练不回写真实云文档，也不生成真实已发布计数', async
   const completed = h.messages.find(m => m.action === 'TASK_ITEM_COMPLETED').payload;
   assert.equal(completed.dryRun, true); assert.equal(completed.writeBackOk, false); assert.equal(completed.docId, 'slot_1');
 });
+test('真实发布前复核失败时不会调用发布函数', async () => {
+  const h = harness();
+  h.run('var actualPreflight = verifyCurrentDocumentTasks');
+  stubPipeline(h);
+  h.run(`verifyCurrentDocumentTasks = actualPreflight;
+    executeInTabDirect = async (_id, fn) => {
+      if (fn === directExtractDocTasks) return { ok: true, tasks: [] };
+      if (fn === directPostToWeiboPlatform) { chrome.runtime.sendMessage({ action: 'TEST_POST' }); return { ok: true }; }
+      return { ok: true };
+    };`);
+  await assert.rejects(h.run(`startPipeline(${JSON.stringify({ dryRun: false, selectedTasks: [task] })})`), /重新扫描/);
+  assert.equal(h.messages.some(m => m.action === 'TEST_POST'), false);
+});
+
+test('旧定时任务复核所得快照会随发布回执保存', async () => {
+  const scheduled = { ...task, id: 'sched_mock', fromSchedule: true };
+  const h = harness({ scheduledTasks: [scheduled] });
+  stubPipeline(h);
+  h.run(`verifyCurrentDocumentTasks = async (_tab, items) => {
+    items[0].task.writeSnapshot = { account: 'Mock账号', content: 'Mock正文', accountCol: 0 };
+  };`);
+  await h.run(`startPipeline(${JSON.stringify({ dryRun: false, selectedTasks: [scheduled] })})`);
+  assert.equal(h.data.scheduledTasks[0].writeSnapshot.content, 'Mock正文');
+});
+
 test('拦截重复发博时不得释放上一次仍有效的锁', async () => {
   const key = 'post::Mock账号::Mock正文';
   const h = harness({ __publishClaims__: { [key]: Date.now() } });
@@ -101,6 +148,53 @@ test('明确未提交的失败会释放内容锁，允许立刻重试同一文�
   const summary = await h.run(`startPipeline(${JSON.stringify({ dryRun: false, selectedTasks: [task] })})`);
   assert.equal(summary.published, 1);
 });
+test('注入前持久化群发成员，中断后重启及锁过期仍阻断定时重发', async () => {
+  const scheduled = [task, { ...task, id: 'sched_mock_2', fromSchedule: true, account: 'Mock账号二', row: 3, targetCell: 'E3' }];
+  scheduled[0] = { ...scheduled[0], id: 'sched_mock_1', fromSchedule: true };
+  const h = harness({ scheduledTasks: scheduled }); stubPipeline(h);
+  h.run(`executeInTabDirect = async (_id, fn) => {
+    if (fn === directPostToWeiboPlatform) {
+      const saved = await chrome.storage.local.get(['publishLedger']);
+      if (saved.publishLedger.length !== 2 || !saved.publishLedger.every(x => x.submittedWithoutReceipt)) throw new Error('落盘时序错误');
+      throw new Error('Mock中断');
+    }
+    return { ok: true };
+  };`);
+  await assert.rejects(h.run(`startPipeline(${JSON.stringify({ dryRun: false, selectedTasks: scheduled })})`), /Mock中断/);
+  const restarted = harness({ ...h.data, __publishClaims__: {} }); stubPipeline(restarted);
+  for (const item of scheduled) {
+    await assert.rejects(restarted.run(`startPipeline(${JSON.stringify({ dryRun: false, selectedTasks: [item] })})`), /缺少回执/);
+  }
+  assert.equal(restarted.data.publishLedger.filter(x => x.submittedWithoutReceipt).length, 2);
+});
+
+test('缺少发布按钮明确未提交并撤销待确认记录', async () => {
+  const h = harness();
+  assert.match(h.run('directPostToWeiboPlatform.toString()'), /submitted:\s*false,\s*error:\s*"未在发稿页定位到【保存并发布】提交按钮"/);
+  stubPipeline(h, { ok: false, submitted: false, error: '未在发稿页定位到【保存并发布】提交按钮' });
+  await assert.rejects(h.run(`startPipeline(${JSON.stringify({ dryRun: false, selectedTasks: [task] })})`), /未在发稿页定位/);
+  assert.equal(h.data.publishLedger.length, 0);
+  assert.equal(h.data.__unwrittenReceipts__.length, 0);
+});
+
+test('待确认账号正文换文档行且锁过期仍阻止重发', async () => {
+  const pending = { id: 'pending', submittedWithoutReceipt: true, resolvedAccount: task.account, fullContent: task.content,
+    docUrl: task.docUrl, targetCell: task.targetCell };
+  const h = harness({ publishLedger: [pending], __publishClaims__: {} }); stubPipeline(h);
+  const moved = { ...task, docUrl: 'https://docs.qq.com/sheet/OTHER', targetCell: 'E99', row: 99, content: ` ${task.content} ` };
+  await assert.rejects(h.run(`startPipeline(${JSON.stringify({ dryRun: false, selectedTasks: [moved] })})`), /缺少回执/);
+  assert.equal(h.data.publishLedger.length, 1);
+});
+
+test('成功回执升级待确认记录，且不遗留待确认副本', async () => {
+  const h = harness(); stubPipeline(h);
+  await h.run(`startPipeline(${JSON.stringify({ dryRun: false, selectedTasks: [task] })})`);
+  assert.equal(h.data.publishLedger.length, 1);
+  assert.equal(h.data.publishLedger[0].postUrl, 'https://weibo.com/123456/Abc123');
+  assert.equal(h.data.publishLedger.some(x => x.submittedWithoutReceipt), false);
+  assert.equal(h.data.__unwrittenReceipts__.some(x => x.submittedWithoutReceipt), false);
+});
+
 test('已明确未提交的失败不得恢复其他博文链接并伪报成功', async () => {
   const h = harness(); stubPipeline(h, { ok: false, submitted: false, error: '未找到目标账号' });
   await assert.rejects(h.run(`startPipeline(${JSON.stringify({ dryRun: false, selectedTasks: [task] })})`), /未找到目标账号/);
@@ -109,7 +203,9 @@ test('已明确未提交的失败不得恢复其他博文链接并伪报成功',
 test('真实发布缺回执必须失败，不制造mock链接', async () => {
   const h = harness(); stubPipeline(h, { ok: true, dryRun: false });
   await assert.rejects(h.run(`startPipeline(${JSON.stringify({ dryRun: false, selectedTasks: [task] })})`), /回执|链接/);
-  assert.equal(h.data.publishLedger?.length || 0, 0);
+  assert.equal(h.data.publishLedger.length, 1);
+  assert.equal(h.data.publishLedger[0].submittedWithoutReceipt, true);
+  assert.equal(h.data.publishLedger[0].postUrl, '');
 });
 test('发布已成功但写回异常仍保留回执与完成状态，防止重发', async () => {
   const h = harness({ scheduledTasks: [{ ...task, id: 'sched_1', status: 'firing' }] }); stubPipeline(h);
@@ -438,8 +534,8 @@ test('钉钉文档扫描与反链接回写走allFrames接口读取与回读校�
   assert.equal(tasks[0].targetCell, 'C2');
 
   const writeRes = await h.run(`writeDingTalkCellInTab(88, 'C2', 'https://weibo.com/999/MockPost', 's1')`);
-  assert.equal(writeRes.ok, true);
-  assert.equal(writeRes.value, 'https://weibo.com/999/MockPost');
+  assert.equal(writeRes.ok, false);
+  assert.match(writeRes.error, /阻断写入/);
 });
 
 test('钉钉写回不切用户当前页，也不在前台窗口点鼠标', async () => {
@@ -596,7 +692,7 @@ test('钉钉文档接口拉取挂起超时时熔断退出不永久卡死', async
   assert.equal(attempts, 15);
 });
 
-test('钉钉写回遇到debugger残留可自愈detach，收到超时信号立即中止并释放debugger', async () => {
+test('钉钉写回收到超时信号时不连接debugger', async () => {
   const h = harness();
   const calls = [];
   let attachCount = 0;
@@ -614,8 +710,9 @@ test('钉钉写回遇到debugger残留可自愈detach，收到超时信号立即
   };
   const res = await h.run(`writeDingTalkCellInTab(9, 'H2', 'https://weibo.com/123/Abc', '', { signal: { aborted: true } })`);
   assert.equal(res.ok, false);
-  assert.ok(attachCount >= 2, '遇到残留debugger应先detach再重连');
-  assert.ok(calls.filter((c) => c[0] === 'detach' && c[1] === 9).length >= 2, '自愈detach与finally释放detach均应执行');
+  assert.match(res.error, /中止/);
+  assert.equal(attachCount, 0);
+  assert.equal(calls.length, 0);
 });
 
 test('结果页未取到链接时回退微博列表严格核对回执并写回文档', async () => {
@@ -664,8 +761,22 @@ test('handleRetryWriteBack仅执行文档补写并同步更新scheduledTasks与p
   assert.equal(postCalled, false);
   assert.equal(h.data.scheduledTasks[0].writeBackOk, true);
   assert.equal(h.data.scheduledTasks[0].writeBackError, '');
-  assert.equal(h.data.publishLedger[0].writeBackOk, true);
+  assert.equal(h.data.publishLedger[0].writeBackOk, false);
   assert.equal(h.data.__unwrittenReceipts__.length, 0);
+});
+
+test('补写仅清除同文档同子表的隔离回执', async () => {
+  const base = { docUrl: 'https://docs.qq.com/sheet/mock', targetCell: 'E8', targetSheetId: 'sheet-a', postUrl: 'https://weibo.com/123/RetryOk' };
+  const otherDoc = { ...base, docUrl: 'https://docs.qq.com/sheet/other' };
+  const otherSheet = { ...base, targetSheetId: 'sheet-b' };
+  const h = harness({ publishLedger: [{ ...base, id: 'a' }, { ...base, id: 'b' }, { ...otherSheet, id: 'c' }], __unwrittenReceipts__: [base, otherDoc, otherSheet] });
+  h.run(`findOrCreateTab = async () => ({id: 77}); waitForTabLoaded = async () => {}; executeInTabDirect = async () => ({ok: true});`);
+  const result = await h.run(`handleRetryWriteBack(${JSON.stringify({ ...base, ledgerId: 'a' })})`);
+  assert.equal(result.ok, true);
+  assert.equal(h.data.publishLedger[0].writeBackOk, true);
+  assert.equal(h.data.publishLedger[1].writeBackOk, undefined);
+  assert.equal(h.data.publishLedger[2].writeBackOk, undefined);
+  assert.equal(h.data.__unwrittenReceipts__.length, 2);
 });
 
 test('handleBatchRescheduleTasks支持批量顺延待触发和异常任务并拒绝已完成或发布中任务', async () => {
@@ -804,14 +915,34 @@ test('合并群发批次个别账号缺回执时先落盘其余账号台账再�
     () => h.run(`startPipeline(${JSON.stringify({ docs: [], dryRun: false, silentMode: true, selectedTasks })})`),
     /虚构小号2/
   );
-  assert.equal(h.data.publishLedger.length, 2);
+  assert.equal(h.data.publishLedger.length, 3);
   assert.deepEqual(
     h.data.publishLedger.map((item) => item.resolvedAccount).sort(),
-    ['虚构主号', '虚构小号1'].sort()
+    accounts.slice().sort()
   );
+  const missing = h.data.publishLedger.find((item) => item.resolvedAccount === '虚构小号2');
+  assert.equal(missing.postUrl, '');
+  assert.equal(missing.submittedWithoutReceipt, true);
   for (const acct of accounts) {
     assert.ok(h.data.__publishClaims__[`post::${acct}::缺回执批次正文`], `账号 ${acct} 的锁不应被提前释放`);
   }
+  assert.equal(h.data.__unwrittenReceipts__.some((item) => item.submittedWithoutReceipt && item.resolvedAccount === '虚构小号2'), true);
+  await assert.rejects(() => h.run(`startPipeline(${JSON.stringify({ docs: [], dryRun: false, silentMode: true, selectedTasks: [selectedTasks[2]] })})`), /已提交但缺少回执/);
+});
+
+test('群发两个账号返回同一回执链接时不能写回任一账号', async () => {
+  const h = harness();
+  stubPipeline(h);
+  h.run(`executeInTabDirect = async (_id, fn) => {
+    if (fn === directPostToWeiboPlatform) return { ok: true, submitted: true, postUrl: 'https://weibo.com/100001/ABC', postUrlsByAccount: { '虚构甲': 'https://weibo.com/100001/ABC', '虚构乙': 'https://weibo.com/100001/ABC' } };
+    if (fn === directRecoverPublishedWeiboUrl) return { ok: false };
+    if (fn === directWriteCellToDoc) throw new Error('不应写入');
+    return { ok: true, ready: true };
+  };`);
+  const tasks = ['虚构甲', '虚构乙'].map((account, i) => ({ account, content: '重复回执测试', row: i + 1, targetCell: '-' }));
+  await assert.rejects(() => h.run(`startPipeline(${JSON.stringify({ dryRun: false, selectedTasks: tasks })})`), /回执/);
+  assert.equal(h.data.publishLedger.length, 2);
+  assert.ok(h.data.publishLedger.every((item) => item.submittedWithoutReceipt && !item.postUrl));
 });
 
 test('发博页残留上一次结果弹窗时自动刷新并重试一次而不是整批中断', async () => {

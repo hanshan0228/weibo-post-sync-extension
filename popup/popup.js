@@ -595,6 +595,7 @@ document.addEventListener("DOMContentLoaded", async () => {
           docName: t.docName,
           docUrl: t.docUrl,
           targetSheetId: t.targetSheetId,
+          writeSnapshot: t.writeSnapshot,
           row: t.row,
           targetCell: t.targetCell,
           account: t.account,
@@ -2306,9 +2307,21 @@ document.addEventListener("DOMContentLoaded", async () => {
     });
   });
 
+  async function getVisibleLedger() {
+    const { publishLedger = [], __unwrittenReceipts__ = [] } = await chrome.storage.local.get(["publishLedger", "__unwrittenReceipts__"]);
+    const seen = new Set();
+    return [...publishLedger, ...__unwrittenReceipts__].filter((item) => {
+      if (!item) return false;
+      if (!item.id) return true;
+      if (seen.has(item.id)) return false;
+      seen.add(item.id);
+      return true;
+    });
+  }
+
   async function renderLedgerList() {
     if (!ledgerListContainer) return;
-    const { publishLedger = [] } = await chrome.storage.local.get(["publishLedger"]);
+    const publishLedger = await getVisibleLedger();
 
     // 填充文档筛选下拉框
     if (ledgerDocFilter) {
@@ -2345,6 +2358,12 @@ document.addEventListener("DOMContentLoaded", async () => {
       const retryWriteBackBtnHtml = canRetryWriteBack
         ? `<button type="button" class="sched-btn-clean primary btn-retry-ledger-writeback" data-idx="${idx}">📝 补写文档</button>`
         : "";
+      const manualReceiptHtml = item.id && item.mode === "真实发布" && item.submittedWithoutReceipt && !item.postUrl
+        ? `<div style="display:flex;gap:6px;margin:8px 0;"><input class="ledger-manual-url" type="url" placeholder="粘贴已发布微博链接" aria-label="微博链接" style="flex:1;min-width:0;"><button type="button" class="sched-btn-clean primary btn-manual-receipt" data-idx="${idx}">保存并补写</button></div>`
+        : "";
+      const resolvePendingHtml = item.id && item.mode === "真实发布" && item.submittedWithoutReceipt && !item.postUrl
+        ? `<button type="button" class="sched-btn-clean btn-resolve-pending" data-idx="${idx}" title="仅在你已到中台确认该账号确实没有发布成功时使用">✅ 已核实未发布，解除阻断</button>`
+        : "";
       const writeBackWarnHtml = (!item.writeBackOk && item.writeBackError)
         ? `<div style="font-size:11px;color:#92400E;background:#FFFBEB;padding:4px 8px;border-radius:4px;border:1px solid #FDE68A;">⚠ 回写失败原因: ${escapeHtml(item.writeBackError)}</div>`
         : "";
@@ -2361,11 +2380,14 @@ document.addEventListener("DOMContentLoaded", async () => {
               <span class="sched-status-pill ${item.mode === "真实发布" ? "done" : "pending"}">${escapeHtml(item.mode || "发布")}</span>
             </div>
           </div>
-          <div class="sched-card-content ledger-content-toggle" data-idx="${idx}" title="点击切换完整正文">${escapeHtml(item.contentSummary || "")}</div>
+          <div class="sched-card-content ledger-content-toggle" data-idx="${idx}" title="点击切换完整正文">${escapeHtml(item.contentSummary || item.fullContent || item.content || "")}</div>
+          ${item.submittedWithoutReceipt ? '<div style="color:#92400E;font-size:11px;">已提交但未取得回执，请核对账号和正文后补录链接</div>' : ""}
+          ${manualReceiptHtml}
+          ${resolvePendingHtml}
           ${writeBackWarnHtml}
           <div class="sched-card-footer" style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
             <div class="sched-card-tags">
-              ${item.postUrl ? `<a href="${escapeHtml(item.postUrl)}" target="_blank" title="${escapeHtml(item.postUrl)}" style="color:var(--primary);text-decoration:none;font-weight:600;">🔗 查看微博 ↗</a>` : `<span style="color:var(--text-sub);font-size:11px;">无链接（演练/草稿）</span>`}
+              ${item.postUrl ? `<a href="${escapeHtml(item.postUrl)}" target="_blank" title="${escapeHtml(item.postUrl)}" style="color:var(--primary);text-decoration:none;font-weight:600;">🔗 查看微博 ↗</a>` : `<span style="color:var(--text-sub);font-size:11px;">${item.submittedWithoutReceipt ? "待人工核对链接" : "无链接（演练/草稿）"}</span>`}
             </div>
             <div style="display:flex;align-items:center;gap:6px;">
               ${retryWriteBackBtnHtml}
@@ -2383,7 +2405,39 @@ document.addEventListener("DOMContentLoaded", async () => {
         const item = filtered[idx];
         if (!item) return;
         const expanded = el.classList.toggle("is-expanded");
-        el.textContent = expanded ? (item.fullContent || item.contentSummary || "") : (item.contentSummary || "");
+        el.textContent = expanded ? (item.fullContent || item.content || item.contentSummary || "") : (item.contentSummary || item.fullContent || item.content || "");
+      });
+    });
+
+    ledgerListContainer.querySelectorAll(".btn-resolve-pending").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const item = filtered[parseInt(btn.dataset.idx, 10)];
+        if (!item) return;
+        if (!confirm(`⚠️ 请先到中台确认账号【${item.account || "默认账号"}】确实没有发布成功。\n\n解除后将允许相同账号与正文重新发布；若实际已发布，将造成重复发博。\n\n确定已核实未发布并解除阻断吗？`)) return;
+        btn.disabled = true;
+        try {
+          const resp = await chrome.runtime.sendMessage({ action: "RESOLVE_PENDING_SUBMISSION", payload: { ledgerId: item.id } });
+          if (!resp?.ok) appendLog(`解除阻断失败: ${resp?.error || "未知异常"}`, "error");
+          else appendLog("已解除待核对阻断，该账号与正文可重新发布", "success");
+        } catch (err) {
+          appendLog(`解除阻断通信异常: ${err?.message || String(err)}`, "error");
+        } finally { await renderLedgerList(); }
+      });
+    });
+
+    ledgerListContainer.querySelectorAll(".btn-manual-receipt").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const item = filtered[parseInt(btn.dataset.idx, 10)];
+        const postUrl = btn.parentElement?.querySelector(".ledger-manual-url")?.value.trim();
+        if (!item || !postUrl) { appendLog("请输入微博链接", "error"); return; }
+        btn.disabled = true;
+        try {
+          const resp = await chrome.runtime.sendMessage({ action: "MANUAL_RECEIPT_WRITE_BACK", payload: { ledgerId: item.id, postUrl } });
+          if (!resp?.ok) appendLog(`人工补录失败: ${resp?.error || "未知异常"}`, "error");
+          else appendLog("微博链接已保存并补写成功", "success");
+        } catch (err) {
+          appendLog(`人工补录通信异常: ${err?.message || String(err)}`, "error");
+        } finally { await renderLedgerList(); }
       });
     });
 
@@ -2436,7 +2490,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   }
 
   btnCopyLedgerLinks?.addEventListener("click", async () => {
-    const { publishLedger = [] } = await chrome.storage.local.get(["publishLedger"]);
+    const publishLedger = await getVisibleLedger();
     const filtered = filterLedgerItems(publishLedger);
     const lines = filtered
       .filter((item) => item && item.mode === "真实发布")
@@ -2499,25 +2553,14 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   btnClearLedger?.addEventListener("click", async () => {
     if (!confirm("确定要清空全部历史发博流水账本吗？清空后无法恢复。")) return;
-    const { publishLedger = [], __unwrittenReceipts__ = [] } = await chrome.storage.local.get([
-      "publishLedger",
-      "__unwrittenReceipts__",
-    ]);
-    const unwritten = publishLedger.filter(
-      (item) => item && item.mode === "真实发布" && item.postUrl && !item.writeBackOk
-    );
-    const mergedUnwritten = [...unwritten, ...__unwrittenReceipts__].slice(0, 500);
-    await chrome.storage.local.set({
-      publishLedger: [],
-      __unwrittenReceipts__: mergedUnwritten,
-    });
-    renderLedgerList();
-    appendLog(
-      unwritten.length > 0
-        ? `已清空历史账本界面（已自动保留 ${unwritten.length} 条未回写真实发博的防重回执）`
-        : "已清空历史发博流水账本",
-      "info"
-    );
+    try {
+      const response = await chrome.runtime.sendMessage({ action: "CLEAR_PUBLISH_LEDGER" });
+      if (!response?.ok) throw new Error(response?.error || "清空账本失败");
+      await renderLedgerList();
+      appendLog(`已清空历史账本界面，保留 ${response.retained} 条待核对或未回写记录`, "info");
+    } catch (error) {
+      appendLog(`清空账本失败: ${error?.message || String(error)}`, "error");
+    }
   });
 
   // ── 14. 账号别名智能映射字典控制器 (Alias Dictionary) ──

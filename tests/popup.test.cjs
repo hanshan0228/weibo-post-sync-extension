@@ -360,7 +360,7 @@ test('开关运行模式交由后台处理，不直接重写定时任务', async
   assert.ok(app.sent.some((request) => request.action === 'SET_DRY_RUN_MODE' && request.dryRun === false));
 });
 
-test('清空账本时已发博未回写成功的真实回执被安全隔离备份', async () => {
+test('清空账本请求交给后台串行处理', async () => {
   const app = await loadPopup({
     publishLedger: [
       { id: 'item_1', mode: '真实发布', postUrl: 'https://weibo.com/123/Abc', writeBackOk: false },
@@ -371,9 +371,9 @@ test('清空账本时已发博未回写成功的真实回执被安全隔离备�
   });
   const btnClear = app.elements.get('btnClearLedger');
   await btnClear.click();
-  assert.deepEqual(app.storage.publishLedger, []);
-  assert.equal(app.storage.__unwrittenReceipts__.length, 1);
-  assert.equal(app.storage.__unwrittenReceipts__[0].id, 'item_1');
+  assert.ok(app.sent.some((request) => request.action === 'CLEAR_PUBLISH_LEDGER'));
+  assert.equal(app.storage.publishLedger.length, 3);
+  assert.equal(app.storage.__unwrittenReceipts__.length, 0);
 });
 
 test('含图投票草稿装配在卡片上展示需人工补传', async () => {
@@ -542,6 +542,18 @@ test('带转发链接的多段@账号派单文本可剥离头部并精准拆分�
   const queued = app.sent.find((m) => m.action === 'ADD_SCHEDULE_TASKS');
   assert.equal(queued.tasks[0].repostUrl, 'https://weibo.com/6723451236/Rr20v8BXT');
   assert.equal(queued.tasks[0].commentOriginal, true);
+});
+
+test('账本合并清账保留记录并按编号去重，展示人工补录核对信息', async () => {
+  const pending = { id: 'manual', mode: '真实发布', submittedWithoutReceipt: true, account: '虚构账号', fullContent: '虚构正文', docName: '模拟表', row: 2 };
+  const app = await loadPopup({ publishLedger: [pending], __unwrittenReceipts__: [pending, { ...pending, id: 'retained', account: '另一个虚构账号' }] });
+  await app.elements.get('tabNavLedger').click();
+  await new Promise((r) => setImmediate(r));
+  const cards = app.elements.get('ledgerListContainer').children;
+  assert.equal(cards.length, 2);
+  assert.match(cards[0].innerHTML, /虚构账号/);
+  assert.match(cards[0].innerHTML, /虚构正文/);
+  assert.match(cards[1].innerHTML, /btn-manual-receipt/);
 });
 
 test('发博账本支持一键复制全部成功发布账号名与链接及单条复制入口', async () => {

@@ -23,6 +23,10 @@ const stateReady = chrome.storage.local.get(["pipelineState"]).then((res) => {
   }
 }).catch((error) => console.error("恢复流水线状态失败:", error));
 
+// 仅内存态：标记当前确实在执行提交的待核对记录，防止运行期间被人工补录/解除。
+// Service Worker 重启后自动清空，此时流水线已中断，记录转为可人工核对的待确认状态。
+const activePendingSubmissionIds = new Set();
+
 let scheduleMutationQueue = Promise.resolve();
 function withScheduleMutation(operation) {
   const result = scheduleMutationQueue.then(operation);
@@ -326,7 +330,7 @@ async function executeInTabDirect(tabId, func, args = [], world = "MAIN", reload
 // ─────────────────────────────────────────────────────────────
 // 直通函数 1：云文档待发内容提取 (直接注入到腾讯文档/钉钉页面运行)
 // ─────────────────────────────────────────────────────────────
-function directExtractDocTasks(targetSheetId, linkColLetter, filterAccount) {
+function directExtractDocTasks(targetSheetId, linkColLetter, filterAccount, strictRead = false) {
   try {
     const app = window.SpreadsheetApp;
     const wb = app && app.workbook;
@@ -563,6 +567,16 @@ function directExtractDocTasks(targetSheetId, linkColLetter, filterAccount) {
         };
 
         for (let r = headerRow; r < rowCount; r++) {
+          let acctVal = "";
+          if (accountCol !== -1) {
+            const acctCell = target.getCellDataAtPosition(r, accountCol);
+            try {
+              acctVal = (tools.getCellEditValue(wb, r, accountCol, sid, acctCell) || "").toString().trim();
+            } catch (error) { if (strictRead) throw error; }
+          }
+          if (acctVal) carriedAccount = acctVal;
+          else acctVal = carriedAccount;
+
           const contentCell = target.getCellDataAtPosition(r, contentCol);
           let contentVal = "";
           try {
@@ -574,26 +588,16 @@ function directExtractDocTasks(targetSheetId, linkColLetter, filterAccount) {
           let linkVal = "";
           try {
             linkVal = (tools.getCellEditValue(wb, r, linkCol, sid, linkCell) || "").toString().trim();
-          } catch (_) {}
+          } catch (error) { if (strictRead) throw error; }
           if (!linkVal && linkCell && linkCell.getCellHyperlinksInfo) {
             try {
               const hl = linkCell.getCellHyperlinksInfo();
               if (hl && hl.hyperlinksInfo && hl.hyperlinksInfo[0]) {
                 linkVal = hl.hyperlinksInfo[0].hyperlink?.url || "";
               }
-            } catch (_) {}
+            } catch (error) { if (strictRead) throw error; }
           }
           if (linkVal) continue;
-
-          let acctVal = "";
-          if (accountCol !== -1) {
-            const acctCell = target.getCellDataAtPosition(r, accountCol);
-            try {
-              acctVal = (tools.getCellEditValue(wb, r, accountCol, sid, acctCell) || "").toString().trim();
-            } catch (_) {}
-          }
-          if (acctVal) carriedAccount = acctVal;
-          else acctVal = carriedAccount;
 
           let timeVal = "";
           if (timeCol !== -1) {
@@ -644,6 +648,7 @@ function directExtractDocTasks(targetSheetId, linkColLetter, filterAccount) {
             time: timeVal,
             targetCell: `${colLetter(linkCol)}${r + 1}`,
             targetSheetId: sid,
+            writeSnapshot: { sheetId: sid, row: r + 1, contentCol, accountCol, linkCol, headerRow, content: contentVal, account: acctVal, link: "" },
             link: "",
             imgUrls: rowImages,
             materialCol: materialCol !== -1 ? colLetter(materialCol) : "",
@@ -1336,7 +1341,7 @@ async function directPostToWeiboPlatform(task, isDryRun) {
 
     const previousUrls = new Set(Array.from(document.querySelectorAll('a[href], input, .publish_model_link'))
       .map((el) => extractWeiboPostUrl(el.href || el.value || el.innerText || el.textContent || "")).filter(Boolean));
-    window.__weiboSyncSubmission = { account: targetAccount, content, startedAt: Date.now(), submitted: false,
+    window.__weiboSyncSubmission = { account: targetAccount, accounts: targetAccounts, content, startedAt: Date.now(), submitted: false,
       previousUrls: Array.from(previousUrls) };
     try {
       if (typeof sessionStorage !== "undefined") sessionStorage.removeItem("__weiboSyncSubmission");
@@ -1430,7 +1435,7 @@ async function directPostToWeiboPlatform(task, isDryRun) {
       }
 
       if (!publishBtn) {
-        return { ok: false, error: "未在发稿页定位到【保存并发布】提交按钮" };
+        return { ok: false, submitted: false, error: "未在发稿页定位到【保存并发布】提交按钮" };
       }
 
       // 页内指纹级防重复发布锁：60秒内同一页面绝不二次点击发布相同正文！
@@ -1506,9 +1511,11 @@ async function directPostToWeiboPlatform(task, isDryRun) {
         const entries = [];
         const seen = new Set();
         const pushEntry = (nick, url) => {
-          if (!url || previousUrls.has(url) || seen.has(url)) return;
-          seen.add(url);
+          if (!url || previousUrls.has(url)) return;
           const cleanNick = String(nick || "").replace(/[:：\s]+$/g, "").trim();
+          const key = `${norm(cleanNick)}::${url}`;
+          if (seen.has(key) || (!cleanNick && entries.some((entry) => entry.url === url))) return;
+          seen.add(key);
           entries.push({ nick: cleanNick, normNick: norm(cleanNick), url });
         };
 
@@ -1544,14 +1551,15 @@ async function directPostToWeiboPlatform(task, isDryRun) {
         const byAcct = {};
         const usedUrls = new Set();
         for (const spec of targetSpecs) {
-          const match = entries.find((e) => !usedUrls.has(e.url) && e.normNick && (e.normNick === spec.norm || (spec.baseNorm && e.normNick === spec.baseNorm)))
-            || entries.find((e) => !usedUrls.has(e.url) && e.normNick && ((spec.norm && (e.normNick.includes(spec.norm) || spec.norm.includes(e.normNick))) || (spec.baseNorm && (e.normNick.includes(spec.baseNorm) || spec.baseNorm.includes(e.normNick)))));
+          const matches = entries.filter((e) => e.normNick && (e.normNick === spec.norm || (spec.baseNorm && e.normNick === spec.baseNorm)));
+          const match = matches.length === 1 && !usedUrls.has(matches[0].url) &&
+            new Set(entries.filter((entry) => entry.url === matches[0].url && entry.normNick).map((entry) => entry.normNick)).size === 1 ? matches[0] : null;
           if (match) {
             byAcct[spec.raw] = match.url;
             usedUrls.add(match.url);
           }
         }
-        if (targetSpecs.length === 1 && !byAcct[targetSpecs[0].raw] && entries.length === 1) {
+        if (targetSpecs.length === 1 && !byAcct[targetSpecs[0].raw] && entries.length === 1 && !entries[0].normNick) {
           byAcct[targetSpecs[0].raw] = entries[0].url;
         }
         return byAcct;
@@ -1668,6 +1676,9 @@ async function directPostToWeiboPlatform(task, isDryRun) {
         }
       }
 
+      if (!isMultiTarget && targetSpecs.length === 1 && extractedEntries.some((entry) => entry.normNick) && !postUrlsByAccount[targetSpecs[0].raw]) {
+        extractedUrl = "";
+      }
       if (!extractedUrl) {
         return {
           ok: false,
@@ -2162,7 +2173,7 @@ async function directPostPollToWeiboHome(task, isDryRun) {
 // ─────────────────────────────────────────────────────────────
 // 直通函数 3：云文档单元格链接回写 (直接注入到腾讯文档/钉钉页面运行)
 // ─────────────────────────────────────────────────────────────
-async function directWriteCellToDoc(cellAddr, linkValue, targetSheetId) {
+async function directWriteCellToDoc(cellAddr, linkValue, targetSheetId, snapshot) {
   try {
     if (!cellAddr || !linkValue) return { ok: false, error: "缺少回写单元格或链接" };
 
@@ -2206,25 +2217,46 @@ async function directWriteCellToDoc(cellAddr, linkValue, targetSheetId) {
 
       if (targetSheet && app.behaviorApi && app.behaviorApi.cellApi) {
         const sid = targetSheet.getSheetId();
-        // 写入前幂等校验：若目标单元格或超链接已精确等于 linkValue，直接返回成功，避免冗余协同写请求
+        // 快照必须来自扫描时的同一子表和行；旧回执缺少列信息时只能人工核对补写。
+        if (!snapshot || !snapshot.sheetId || snapshot.sheetId !== sid ||
+            snapshot.row !== targetRow1 || snapshot.linkCol !== targetCol0 ||
+            !Number.isInteger(snapshot.contentCol) || snapshot.contentCol < 0 ||
+            !Number.isInteger(snapshot.accountCol) || snapshot.accountCol < 0 ||
+            !Number.isInteger(snapshot.headerRow) || snapshot.headerRow < 1 || snapshot.headerRow >= targetRow1 ||
+            new Set([snapshot.contentCol, snapshot.accountCol, snapshot.linkCol]).size !== 3 ||
+            typeof snapshot.content !== "string" || !snapshot.content.trim() ||
+            typeof snapshot.account !== "string" || !snapshot.account.trim() || snapshot.link !== "") {
+          return { ok: false, error: "缺少完整的文档行快照，已阻断自动写回；请核对回执后手动补写，勿重新发布" };
+        }
+        const readCell = (row, col) => {
+          const cell = targetSheet.getCellDataAtPosition(row, col);
+          const text = String(tools.getCellEditValue(wb, row, col, sid, cell) ?? "").trim();
+          return { cell, text };
+        };
+        let pre;
         try {
-          const preCell = targetSheet.getCellDataAtPosition(targetRow0, targetCol0);
-          let preVal = (tools.getCellEditValue(wb, targetRow0, targetCol0, sid, preCell) || "").toString().trim();
-          if (preVal !== linkValue && preCell && preCell.getCellHyperlinksInfo) {
-            const preLinks = preCell.getCellHyperlinksInfo();
-            const preHref = preLinks?.hyperlinksInfo?.[0]?.hyperlink?.url || "";
-            if (String(preHref).trim() === linkValue) preVal = linkValue;
+          const content = readCell(targetRow0, snapshot.contentCol).text;
+          let account = "";
+          for (let r = targetRow0; r >= snapshot.headerRow; r--) {
+            account = readCell(r, snapshot.accountCol).text;
+            if (account) break;
           }
-          if (preVal === linkValue) {
-            return {
-              ok: true,
-              provider: "SpreadsheetApp.behaviorApi",
-              cell: cellAddr,
-              verified: preVal,
-              idempotent: true,
-            };
+          pre = readCell(targetRow0, targetCol0);
+          const hrefs = pre.cell && pre.cell.getCellHyperlinksInfo
+            ? (pre.cell.getCellHyperlinksInfo()?.hyperlinksInfo || []).map((item) => String(item?.hyperlink?.url || "").trim()).filter(Boolean)
+            : [];
+          if (content !== snapshot.content.trim() || account !== snapshot.account.trim()) {
+            return { ok: false, error: "文档行正文或账号与任务快照不一致，已阻断写回；请核对回执后手动补写，勿重新发布" };
           }
-        } catch (_) {}
+          if (hrefs.some((href) => href !== linkValue) || (pre.text && pre.text !== linkValue && !hrefs.includes(linkValue))) {
+            return { ok: false, error: "回写单元格已有不同内容或链接，已阻断覆盖；请人工核对回执" };
+          }
+          if (pre.text === linkValue || hrefs.includes(linkValue)) {
+            return { ok: true, provider: "SpreadsheetApp.behaviorApi", cell: cellAddr, verified: linkValue, idempotent: true };
+          }
+        } catch (readErr) {
+          return { ok: false, error: `读取文档行快照失败，已阻断写回: ${readErr.message || readErr}` };
+        }
 
         const uuid = (typeof crypto !== "undefined" && crypto.randomUUID)
           ? crypto.randomUUID()
@@ -2453,21 +2485,22 @@ async function directRecoverPublishedWeiboUrl(targetAccount, targetContent) {
     const extractWeiboPostUrl = (rawText, excludedText = "", allowShortUrl = true) => {
       if (!rawText) return "";
       const lines = String(rawText).split(/\r?\n/);
+      const excludedUrls = new Set((String(excludedText).match(/https?:\/\/(?:www\.)?(?:weibo\.com|m\.weibo\.cn|t\.cn)\/[^\s"'<>]+/ig) || []).map((url) => url.replace(/[),，。]+$/, "")));
       let shortUrlFallback = "";
       for (const line of lines) {
         // 1. 经典个人博文直链：https://weibo.com/<UID>/<MID>
         const m1 = line.match(/https?:\/\/(?:www\.)?weibo\.com\/([0-9]{5,})\/([A-Za-z0-9]+)/i);
-        if (m1) {
+        if (m1 && !Array.from(excludedUrls).some((url) => url.includes(`/${m1[1]}/${m1[2]}`))) {
           return `https://weibo.com/${m1[1]}/${m1[2]}`;
         }
         // 2. 详情页直链：https://weibo.com/detail/<MID>
         const m2 = line.match(/https?:\/\/(?:www\.)?weibo\.com\/detail\/([0-9A-Za-z]+)/i);
-        if (m2) {
+        if (m2 && !Array.from(excludedUrls).some((url) => url.includes(`/detail/${m2[1]}`))) {
           return `https://weibo.com/detail/${m2[1]}`;
         }
         // 3. 移动端直链：https://m.weibo.cn/status/<MID>
         const m3 = line.match(/https?:\/\/m\.weibo\.cn\/(?:status|detail)\/([0-9A-Za-z]+)/i);
-        if (m3) {
+        if (m3 && !Array.from(excludedUrls).some((url) => url.includes(`/${m3[1]}`))) {
           return `https://m.weibo.cn/status/${m3[1]}`;
         }
         // 4. 微博短链兜底（如列表正文末尾附带的 http://t.cn/AXYuhH3q，排除原正文自带短链）
@@ -2520,10 +2553,11 @@ async function directRecoverPublishedWeiboUrl(targetAccount, targetContent) {
         } catch (_) {}
       }
       const sameSubmission = submission && submission.submitted &&
-        normalize(submission.account) === account && normalize(submission.content) === content;
+        [submission.account, ...(Array.isArray(submission.accounts) ? submission.accounts : [])].some((value) => normalize(value) === account) &&
+        normalize(submission.content) === content;
       const previousUrls = new Set(submission?.previousUrls || []);
-      if (sameSubmission && window.__clipCaptured) {
-        const u = extractWeiboPostUrl(window.__clipCaptured);
+      if (sameSubmission && (!Array.isArray(submission.accounts) || submission.accounts.length <= 1) && normalize(submission.account) === account && window.__clipCaptured) {
+        const u = extractWeiboPostUrl(window.__clipCaptured, targetContent);
         if (u && !previousUrls.has(u)) return { ok: true, postUrl: u, source: "本次提交剪贴板捕获" };
       }
       window.__clipCaptured = "";
@@ -2539,7 +2573,7 @@ async function directRecoverPublishedWeiboUrl(targetAccount, targetContent) {
       let diagAccountHits = 0;
       let diagTimeHits = 0;
       let diagRowStatus = "";
-      const extractUrlFromWeiboLinksDialog = () => {
+      const extractUrlFromWeiboLinksDialog = (requireNamed = false) => {
         const dialogs = Array.from(document.querySelectorAll('.weibo-links-dialog, .n-dialog, .n-modal, [role="dialog"]'));
         for (const dialog of dialogs) {
           const items = Array.from(dialog.querySelectorAll('.weibo-link-item, .publish_model_item'));
@@ -2559,9 +2593,8 @@ async function directRecoverPublishedWeiboUrl(targetAccount, targetContent) {
           if (!entries.length) continue;
           let matched = null;
           if (account) {
-            matched = entries.find((e) => e.normNick === account)
-              || entries.find((e) => e.normNick && (e.normNick.includes(account) || account.includes(e.normNick)))
-              || (entries.length === 1 && !entries[0].normNick ? entries[0] : null);
+            const exact = entries.filter((e) => e.normNick === account);
+            matched = exact.length === 1 ? exact[0] : (!requireNamed && entries.length === 1 && !entries[0].normNick && (!submission.accounts || submission.accounts.length <= 1) ? entries[0] : null);
           } else if (entries.length === 1) {
             matched = entries[0];
           }
@@ -2611,7 +2644,7 @@ async function directRecoverPublishedWeiboUrl(targetAccount, targetContent) {
             const cells = Array.from(row.querySelectorAll('td, [role="cell"], .n-data-table-td'));
             const rawCellTexts = cells.map((cell) => String(cell.getAttribute?.("title") || cell.innerText || cell.textContent || ""));
             const cellTexts = rawCellTexts.map((t) => normalize(t));
-            const accountHit = cellTexts.some((ct) => ct === account || (account.length >= 2 && ct.includes(account)));
+            const accountHit = cellTexts.some((ct) => ct === account);
             const contentHit = rawCellTexts.some((raw) => contentMatchesCell(raw));
             if (contentHit) diagContentHits++;
             if (accountHit) diagAccountHits++;
@@ -2630,12 +2663,14 @@ async function directRecoverPublishedWeiboUrl(targetAccount, targetContent) {
             }
             const publishedAt = /^\d{10,13}$/.test(rawTime || "")
               ? Number(rawTime) * (String(rawTime).length === 10 ? 1000 : 1) : Date.parse(rawTime || "");
-            if (!Number.isFinite(publishedAt) || publishedAt < submission.startedAt - 1000 || publishedAt > Date.now() + 10000) continue;
+            const minutePrecision = /^\d{4}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}$/.test(String(rawTime).trim());
+            // 同一分钟只能证明落在该分钟内，不能证明晚于提交时刻。
+            if (!Number.isFinite(publishedAt) || publishedAt < submission.startedAt - (minutePrecision ? 0 : 1000) || publishedAt > Date.now() + 10000) continue;
             diagTimeHits++;
 
             // 1. 优先查找直链超链接
             const aLink = row.querySelector('a[href*="weibo.com"], a[href*="m.weibo.cn"]');
-            if (aLink && aLink.href) {
+            if (hasAccountColumn && aLink && aLink.href) {
               const u = extractWeiboPostUrl(aLink.href, targetContent);
               if (u && !previousUrls.has(u)) return { ok: true, postUrl: u, source: "已核对账号正文与发布时间的列表链接" };
             }
@@ -2643,14 +2678,14 @@ async function directRecoverPublishedWeiboUrl(targetAccount, targetContent) {
             // 2. 检查行内 HTML 中是否有直链（先仅查完整直链，不抢跑 t.cn 短链）
             const rowHtml = row.innerHTML || "";
             const htmlFullUrl = extractWeiboPostUrl(rowHtml, targetContent, false);
-            if (htmlFullUrl && !previousUrls.has(htmlFullUrl)) return { ok: true, postUrl: htmlFullUrl, source: "微博列表行HTML" };
+            if (hasAccountColumn && htmlFullUrl && !previousUrls.has(htmlFullUrl)) return { ok: true, postUrl: htmlFullUrl, source: "微博列表行HTML" };
 
             // 3. 点击操作列的“获取链接”弹窗或“复制链接”按钮
             const btns = Array.from(row.querySelectorAll('button, .n-button, a, span, [role="button"]'));
             for (const btn of btns) {
               const bText = (btn.innerText || btn.textContent || "").trim();
               if (bText === "获取链接" || bText.includes("获取链接")) {
-                const alreadyOpenUrl = extractUrlFromWeiboLinksDialog();
+                const alreadyOpenUrl = extractUrlFromWeiboLinksDialog(!hasAccountColumn);
                 if (alreadyOpenUrl) return { ok: true, postUrl: alreadyOpenUrl, source: "微博列表获取链接弹窗" };
                 try {
                   btn.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window }));
@@ -2659,10 +2694,10 @@ async function directRecoverPublishedWeiboUrl(targetAccount, targetContent) {
                 btn.click();
                 for (let waitDlg = 0; waitDlg < 12; waitDlg++) {
                   await new Promise((r) => setTimeout(r, 250));
-                  const dlgUrl = extractUrlFromWeiboLinksDialog();
+                  const dlgUrl = extractUrlFromWeiboLinksDialog(!hasAccountColumn);
                   if (dlgUrl) return { ok: true, postUrl: dlgUrl, source: "微博列表获取链接弹窗" };
                 }
-              } else if (["复制链接", "复制微博链接"].includes(bText)) {
+              } else if (hasAccountColumn && ["复制链接", "复制微博链接"].includes(bText)) {
                 try {
                   btn.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window }));
                   btn.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, view: window }));
@@ -2678,6 +2713,7 @@ async function directRecoverPublishedWeiboUrl(targetAccount, targetContent) {
             const statusCell = rawCellTexts.find((t) => /^(?:发布中|待发布|待审核|发布成功|部分发布成功|发布失败)$/.test(String(t || "").trim()));
             if (statusCell) diagRowStatus = String(statusCell).trim();
 
+            if (!hasAccountColumn) continue;
             // 4. 兜底查找 t.cn 短链（超链接 / HTML / 行内文本）
             const shortAnchor = row.querySelector('a[href*="t.cn/"]');
             if (shortAnchor && shortAnchor.href) {
@@ -3648,7 +3684,7 @@ async function inspectDingTalkSheetState(tabId) {
         }
       }
 
-      return { isSheetFrame: true, currentAddr, formulaValue, activeSheetTitle };
+      return { isSheetFrame: true, currentAddr, formulaValue, formulaReadable: formulaNodes.length === 1, activeSheetTitle };
     },
   }).catch(() => []);
   return (frameResults || []).map((r) => r?.result).find(Boolean) || null;
@@ -3806,6 +3842,46 @@ async function dingTalkPointerAllowed(tabId) {
   }
 }
 
+function validateDingTalkWriteSnapshot(payload, targetSheetId, coords, snapshot, linkValue, activeSheetTitle) {
+  try {
+    if (!targetSheetId || !snapshot?.account || !snapshot?.content || !activeSheetTitle) throw new Error("缺少子表、账号、正文或当前子表信息");
+    if ((snapshot.sheetId && String(snapshot.sheetId) !== targetSheetId) || (snapshot.row && Number(snapshot.row) !== coords.rowNum)) throw new Error("任务快照子表或行号不一致");
+    const root = typeof payload?.text === "string" && !payload?.data?.documentContent ? JSON.parse(payload.text) : payload;
+    const doc = root?.data?.documentContent;
+    const raw = doc?.checkpoint?.content || doc?.deltas?.snapshot;
+    const workbook = typeof raw === "string" ? JSON.parse(raw) : structuredClone(raw);
+    const meta = (workbook?.sheetsMeta || []).filter((m) => String(m?.id || "") === targetSheetId);
+    const title = String(activeSheetTitle).trim();
+    if (meta.length !== 1 || !meta[0].title || String(meta[0].title).trim() !== title ||
+        workbook.sheetsMeta.filter((m) => String(m?.title || "").trim() === title).length !== 1) throw new Error("无法确认当前子表与目标子表一致");
+    const rows = workbook?.content?.[targetSheetId]?.rows;
+    if (!Array.isArray(rows)) throw new Error("无法读取目标子表");
+    const matches = rows.filter((r) => Array.isArray(r) && Number(r[0]) + 1 === coords.rowNum);
+    if (matches.length !== 1 || !Array.isArray(matches[0][2])) throw new Error("无法确认目标行");
+    const cells = matches[0][2].filter((c) => Array.isArray(c) && Number(c[0]) + 1 === coords.colNum);
+    if (cells.length > 1) throw new Error("目标单元格不唯一");
+    if (cells.length && (!cells[0][1] || typeof cells[0][1] !== "object" || cells[0][1].formula != null || cells[0][1].value === undefined)) throw new Error("目标单元格内容无法验证");
+    let existingValue = "";
+    if (cells.length) {
+      const value = cells[0][1].value;
+      if (value !== null && typeof value !== "string" && typeof value !== "number" && !(typeof value === "object" && value.type === "asl" && Array.isArray(value.data))) throw new Error("目标单元格内容无法验证");
+      const parsed = extractDingTalkCellPayload(cells[0][1]);
+      if (parsed.link && !dingTalkCellWriteMatches(parsed.link, linkValue)) throw new Error("目标单元格已有不同链接，禁止覆盖");
+      const actual = String(parsed.text || parsed.link || "").trim();
+      if (parsed.images?.length || (!actual && typeof value === "object")) throw new Error("目标单元格内容无法验证");
+      if (actual && !dingTalkCellWriteMatches(actual, linkValue)) throw new Error("目标单元格已有不同内容，禁止覆盖");
+      existingValue = actual;
+      if (actual) matches[0][2] = matches[0][2].filter((c) => c !== cells[0]);
+    }
+    const parsed = parseDingTalkDocumentPayload({ data: { documentContent: { checkpoint: { content: JSON.stringify(workbook) } } } }, { targetSheetId, linkColLetter: coords.normAddr.replace(/\d+$/, ""), maxRows: Number.MAX_SAFE_INTEGER });
+    const task = parsed.ok && parsed.tasks.find((t) => t.targetCell === coords.normAddr);
+    if (!task || task.account !== String(snapshot.account).trim() || task.content !== String(snapshot.content).trim()) throw new Error("目标行账号或正文与任务快照不一致");
+    return existingValue ? { ok: true, idempotent: true, value: existingValue } : { ok: true };
+  } catch (err) {
+    return { ok: false, error: `钉钉写前校验失败：${err?.message || String(err)}` };
+  }
+}
+
 async function writeDingTalkCellInTab(tabId, cellAddr, linkValue, targetSheetId, options = {}) {
   const coords = parseCellAddrCoords(cellAddr);
   if (!coords) return { ok: false, error: "无效的钉钉单元格地址" };
@@ -3815,6 +3891,7 @@ async function writeDingTalkCellInTab(tabId, cellAddr, linkValue, targetSheetId,
 
   // ── 通道 1：CDP 真实鼠标 + 真实键盘引擎 (100% 对齐原系统 Playwright 操作，绕过 Canvas 合成事件拦截) ──
   const canUseDebugger = typeof chrome !== "undefined" && chrome.debugger && typeof chrome.debugger.attach === "function";
+  if (!canUseDebugger) return { ok: false, error: "钉钉写回无法验证当前子表和单元格，已阻断写入" };
   if (canUseDebugger) {
     let initialState = await inspectDingTalkSheetState(tabId);
     if (!initialState) {
@@ -3825,22 +3902,7 @@ async function writeDingTalkCellInTab(tabId, cellAddr, linkValue, targetSheetId,
       return { ok: false, error: "钉钉表格编辑帧尚未就绪，请确认文档已加载完成并具备编辑权限" };
     }
 
-    // 多子表防写串校验：仅当当前激活标题确认为工作簿内“另一个已知子表”且与目标子表不一致时阻断，避免顶部工具栏 Tab 误触发
-    if (targetSheetId && initialState.activeSheetTitle) {
-      try {
-        const payload = await fetchDingTalkDocumentPayloadInTab(tabId);
-        const metaList = Array.isArray(payload?.sheetsMeta) ? payload.sheetsMeta : [];
-        const targetMeta = metaList.find((m) => m && m.id === targetSheetId);
-        const curTitle = String(initialState.activeSheetTitle).trim();
-        const isKnownSheetTitle = metaList.some((m) => m && String(m.title || "").trim() === curTitle);
-        if (targetMeta?.title && isKnownSheetTitle && String(targetMeta.title).trim() !== curTitle) {
-          return {
-            ok: false,
-            error: `钉钉当前激活子表为 [${curTitle}]，与目标子表 [${targetMeta.title}] 不一致，已阻断跨表写入`,
-          };
-        }
-      } catch (_) {}
-    }
+    if (isAborted()) return { ok: false, error: "钉钉写回已超时中止" };
 
     let attached = false;
     try {
@@ -3900,18 +3962,22 @@ async function writeDingTalkCellInTab(tabId, cellAddr, linkValue, targetSheetId,
         return { ok: false, error: `钉钉表格名称框未能定位到单元格 ${coords.normAddr} (${lastNavDiag})` };
       }
 
-      // 写前单元格幂等与防覆盖校验：已写入同一链接直接成功；若已有其他微博链接则阻断覆盖
+      const payload = await fetchDingTalkDocumentPayloadInTab(tabId, 8000, { signal: options?.signal, maxAttempts: 2 });
       const cellBeforeState = await inspectDingTalkSheetState(tabId);
-      const beforeVal = String(cellBeforeState?.formulaValue || "").trim();
-      if (dingTalkCellWriteMatches(beforeVal, cleanValue)) {
+      if (isAborted()) return { ok: false, error: "钉钉写回已超时中止" };
+      if (cellBeforeState?.currentAddr !== coords.normAddr || !cellBeforeState.formulaReadable) {
+        return { ok: false, error: "无法确认目标单元格或读取公式栏，已阻断写回" };
+      }
+      const guard = validateDingTalkWriteSnapshot(payload, targetSheetId, coords, options.snapshot, cleanValue, cellBeforeState.activeSheetTitle);
+      if (!guard.ok) return guard;
+      const beforeVal = String(cellBeforeState.formulaValue || "").trim();
+      if (beforeVal && !dingTalkCellWriteMatches(beforeVal, cleanValue)) {
+        return { ok: false, error: `钉钉单元格 ${coords.normAddr} 已有不同内容，已阻断覆盖写入` };
+      }
+      if (guard.idempotent && dingTalkCellWriteMatches(beforeVal, cleanValue)) {
         return { ok: true, cell: coords.normAddr, value: beforeVal, idempotent: true };
       }
-      if (beforeVal && /https?:\/\/(?:www\.)?(?:weibo\.com|m\.weibo\.cn|weibo\.cn|t\.cn)\//i.test(beforeVal)) {
-        return {
-          ok: false,
-          error: `钉钉单元格 ${coords.normAddr} 已有其他博文链接 (${beforeVal})，已阻断覆盖写入`,
-        };
-      }
+      if (guard.idempotent || beforeVal) return { ok: false, error: "钉钉单元格接口与公式栏不一致，已阻断写回" };
 
       // 先离开名称框再输入链接。否则链接会接在 G209 后面，回车跳到错误单元格。
       await chrome.scripting.executeScript({
@@ -3929,6 +3995,7 @@ async function writeDingTalkCellInTab(tabId, cellAddr, linkValue, targetSheetId,
           }
         },
       }).catch(() => {});
+      if (isAborted()) return { ok: false, error: "钉钉写回已超时中止" };
       await chrome.debugger.sendCommand({ tabId }, "Input.insertText", { text: cleanValue });
       await new Promise((r) => setTimeout(r, 250));
       await sendCdpKeyEnter(tabId);
@@ -4334,6 +4401,37 @@ async function downloadImagesViaDocTab(tabId, docUrl, imageUrls) {
 // ─────────────────────────────────────────────────────────────
 // 业务调度流程 (支持多文档卡槽联动扫描与发布)
 // ─────────────────────────────────────────────────────────────
+async function verifyCurrentDocumentTasks(docTab, batchItems, resolveAccountName) {
+  const pending = batchItems.filter((item) => item.taskDocUrl && item.task.targetCell && item.task.targetCell !== "-");
+  if (!pending.length) return;
+  if (!docTab?.id) throw new Error("无法打开云文档复核任务，未提交发布");
+  await waitForTabLoaded(docTab.id, 15000);
+  for (const item of pending) {
+    const match = /^([A-Z]+)([1-9]\d*)$/i.exec(String(item.task.targetCell));
+    if (!match || Number(match[2]) !== Number(item.task.row)) throw new Error("文档任务坐标无效，未提交发布");
+    const options = { targetSheetId: item.taskSheetId, linkColLetter: match[1].toUpperCase(), filterAccount: "" };
+    const result = isDingTalkDocUrl(item.taskDocUrl)
+      ? await scanDingTalkDocTab(docTab.id, options)
+      : await executeInTabDirect(docTab.id, directExtractDocTasks,
+          [item.taskSheetId, options.linkColLetter, "", true], "MAIN", item.taskDocUrl);
+    if (!result?.ok || !Array.isArray(result.tasks)) throw new Error("无法读取云文档当前内容，未提交发布");
+    const current = result.tasks.find((row) => Number(row.row) === Number(item.task.row) &&
+      String(row.targetCell).toUpperCase() === String(item.task.targetCell).toUpperCase() &&
+      String(row.targetSheetId || "") === String(item.taskSheetId || ""));
+    const currentImages = Array.isArray(current?.imgUrls) ? current.imgUrls.slice(0, 9) : [];
+    const taskImages = Array.isArray(item.task.imgUrls) ? item.task.imgUrls.slice(0, 9) : [];
+    if (!current || current.content !== item.task.content || resolveAccountName(current.account) !== item.resolvedAccount ||
+        currentImages.length !== taskImages.length || currentImages.some((url, index) => url !== taskImages[index])) {
+      throw new Error(`文档第 ${item.task.row} 行的正文、账号或链接状态已变化，请重新扫描；未提交发布`);
+    }
+    if (!isDingTalkDocUrl(item.taskDocUrl) && (!current.writeSnapshot || !String(current.writeSnapshot.account || "").trim() ||
+        !Number.isInteger(current.writeSnapshot.accountCol) || current.writeSnapshot.accountCol < 0)) {
+      throw new Error("无法获取文档写回快照，未提交发布");
+    }
+    if (current.writeSnapshot) item.task.writeSnapshot = current.writeSnapshot;
+  }
+}
+
 async function scanDocTasks(config) {
   // 支持多文档数组 (config.docs) 或单文档 (config.docUrl)
   const docList = Array.isArray(config.docs) && config.docs.length > 0
@@ -4634,7 +4732,12 @@ async function startPipeline(config, reservation = null) {
           item.resolvedAccount === rAcct && item.fullContent === t.content && item.postUrl)
         : null;
 
+      const hasPendingSubmission = (account, content) => allReceipts.some((item) => item.submittedWithoutReceipt &&
+        item.resolvedAccount === account && String(item.fullContent || "").trim() === String(content || "").trim());
+      const pendingSubmission = !taskDryRun && hasPendingSubmission(resolvedAccount, task.content);
+      if (pendingSubmission) throw new Error(`账号 [${resolvedAccount}] 已提交但缺少回执，请人工核对，禁止自动重发`);
       const previousReceipt = findReceipt(task, taskDocUrl, taskSheetId, resolvedAccount);
+      if (!task.writeSnapshot && previousReceipt?.writeSnapshot) task.writeSnapshot = previousReceipt.writeSnapshot;
 
       // 合并连续的同文案、同配图、同类型非投票多账号任务，一次勾选群发，彻底对齐原系统速度
       const batchItems = [{
@@ -4664,7 +4767,8 @@ async function startPipeline(config, reservation = null) {
           const nextResolved = resolveAccountName(nextTask.account);
           if (!nextResolved || batchAccounts.has(nextResolved)) break;
           const nextReceipt = findReceipt(nextTask, nextDocUrl, nextSheetId, nextResolved);
-          if (nextReceipt) break;
+          const nextPending = !nextDryRun && hasPendingSubmission(nextResolved, nextTask.content);
+          if (nextReceipt || nextPending) break;
           batchAccounts.add(nextResolved);
           batchItems.push({
             index: j,
@@ -4746,6 +4850,10 @@ async function startPipeline(config, reservation = null) {
         __submitToken: submitToken,
       });
 
+      if (!taskDryRun && !previousReceipt) {
+        await verifyCurrentDocumentTasks(currentDocTab, batchItems, resolveAccountName);
+      }
+
       // 真实发博内容级全局持久化台账排他锁：同一账号 + 同一正文内容，3 分钟内物理绝对只允许真实发射一次！
       if (job.aborted) throw new Error("流水线已手动取消，未提交下一条发布");
       if (batchItems.some((b) => b.task.fromSchedule)) {
@@ -4801,6 +4909,19 @@ async function startPipeline(config, reservation = null) {
       job.tabId = weiboTab && weiboTab.id ? weiboTab.id : null;
       let postRes = previousReceipt ? { ok: true, postUrl: previousReceipt.postUrl, fromRecovery: true } : null;
       let postErr = null;
+      let pendingIds = [];
+      const clearPendingSubmission = async () => {
+        if (!pendingIds.length) return;
+        await withScheduleMutation(async () => {
+          const { publishLedger = [], __unwrittenReceipts__ = [] } = await chrome.storage.local.get(["publishLedger", "__unwrittenReceipts__"]);
+          await chrome.storage.local.set({
+            publishLedger: publishLedger.filter((item) => !pendingIds.includes(item.id)),
+            __unwrittenReceipts__: __unwrittenReceipts__.filter((item) => !pendingIds.includes(item.id)),
+          });
+        });
+        pendingIds.forEach((id) => activePendingSubmissionIds.delete(id));
+        pendingIds = [];
+      };
       try {
         if (previousReceipt) {
           appendLog("已找到该文档行的持久化发布回执，本次仅核对并补写链接，不重复发布", "info");
@@ -4857,6 +4978,23 @@ async function startPipeline(config, reservation = null) {
 
           if (!postRes) {
             if (job.aborted) throw new Error("流水线已手动取消，未提交本条发布");
+            if (!taskDryRun) {
+              const pending = batchItems.map((b, index) => ({
+                id: `pending_${submitToken}_${index}`, timestamp: Date.now(), docName: b.taskDocName,
+                docUrl: b.taskDocUrl, row: b.task.row, targetCell: b.task.targetCell,
+                targetSheetId: b.taskSheetId, account: b.task.account, resolvedAccount: b.resolvedAccount,
+                fullContent: b.task.content, contentSummary: b.task.content.substring(0, 45),
+                writeSnapshot: b.task.writeSnapshot, scheduleId: b.task.fromSchedule || String(b.task.id || "").startsWith("sched_") ? b.task.id : "", postUrl: "", mode: "真实发布", submittedWithoutReceipt: true,
+                writeBackOk: false, writeBackError: "发布状态待确认，请人工核对，禁止自动重发",
+              }));
+              await withScheduleMutation(async () => {
+                const { publishLedger = [], __unwrittenReceipts__ = [] } = await chrome.storage.local.get(["publishLedger", "__unwrittenReceipts__"]);
+                await chrome.storage.local.set({ publishLedger: [...pending, ...publishLedger], __unwrittenReceipts__: [...pending, ...__unwrittenReceipts__] });
+                pendingIds = pending.map((item) => item.id);
+                pendingIds.forEach((id) => activePendingSubmissionIds.add(id));
+              });
+              contentSubmitted = true;
+            }
             postRes = await executeInTabDirect(
               weiboTab.id,
               directPostToWeiboPlatform,
@@ -4908,7 +5046,7 @@ async function startPipeline(config, reservation = null) {
             if (checkSubmitRes && checkSubmitRes.submitted) {
               appendLog("检测到发稿中台在点击发布后发生页面跳转/刷新，留在当前页复制结果链接...", "warn");
               postRes = { ok: false, submitted: true, error: errMsg };
-            } else if ((errMsg.includes("Frame") || errMsg.includes("未关闭的弹窗")) && (!checkSubmitRes || checkSubmitRes.submitted === false)) {
+            } else if (taskDryRun && (errMsg.includes("Frame") || errMsg.includes("未关闭的弹窗")) && (!checkSubmitRes || checkSubmitRes.submitted === false)) {
               appendLog(`检测到发稿中台${errMsg.includes("未关闭的弹窗") ? "残留弹窗" : "页面帧重建"}（确认尚未提交），正在刷新就绪并重试一次...`, "warn");
               await chrome.tabs.update(weiboTab.id, { url: platformUrl }).catch(() => {});
               await waitForTabLoaded(weiboTab.id, 12000, false).catch(() => {});
@@ -4944,7 +5082,7 @@ async function startPipeline(config, reservation = null) {
       }
 
       // 取消连续重载后，上一批可能残留结果弹窗；命中该保护时刷新一次发博页再重试，避免整批中断
-      if (!isPoll && !previousReceipt && postRes && postRes.ok === false && !postRes.submitted
+      if (!isPoll && !previousReceipt && postRes && postRes.ok === false && postRes.submitted === false
           && /未关闭的弹窗/.test(String(postRes.error || "")) && weiboTab?.id) {
         appendLog("发稿中台残留上一次结果弹窗，正在刷新发博页后重试一次...", "warn");
         await chrome.tabs.update(weiboTab.id, { url: platformUrl }).catch(() => {});
@@ -4962,7 +5100,17 @@ async function startPipeline(config, reservation = null) {
         postErr = null;
       }
 
+      if (pendingIds.length && postRes?.submitted === false) {
+        await clearPendingSubmission();
+        contentSubmitted = false;
+      }
+
       if (postRes && postRes.needLogin) {
+        // 登录页意味着发布按钮从未被点击，预占的待确认记录可安全撤销，避免污染台账。
+        if (pendingIds.length && !contentSubmitted) {
+          await clearPendingSubmission();
+          contentSubmitted = false;
+        }
         if (runnerWin && runnerWin.id) {
           await chrome.windows.update(runnerWin.id, {
             focused: true,
@@ -5076,6 +5224,9 @@ async function startPipeline(config, reservation = null) {
       if (!taskDryRun && (ambiguousInject || (postRes && (postRes.submitted === true || postRes.ok === true)))) {
         contentSubmitted = true;
       }
+      if (postRes && !postRes.ok && postRes.submitted === true && !taskDryRun && !isPoll) {
+        postRes = { ...postRes, ok: true, postUrl: "" };
+      }
       if (!postRes || !postRes.ok) {
         throw new Error(`[${taskDocName}] 第 ${task.row} 行发博失败: ${postRes?.error || postErr?.message || "未知异常"}`);
       }
@@ -5096,9 +5247,9 @@ async function startPipeline(config, reservation = null) {
 
         const targetN = normAcctKey(bItem.resolvedAccount);
         const baseN = normAcctKey(stripAcctParens(bItem.resolvedAccount));
-        const entryHit = postEntriesList.find((e) => e.normNick && (e.normNick === targetN || (baseN && e.normNick === baseN)))
-          || postEntriesList.find((e) => e.normNick && ((targetN && (e.normNick.includes(targetN) || targetN.includes(e.normNick))) || (baseN && (e.normNick.includes(baseN) || baseN.includes(e.normNick)))));
-        if (entryHit && entryHit.url) return String(entryHit.url);
+        const entryMatches = postEntriesList.filter((e) => e.normNick && (e.normNick === targetN || (baseN && e.normNick === baseN)));
+        if (entryMatches.length === 1 && entryMatches[0].url &&
+            new Set(postEntriesList.filter((entry) => entry.url === entryMatches[0].url && entry.normNick).map((entry) => entry.normNick)).size === 1) return String(entryMatches[0].url);
 
         if (!bItem.taskDryRun && weiboTab?.id) {
           const wbListUrl = "https://ai-publish-platform.weibo.com/#/wb-list";
@@ -5127,6 +5278,9 @@ async function startPipeline(config, reservation = null) {
 
       const preparedOnly = postRes.preparedOnly === true;
       const batchUrlFailures = [];
+      const usedBatchUrls = new Set();
+      const mappedUrls = Object.values(postRes.postUrlsByAccount || {});
+      const duplicateMappedUrls = new Set(mappedUrls.filter((url, index) => mappedUrls.indexOf(url) !== index));
       for (let bIdx = 0; bIdx < batchItems.length; bIdx++) {
         const bItem = batchItems[bIdx];
         const bTask = bItem.task;
@@ -5136,17 +5290,31 @@ async function startPipeline(config, reservation = null) {
         const bSheetId = bItem.taskSheetId;
         const bDryRun = bItem.taskDryRun;
 
-        const postUrl = preparedOnly ? "" : await resolveUrlForBatchItem(bItem);
+        const candidateUrl = preparedOnly ? "" : await resolveUrlForBatchItem(bItem);
+        const postUrl = isBatchMulti && (usedBatchUrls.has(candidateUrl) || duplicateMappedUrls.has(candidateUrl)) ? "" : candidateUrl;
+        if (postUrl) usedBatchUrls.add(postUrl);
         if (!preparedOnly && (!postUrl || (!bDryRun && !validWeiboUrlRe.test(postUrl)))) {
-          if (!isBatchMulti) {
-            throw new Error("发布未取得有效博文回执链接，请核对中台结果，禁止自动重复发布");
-          }
-          // 该账号已随批次真实发出但未取到回执：先为同批次其余账号落盘台账，最后统一报错，禁止自动重发
+          // 已提交但未取得回执，持久记录并在处理其他成员后统一报错。
           batchUrlFailures.push(`${bResolvedAccount || "默认"}(第${bTask.row}行)`);
+          const pending = { id: `led_${Date.now()}_${bIdx}_${Math.random().toString(36).substring(2, 6)}`,
+            timestamp: Date.now(), docName: bDocName, docUrl: bDocUrl, row: bTask.row,
+            targetCell: bTask.targetCell, targetSheetId: bSheetId, account: bTask.account,
+            resolvedAccount: bResolvedAccount, fullContent: bTask.content, contentSummary: bTask.content.substring(0, 45),
+            writeSnapshot: bTask.writeSnapshot,
+            scheduleId: bTask.fromSchedule || String(bTask.id || "").startsWith("sched_") ? bTask.id : "",
+            postUrl: "", mode: "真实发布", submittedWithoutReceipt: true,
+            writeBackOk: false, writeBackError: "已提交但缺少回执，请人工核对，禁止自动重发" };
+          if (!pendingIds[bIdx]) await withScheduleMutation(async () => {
+            const { publishLedger = [], __unwrittenReceipts__ = [] } = await chrome.storage.local.get(["publishLedger", "__unwrittenReceipts__"]);
+            await chrome.storage.local.set({ publishLedger: [pending, ...publishLedger], __unwrittenReceipts__: [pending, ...__unwrittenReceipts__] });
+          });
+          if (bTask.fromSchedule || String(bTask.id || "").startsWith("sched_")) {
+            await updateScheduledTask(bTask.id, { status: "done", submittedWithoutReceipt: true, postUrl: "", writeBackOk: false, writeBackError: pending.writeBackError });
+          }
           appendLog(`账号 [${bResolvedAccount || "默认"}] 已随批次提交，但未取到博文回执链接，请人工核对补写，切勿重发`, "error");
           continue;
         }
-        const receipt = { status: "done", postUrl, dryRun: bDryRun, preparedOnly, error: "", writeBackOk: false, writeBackError: "", completedAt: Date.now() };
+        const receipt = { status: "done", postUrl, dryRun: bDryRun, preparedOnly, error: "", writeBackOk: false, writeBackError: "", completedAt: Date.now(), writeSnapshot: bTask.writeSnapshot };
         const scheduled = !!(bTask.fromSchedule || (bTask.id && String(bTask.id).startsWith("sched_")));
         if (scheduled) await updateScheduledTask(bTask.id, receipt);
 
@@ -5163,6 +5331,7 @@ async function startPipeline(config, reservation = null) {
           resolvedAccount: bResolvedAccount,
           contentSummary: bTask.content.substring(0, 45),
           fullContent: bTask.content,
+          writeSnapshot: bTask.writeSnapshot,
           postUrl,
           mode: bDryRun ? "安全演练" : preparedOnly ? "投票草稿" : "真实发布",
           preparedOnly,
@@ -5174,11 +5343,12 @@ async function startPipeline(config, reservation = null) {
         // 回执必须先落盘；回写故障不能使已发博任务重新进入可发送状态。
         await withScheduleMutation(async () => {
           const { publishLedger = [], __unwrittenReceipts__ = [] } = await chrome.storage.local.get(["publishLedger", "__unwrittenReceipts__"]);
-          const nextLedger = [ledgerItem, ...publishLedger];
-          const evictedUnwritten = nextLedger.slice(500).filter((item) => item.mode === "真实发布" && item.postUrl && !item.writeBackOk);
-          const nextUnwritten = evictedUnwritten.length > 0
-            ? [...evictedUnwritten, ...__unwrittenReceipts__].slice(0, 500)
-            : __unwrittenReceipts__;
+          const pendingId = pendingIds[bIdx];
+          if (pendingId) activePendingSubmissionIds.delete(pendingId);
+          const nextLedger = [ledgerItem, ...publishLedger.filter((item) => item.id !== pendingId)];
+          const evictedUnwritten = nextLedger.slice(500).filter((item) => item.mode === "真实发布" && (item.submittedWithoutReceipt || (item.postUrl && !item.writeBackOk)));
+          const unwritten = [...evictedUnwritten, ...__unwrittenReceipts__.filter((item) => item.id !== pendingId)];
+          const nextUnwritten = unwritten;
           await chrome.storage.local.set({
             publishLedger: nextLedger.slice(0, 500),
             __unwrittenReceipts__: nextUnwritten,
@@ -5206,7 +5376,7 @@ async function startPipeline(config, reservation = null) {
               appendLog("钉钉链接写回使用已打开的文档标签，不切换当前页面，也不移动鼠标", "info");
               const dingTalkSignal = { aborted: false };
               writeRes = await Promise.race([
-                writeDingTalkCellInTab(currentDocTab.id, bTask.targetCell, postUrl, bSheetId, { signal: dingTalkSignal }),
+                writeDingTalkCellInTab(currentDocTab.id, bTask.targetCell, postUrl, bSheetId, { signal: dingTalkSignal, snapshot: bTask.writeSnapshot || bTask }),
                 new Promise((_, reject) => setTimeout(() => {
                   dingTalkSignal.aborted = true;
                   reject(new Error("钉钉写回超时（45秒），请手动核对单元格"));
@@ -5216,7 +5386,7 @@ async function startPipeline(config, reservation = null) {
               const docAwake = await holdBackgroundTabAwake(currentDocTab.id);
               try {
                 writeRes = await executeInTabDirect(currentDocTab.id, directWriteCellToDoc,
-                  [bTask.targetCell, postUrl, bSheetId], "MAIN", bDocUrl, false);
+                  [bTask.targetCell, postUrl, bSheetId, bTask.writeSnapshot], "MAIN", bDocUrl, false);
               } finally {
                 if (docAwake) await releaseBackgroundTab(currentDocTab.id);
               }
@@ -5279,7 +5449,7 @@ async function startPipeline(config, reservation = null) {
       }
 
       if (batchUrlFailures.length > 0) {
-        throw new Error(`批次内账号 [${batchUrlFailures.join("、")}] 已提交但未取到回执链接，其余账号台账已保存，请人工核对补写，切勿重发`);
+        throw new Error(`批次内账号 [${batchUrlFailures.join("、")}] 已提交但未取到有效博文回执链接，台账已保存，请人工核对补写，切勿重发`);
       }
 
       i += batchItems.length - 1;
@@ -5318,6 +5488,8 @@ async function startPipeline(config, reservation = null) {
         appendLog("已自动关闭后台静默发博窗口", "info");
       } catch (_) {}
     }
+    // 流水线结束后，尚存的待核对记录转为可人工补录/解除状态。
+    activePendingSubmissionIds.clear();
     state.isRunning = false;
     activeJob = null;
     updateProgress(state.stage, state.percentage);
@@ -5352,7 +5524,14 @@ function pruneExpiredDoneSchedules(tasks, now = Date.now()) {
   if (!Array.isArray(tasks) || tasks.length === 0) return { tasks: [], removed: 0 };
   let removed = 0;
   const kept = tasks.filter((task) => {
+    // 已人工核实未发布并解除阻断的记录，按常规 TTL 清理，避免跨批次永久累积。
+    if (task && task.status === "error" && task.resolvedAt && now - task.resolvedAt >= SCHEDULE_DONE_TTL_MS) {
+      removed += 1;
+      return false;
+    }
     if (!task || task.status !== "done") return true;
+    // 待核对或待补写的记录保留，避免自动清理后丢失人工处理入口（账本中仍有防重证据）。
+    if (task.submittedWithoutReceipt || (task.postUrl && !task.writeBackOk)) return true;
     const doneAt = Number(task.completedAt || task.firingAt || task.fireAtTimestamp || task.createdAt || 0);
     if (doneAt > 0 && now - doneAt >= SCHEDULE_DONE_TTL_MS) {
       removed += 1;
@@ -6160,6 +6339,33 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 
+  if (request.action === "CLEAR_PUBLISH_LEDGER") {
+    withScheduleMutation(async () => {
+      const { publishLedger = [], __unwrittenReceipts__ = [] } = await chrome.storage.local.get(["publishLedger", "__unwrittenReceipts__"]);
+      const retained = publishLedger.filter((item) => item && item.mode === "真实发布" && (item.submittedWithoutReceipt || (item.postUrl && !item.writeBackOk)));
+      const merged = [...retained, ...__unwrittenReceipts__].filter((item, index, all) =>
+        !item?.id || all.findIndex((other) => other?.id === item.id) === index);
+      await chrome.storage.local.set({ publishLedger: [], __unwrittenReceipts__: merged });
+      return retained.length;
+    }).then((retained) => sendResponse({ ok: true, retained }))
+      .catch((err) => sendResponse({ ok: false, error: err.message || String(err) }));
+    return true;
+  }
+
+  if (request.action === "MANUAL_RECEIPT_WRITE_BACK") {
+    handleManualReceiptWriteBack(request.payload || request)
+      .then((res) => sendResponse(res))
+      .catch((err) => sendResponse({ ok: false, error: err.message || String(err) }));
+    return true;
+  }
+
+  if (request.action === "RESOLVE_PENDING_SUBMISSION") {
+    handleResolvePendingSubmission(request.payload || request)
+      .then((res) => sendResponse(res))
+      .catch((err) => sendResponse({ ok: false, error: err.message || String(err) }));
+    return true;
+  }
+
   if (request.action === "RETRY_WRITE_BACK") {
     handleRetryWriteBack(request.payload || request)
       .then((res) => sendResponse(res))
@@ -6167,6 +6373,103 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 });
+
+async function handleResolvePendingSubmission(payload = {}) {
+  const ledgerId = String(payload.ledgerId || "").trim();
+  if (!ledgerId) return { ok: false, error: "缺少账本记录编号" };
+  return withScheduleMutation(async () => {
+    // 校验必须落在临界区内，避免"已写库、未加内存标记"窗口期被并发解除。
+    if (activePendingSubmissionIds.has(ledgerId)) {
+      return { ok: false, error: "该任务正在发布中，请等待流水线结束后再核实" };
+    }
+    const {
+      publishLedger = [],
+      __unwrittenReceipts__ = [],
+      scheduledTasks = [],
+    } = await chrome.storage.local.get(["publishLedger", "__unwrittenReceipts__", "scheduledTasks"]);
+    const entries = [...publishLedger, ...__unwrittenReceipts__].filter((item) => item && item.id === ledgerId);
+    if (!entries.length) return { ok: false, error: "未找到待核对记录，请刷新账本" };
+    if (entries.some((item) => !item.submittedWithoutReceipt)) {
+      return { ok: false, error: "记录状态已变化，请刷新账本后重试" };
+    }
+    const scheduleId = String(entries.find((item) => item.scheduleId)?.scheduleId || "").trim();
+    const nextScheduled = scheduledTasks.map((item) => (item && (item.id === ledgerId || (scheduleId && item.id === scheduleId)))
+      ? { ...item, status: "error", submittedWithoutReceipt: false, postUrl: "", writeBackOk: false,
+          writeBackError: "", error: "已人工核实未发布，阻断已解除，可重新排程", resolvedAt: Date.now() }
+      : item);
+    await chrome.storage.local.set({
+      publishLedger: publishLedger.filter((item) => !item || item.id !== ledgerId),
+      __unwrittenReceipts__: __unwrittenReceipts__.filter((item) => !item || item.id !== ledgerId),
+      scheduledTasks: nextScheduled,
+    });
+    return { ok: true };
+  });
+}
+
+function isVerifiedWeiboPostUrl(raw) {
+  try {
+    const url = new URL(String(raw || "").trim());
+    if (!/^https?:$/.test(url.protocol)) return false;
+    const host = url.hostname.toLowerCase().replace(/^www\./, "");
+    const path = url.pathname.replace(/\/+$/, "");
+    if (host === "t.cn") return /^\/[A-Za-z0-9]+$/.test(path);
+    if (host === "m.weibo.cn") return /^\/(?:status|detail)\/[A-Za-z0-9]+$/.test(path);
+    if (host === "weibo.com" || host === "weibo.cn") {
+      return /^\/\d+\/[A-Za-z0-9]+$/.test(path) || /^\/detail\/[A-Za-z0-9]+$/.test(path);
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+async function handleManualReceiptWriteBack(payload = {}) {
+  const ledgerId = String(payload.ledgerId || "").trim();
+  const postUrl = String(payload.postUrl || "").trim();
+  if (!ledgerId) return { ok: false, error: "缺少账本记录编号" };
+  if (!isVerifiedWeiboPostUrl(postUrl)) {
+    return { ok: false, error: "请输入具体博文链接（账号主页不可作为回执）" };
+  }
+  if (activePendingSubmissionIds.has(ledgerId)) {
+    return { ok: false, error: "该任务正在发布中，请等待流水线结束后再补录" };
+  }
+  const identity = (value) => {
+    try {
+      const url = new URL(value);
+      return `${url.hostname.toLowerCase().replace(/^www\./, "")}${url.pathname.replace(/\/+$/, "")}`;
+    } catch { return ""; }
+  };
+  const prepared = await withScheduleMutation(async () => {
+    // 校验必须落在临界区内，避免"已写库、未加内存标记"窗口期被并发补录/解除。
+    if (activePendingSubmissionIds.has(ledgerId)) {
+      return { error: "该任务正在发布中，请等待流水线结束后再补录" };
+    }
+    const { publishLedger = [], __unwrittenReceipts__ = [], scheduledTasks = [] } = await chrome.storage.local.get(["publishLedger", "__unwrittenReceipts__", "scheduledTasks"]);
+    const entries = [...publishLedger, ...__unwrittenReceipts__];
+    const copies = entries.filter((item) => item && item.id === ledgerId);
+    const entry = copies[0];
+    if (!entry || copies.some((item) => item.mode !== "真实发布" || item.writeBackOk || (!item.submittedWithoutReceipt && !item.postUrl))) {
+      return { error: "记录不存在或状态不允许人工补录" };
+    }
+    if (copies.some((item) => item.postUrl && identity(item.postUrl) !== identity(postUrl))) {
+      return { error: "该记录已有不同链接，拒绝覆盖" };
+    }
+    if (entries.some((item) => item && item.id !== ledgerId && item.postUrl && identity(item.postUrl) === identity(postUrl))) {
+      return { error: "该微博链接已归属于其他记录" };
+    }
+    if (!entry.docUrl || !entry.targetCell || entry.targetCell === "-") return { error: "记录缺少文档或回写单元格" };
+    const savedUrl = copies.find((item) => item.postUrl)?.postUrl || postUrl;
+    const scheduleId = String(entry.scheduleId || "").trim();
+    const update = (item) => item && item.id === ledgerId ? { ...item, postUrl: savedUrl, submittedWithoutReceipt: false } : item;
+    const nextScheduled = scheduleId
+      ? scheduledTasks.map((item) => item && item.id === scheduleId ? { ...item, postUrl: savedUrl, submittedWithoutReceipt: false } : item)
+      : scheduledTasks;
+    await chrome.storage.local.set({ publishLedger: publishLedger.map(update), __unwrittenReceipts__: __unwrittenReceipts__.map(update), scheduledTasks: nextScheduled });
+    return { entry: { ...entry, postUrl: savedUrl, scheduleId } };
+  });
+  if (prepared.error) return { ok: false, error: prepared.error };
+  return handleRetryWriteBack({ ...prepared.entry, ledgerId, scheduleId: prepared.entry.scheduleId || "", strictLedgerId: true });
+}
 
 async function handleRetryWriteBack(payload = {}) {
   const docUrl = String(payload.docUrl || "").trim();
@@ -6196,19 +6499,30 @@ async function handleRetryWriteBack(payload = {}) {
 
     let writeRes;
     if (isDingTalkDocUrl(docUrl)) {
+      const stored = await chrome.storage.local.get(["scheduledTasks", "publishLedger", "__unwrittenReceipts__"]);
+      const entry = [...(stored.scheduledTasks || []), ...(stored.publishLedger || []), ...(stored.__unwrittenReceipts__ || [])]
+        .find((item) => item && ((scheduleId && item.id === scheduleId) || (ledgerId && item.id === ledgerId)) &&
+          item.docUrl === docUrl && item.targetCell === targetCell && String(item.targetSheetId || "") === targetSheetId && item.postUrl === postUrl);
+      const snapshot = entry?.writeSnapshot || (entry && { account: entry.account, content: entry.fullContent || entry.content });
       const dingTalkSignal = { aborted: false };
       writeRes = await Promise.race([
-        writeDingTalkCellInTab(docTab.id, targetCell, postUrl, targetSheetId, { signal: dingTalkSignal }),
+        writeDingTalkCellInTab(docTab.id, targetCell, postUrl, targetSheetId, { signal: dingTalkSignal, snapshot }),
         new Promise((_, reject) => setTimeout(() => {
           dingTalkSignal.aborted = true;
           reject(new Error("钉钉补写超时（45秒），请手动核对单元格"));
         }, 45000)),
       ]);
     } else {
+      const { scheduledTasks = [], publishLedger = [], __unwrittenReceipts__ = [] } = await chrome.storage.local.get(["scheduledTasks", "publishLedger", "__unwrittenReceipts__"]);
+      const entries = [...scheduledTasks, ...publishLedger, ...__unwrittenReceipts__];
+      const saved = entries.find((entry) => entry &&
+        ((scheduleId && entry.id === scheduleId) || (ledgerId && entry.id === ledgerId)) &&
+        entry.docUrl === docUrl && entry.targetCell === targetCell &&
+        String(entry.targetSheetId || "") === targetSheetId && entry.postUrl === postUrl);
       const docAwake = await holdBackgroundTabAwake(docTab.id);
       try {
         writeRes = await executeInTabDirect(docTab.id, directWriteCellToDoc,
-          [targetCell, postUrl, targetSheetId], "MAIN", docUrl, false);
+          [targetCell, postUrl, targetSheetId, saved?.writeSnapshot], "MAIN", docUrl, false);
       } finally {
         if (docAwake) await releaseBackgroundTab(docTab.id);
       }
@@ -6230,9 +6544,12 @@ async function handleRetryWriteBack(payload = {}) {
 
     const matchesEntry = (entry) => {
       if (!entry) return false;
-      if (scheduleId && entry.id === scheduleId) return true;
-      if (ledgerId && entry.id === ledgerId) return true;
-      return entry.postUrl === postUrl && entry.targetCell === targetCell && (!docUrl || entry.docUrl === docUrl);
+      const idHit = Boolean((scheduleId && entry.id === scheduleId) || (ledgerId && entry.id === ledgerId));
+      const sameTarget = entry.postUrl === postUrl && entry.targetCell === targetCell && entry.docUrl === docUrl &&
+        String(entry.targetSheetId || "") === targetSheetId;
+      if (sameTarget) return (scheduleId || ledgerId) ? idHit : true;
+      // 明确的记录/排程编号命中时，兼容旧记录缺少子表标识的情况。
+      return idHit && entry.docUrl === docUrl && entry.targetCell === targetCell;
     };
 
     const nextScheduled = scheduledTasks.map((t) => (
@@ -6241,9 +6558,16 @@ async function handleRetryWriteBack(payload = {}) {
     const nextLedger = publishLedger.map((item) => (
       matchesEntry(item) ? { ...item, writeBackOk, writeBackError } : item
     ));
+    const retainedEntry = __unwrittenReceipts__.find(matchesEntry);
+    if (ledgerId && retainedEntry && !nextLedger.some((item) => item?.id === ledgerId)) {
+      nextLedger.unshift({ ...retainedEntry, writeBackOk, writeBackError });
+    }
     const nextUnwritten = writeBackOk
-      ? __unwrittenReceipts__.filter((u) => !(u && u.postUrl === postUrl && u.targetCell === targetCell))
-      : __unwrittenReceipts__;
+      ? __unwrittenReceipts__.filter((u) => payload.strictLedgerId
+          ? !matchesEntry(u)
+          : !(u && u.postUrl === postUrl && u.targetCell === targetCell &&
+              u.docUrl === docUrl && String(u.targetSheetId || "") === targetSheetId))
+      : __unwrittenReceipts__.map((item) => matchesEntry(item) ? { ...item, writeBackOk, writeBackError } : item);
 
     await chrome.storage.local.set({
       scheduledTasks: nextScheduled,
@@ -6439,9 +6763,7 @@ async function handleUpdateScheduleTask(taskId, updates) {
         fireAtTime: updates.fireAtTime || new Date(updates.fireAtTimestamp).toLocaleString(), status: "pending", error: "" } : {}) };
     await chrome.storage.local.set({ scheduledTasks: scheduledTasks.map((item) => item.id === taskId ? next : item) });
     if (rescheduled) {
-      const { __publishClaims__ = {} } = await chrome.storage.local.get(["__publishClaims__"]);
-      const claims = Object.fromEntries(Object.entries(__publishClaims__).filter(([key]) => key !== `sched::${taskId}`));
-      await chrome.storage.local.set({ __publishClaims__: claims });
+      await releasePublishTaskLock(`sched::${taskId}`);
       await armSchedule(next);
     }
     return next;
@@ -6473,8 +6795,8 @@ async function handleClearDoneSchedule() {
     const remaining = [];
     for (const task of scheduledTasks) {
       if (task && task.status === "done") {
-        const needsRetryWriteBack = task.postUrl && !task.writeBackOk && task.dryRun === false && !task.preparedOnly
-          && task.targetCell && task.targetCell !== "-" && task.docUrl;
+        const needsRetryWriteBack = task.submittedWithoutReceipt || (task.postUrl && !task.writeBackOk && task.dryRun === false && !task.preparedOnly
+          && task.targetCell && task.targetCell !== "-" && task.docUrl);
         if (needsRetryWriteBack) {
           keptWriteBackFailed += 1;
           remaining.push(task);
@@ -6512,7 +6834,7 @@ async function handleBatchRescheduleTasks(taskIds, options = {}) {
   }
 
   const updatedTasks = await withScheduleMutation(async () => {
-    const { scheduledTasks = [], __publishClaims__ = {} } = await chrome.storage.local.get(["scheduledTasks", "__publishClaims__"]);
+    const { scheduledTasks = [] } = await chrome.storage.local.get(["scheduledTasks"]);
     const selected = scheduledTasks.filter((t) => taskIds.includes(t.id));
     if (!selected.length) throw new Error("未找到要改期的定时任务");
     if (selected.some((t) => t.status === "firing")) {
@@ -6542,10 +6864,15 @@ async function handleBatchRescheduleTasks(taskIds, options = {}) {
       return next;
     });
 
-    const nextClaims = Object.fromEntries(
-      Object.entries(__publishClaims__).filter(([key]) => !editableIds.has(key.replace(/^sched::/, "")))
-    );
-    await chrome.storage.local.set({ scheduledTasks: nextTasks, __publishClaims__: nextClaims });
+    // 认领锁必须与发布流程共用同一串行队列，避免与并发的 claim/release 互相覆盖。
+    await withPublishClaim(async () => {
+      const { __publishClaims__ = {} } = await chrome.storage.local.get(["__publishClaims__"]);
+      const nextClaims = Object.fromEntries(
+        Object.entries(__publishClaims__).filter(([key]) => !editableIds.has(key.replace(/^sched::/, "")))
+      );
+      await chrome.storage.local.set({ __publishClaims__: nextClaims });
+    });
+    await chrome.storage.local.set({ scheduledTasks: nextTasks });
     for (const next of nextMap.values()) {
       await armSchedule(next);
     }
