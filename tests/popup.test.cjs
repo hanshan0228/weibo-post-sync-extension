@@ -15,6 +15,9 @@ class Element {
     this.style = {};
     this.value = '';
     this.textContent = '';
+    this.scrollTop = 0;
+    this.scrollHeight = 0;
+    this.clientHeight = 100;
     this.checked = false;
     this.disabled = false;
     this._html = '';
@@ -39,6 +42,15 @@ class Element {
   }
   click() { return this.emit('click'); }
   appendChild(child) { this.children.push(child); child.parentElement = this; return child; }
+  prepend(child) { this.children.unshift(child); child.parentElement = this; return child; }
+  insertBefore(child, ref) {
+    const idx = ref ? this.children.indexOf(ref) : -1;
+    if (idx === -1) this.children.push(child);
+    else this.children.splice(idx, 0, child);
+    child.parentElement = this;
+    return child;
+  }
+  get firstChild() { return this.children[0] || null; }
   remove() { if (this.parentElement) this.parentElement.children = this.parentElement.children.filter((el) => el !== this); }
   focus() {}
   querySelector(selector) {
@@ -1001,6 +1013,242 @@ test('文档卡槽支持自定义名称并持久化，同时联动更新已扫�
   await nameInput.emit('blur');
   assert.equal(app.storage.docPresets[0].name, '文档 1 (主表)');
   assert.equal(nameInput.value, '文档 1 (主表)');
+});
+
+test('大号+N小号抽号自动过滤仅蓝V、同时评论给原微博等非账号复选框与已下线账号', async () => {
+  const app = await loadPopup({
+    cachedPlatformAccounts: [
+      '新浪热点',
+      '仅蓝V',
+      '仅蓝v',
+      '仅视频',
+      '同时评论给原微博',
+      '全选',
+      '新浪运动',
+      '新浪航天',
+      '新浪医典',
+      '新浪科普',
+      '新浪生活',
+      '新浪文旅',
+    ],
+  });
+  const text = [
+    '【郎平期待朱婷在国际赛场为中国代言】#郎平不认同竞技体育菜是原罪#在《体坛零距离》节目最后，郎平谈及对朱婷未来的期待。 http://t.cn/AXzrLUX3',
+    '',
+    '@新浪热点值班 辛苦大号+3小号发',
+  ].join('\n');
+  const tasks = await app.api.parseBatchTaskText(text);
+  assert.equal(tasks.length, 4);
+  assert.equal(tasks[0].account, '新浪热点');
+  const subAccounts = tasks.slice(1).map((t) => t.account);
+  for (const bad of ['仅蓝V', '仅蓝v', '仅视频', '同时评论给原微博', '全选', '新浪运动', '新浪航天', '新浪医典']) {
+    assert.equal(subAccounts.includes(bad), false, `不应抽到非账号或已下线账号: ${bad}`);
+  }
+  assert.deepEqual(new Set(subAccounts), new Set(['新浪科普', '新浪生活', '新浪文旅']));
+});
+
+test('@新浪热点值班 仅跟 N小号（无大号/+小号/和小号）时仅抽取小号，不加入新浪热点', async () => {
+  const app = await loadPopup({
+    cachedPlatformAccounts: [
+      '新浪热点',
+      '新浪科普',
+      '新浪生活',
+      '新浪文旅',
+      '新浪手机',
+    ],
+  });
+  const text = [
+    '郎平“吐槽”女儿饭量大，做事情商低，鲁豫：这是亲妈吗？#郎平讲到职业时简直在发光##热浪之外#http://t.cn/A6x2BV4c',
+    '',
+    ' @新浪热点值班 辛苦4小号',
+  ].join('\n');
+  const tasks = await app.api.parseBatchTaskText(text);
+  assert.equal(tasks.length, 4);
+  const accts = tasks.map((t) => t.account);
+  assert.equal(accts.includes('新浪热点'), false);
+  assert.deepEqual(new Set(accts), new Set(['新浪科普', '新浪生活', '新浪文旅', '新浪手机']));
+});
+
+test('点击智能解析预览左侧的一键粘贴按钮可将剪贴板内容填入解析框', async () => {
+  const clipText = '测试剪贴板派单正文\n@新浪热点值班 辛苦4小号';
+  const app = await loadPopup({}, {}, {
+    navigator: { clipboard: { readText: async () => clipText } },
+  });
+  const input = app.elements.get('taskParserInput');
+  input.style.display = 'none';
+  await app.elements.get('btnPasteParser').click();
+  assert.equal(input.value, clipText);
+  assert.equal(input.style.display, 'block');
+  assert.equal(app.elements.get('btnToggleParserInput').textContent, '🔼 收起原文');
+});
+
+test('运行状态日志倒序渲染，最新日志在最上面且靠近顶部时保持置顶', async () => {
+  const app = await loadPopup({}, {
+    GET_PIPELINE_STATUS: {
+      ok: true,
+      state: {
+        isRunning: false,
+        stage: '',
+        percentage: 0,
+        logs: [
+          { detail: '第一条旧日志', level: 'info', time: '10:00:01' },
+          { detail: '第二条日志', level: 'info', time: '10:00:02' },
+        ],
+      },
+    },
+  });
+  const logWindow = app.elements.get('logWindow');
+  assert.equal(logWindow.children.length, 2);
+  assert.ok(logWindow.children[0].textContent.includes('第二条日志'));
+  assert.ok(logWindow.children[1].textContent.includes('第一条旧日志'));
+  assert.equal(logWindow.scrollTop, 0);
+
+  logWindow.scrollTop = 10;
+  for (const fn of app.messages) {
+    fn({
+      action: 'PIPELINE_LOG',
+      payload: { detail: '第三条最新日志', level: 'success', time: '10:00:03' },
+    });
+  }
+  assert.ok(logWindow.children[0].textContent.includes('第三条最新日志'));
+  assert.equal(logWindow.scrollTop, 0);
+
+  logWindow.scrollTop = 80;
+  for (const fn of app.messages) {
+    fn({
+      action: 'PIPELINE_LOG',
+      payload: { detail: '第四条日志', level: 'info', time: '10:00:04' },
+    });
+  }
+  assert.ok(logWindow.children[0].textContent.includes('第四条日志'));
+  assert.equal(logWindow.scrollTop, 80);
+});
+
+test('立即巡检失败时日志打印错误原因且不再误报暂无新微博', async () => {
+  const app = await loadPopup({}, {
+    GET_TOPIC_PIN_STATE: {
+      ok: true,
+      config: { autoMonitorEnabled: true, monitorUid: '2318910945', monitorIntervalSec: 180 },
+      tasks: [],
+      monitorStatus: { alarmActive: true, nextRunAt: Date.now() + 60000, lastRunAt: Date.now() - 30000, ok: true, newPost: false },
+    },
+    SAVE_TOPIC_PIN_CONFIG: { ok: true, config: { autoMonitorEnabled: true, monitorUid: '2318910945', monitorIntervalSec: 180 } },
+    RUN_TOPIC_MONITOR_NOW: { ok: true, res: { ok: false, reason: '微博登录态失效' } },
+  });
+  await app.elements.get('btnRunTopicMonitorNow').click();
+  const logWindow = app.elements.get('logWindow');
+  const logsText = logWindow.children.map((c) => c.textContent).join('\n');
+  assert.match(logsText, /巡检失败: 微博登录态失效/);
+  assert.doesNotMatch(logsText, /暂无新微博/);
+  assert.match(app.elements.get('topicMonitorStatusText').textContent, /巡检运行中/);
+});
+
+test('设置页支持展示、新增、删除与恢复支持的发布账号，并联动任务解析', async () => {
+  const app = await loadPopup({
+    cachedPlatformAccounts: ['新浪热点', '新浪科普', '新浪生活'],
+  });
+
+  // 1. 初始渲染包含当前支持的 3 个账号
+  assert.equal(app.elements.get('supportedAccountsCountBadge').textContent, '3 个账号');
+  const container = app.elements.get('supportedAccountsListContainer');
+  assert.equal(container.children.length, 3);
+
+  // 2. 新增发布账号
+  app.elements.get('newSupportedAccountInput').value = '新浪新账号';
+  await app.elements.get('btnAddSupportedAccount').click();
+  assert.equal(app.elements.get('supportedAccountsCountBadge').textContent, '4 个账号');
+  assert.deepEqual(app.storage.customAccounts, ['新浪新账号']);
+
+  // 新增账号可被任务解析识别
+  const parsedAdded = await app.api.parseBatchTaskText('@新浪新账号\n测试新增账号发博文案');
+  assert.equal(parsedAdded.length, 1);
+  assert.equal(parsedAdded[0].account, '新浪新账号');
+
+  // 3. 删除发布账号（从列表中移除并写入 disabledAccounts，任务解析抽号不再抽到它）
+  const lifePill = container.children.find((p) => p.children?.[0]?.textContent === '新浪生活');
+  assert.ok(lifePill);
+  const lifeDelBtn = lifePill.children[1];
+  assert.ok(lifeDelBtn);
+  await lifeDelBtn.click();
+  assert.equal(app.elements.get('supportedAccountsCountBadge').textContent, '3 个账号');
+  assert.ok(app.storage.disabledAccounts.includes('新浪生活'));
+
+  const parsedWithoutLife = await app.api.parseBatchTaskText('测试文案\n@新浪热点值班 辛苦+全部小号');
+  const extractedAccounts = parsedWithoutLife.map((t) => t.account);
+  assert.equal(extractedAccounts.includes('新浪生活'), false);
+  assert.ok(extractedAccounts.includes('新浪新账号'));
+
+  // 4. 恢复默认清空自定义与移除记录
+  await app.elements.get('btnResetDefaultAccounts').click();
+  assert.deepEqual(app.storage.customAccounts, []);
+  assert.deepEqual(app.storage.disabledAccounts, []);
+  assert.equal(app.elements.get('supportedAccountsCountBadge').textContent, '3 个账号');
+});
+
+test('话题置顶页面支持状态筛选、关键词搜索、批量粘贴链接与批量重试异常任务', async () => {
+  const app = await loadPopup({}, {
+    GET_TOPIC_PIN_STATE: {
+      ok: true,
+      config: { autoMonitorEnabled: true, monitorUid: '2318910945', monitorIntervalSec: 150 },
+      tasks: [
+        {
+          id: 'tp_1',
+          mode: 'manual_pin',
+          status: 'done',
+          postUrl: 'https://weibo.com/2318910945/Done1',
+          topics: [{ hashtag: '科技前沿', status: 'pinned', note: '已置顶' }],
+        },
+        {
+          id: 'tp_2',
+          mode: 'auto_monitor',
+          status: 'waiting_review',
+          postUrl: 'https://weibo.com/2318910945/Wait2',
+          topics: [{ hashtag: '体育快讯', status: 'waiting_review', note: '审核中' }],
+        },
+        {
+          id: 'tp_3',
+          mode: 'manual_pin',
+          status: 'error',
+          postUrl: 'https://weibo.com/2318910945/Err3',
+          error: '网络超时',
+          topics: [{ hashtag: '财经热点', status: 'error', note: '失败' }],
+        },
+      ],
+      monitorStatus: { alarmActive: true, ok: true, lastRunAt: Date.now() - 10000, newPost: false },
+    },
+    MANUAL_TOPIC_PIN: { ok: true },
+    RETRY_ALL_ERROR_TOPIC_PIN_TASKS: { ok: true, retriedCount: 1 },
+  });
+
+  // 1. 巡检状态条显示运行中，重试异常按钮显示异常数量
+  const monEl = app.elements.get('topicMonitorStatusText');
+  assert.ok(monEl.classList.contains('is-running'));
+  assert.equal(app.elements.get('btnRetryAllErrorTopicPins').style.display, 'inline-flex');
+  assert.equal(app.elements.get('btnRetryAllErrorTopicPins').textContent, '🔁 重试异常 (1)');
+
+  // 2. 关键词搜索过滤
+  const searchInput = app.elements.get('topicPinSearchInput');
+  searchInput.value = '体育快讯';
+  await searchInput.emit('input');
+  const listEl = app.elements.get('topicPinListContainer');
+  assert.match(listEl.innerHTML, /Wait2/);
+  assert.doesNotMatch(listEl.innerHTML, /Done1/);
+  assert.doesNotMatch(listEl.innerHTML, /Err3/);
+
+  // 清空搜索后，点击批量重试异常
+  searchInput.value = '';
+  await searchInput.emit('input');
+  await app.elements.get('btnRetryAllErrorTopicPins').click();
+  assert.ok(app.sent.some((m) => m.action === 'RETRY_ALL_ERROR_TOPIC_PIN_TASKS'));
+
+  // 3. 手动置顶支持一次提交多条空格/换行分隔的微博链接
+  app.sent.length = 0;
+  app.elements.get('manualPinUrlInput').value = 'https://weibo.com/1/A\nhttps://weibo.com/1/B';
+  await app.elements.get('btnManualPinSubmit').click();
+  const manualCalls = app.sent.filter((m) => m.action === 'MANUAL_TOPIC_PIN');
+  assert.equal(manualCalls.length, 2);
+  assert.equal(manualCalls[0].url, 'https://weibo.com/1/A');
+  assert.equal(manualCalls[1].url, 'https://weibo.com/1/B');
 });
 
 

@@ -5,6 +5,10 @@
  * 2. "Cannot access contents of the page" (针对 Tab Wrangler / Chrome 内存节省程序导致的 discarded/unloaded 休眠标签页自动唤醒重载，以及 CAS 登录重定向精确识别)
  */
 
+if (typeof importScripts === "function") {
+  importScripts("topic_pinner.js");
+}
+
 let state = {
   isRunning: false,
   stage: "准备就绪",
@@ -42,29 +46,59 @@ async function updateScheduledTask(taskId, updates) {
   });
 }
 
-// 初始化防盗链请求头修改规则 (解决 docimg*.docs.qq.com 403 Forbidden 问题)
+// 初始化防盗链请求头修改规则 (docs.qq.com 防盗链 & 扩展后台直连微博 API Referer/Origin 对齐)
 function initRefererRules() {
-  if (chrome.declarativeNetRequest && chrome.declarativeNetRequest.updateDynamicRules) {
-    chrome.declarativeNetRequest.updateDynamicRules({
-      removeRuleIds: [1001],
-      addRules: [
-        {
-          id: 1001,
-          priority: 1,
-          action: {
-            type: "modifyHeaders",
-            requestHeaders: [
-              { header: "Referer", operation: "set", value: "https://docs.qq.com/" }
-            ]
-          },
-          condition: {
-            urlFilter: "docs.qq.com",
-            resourceTypes: ["xmlhttprequest", "image", "other", "sub_frame"]
-          }
-        }
-      ]
-    }).catch((e) => console.warn("DeclarativeNetRequest init:", e));
+  if (!chrome.declarativeNetRequest || !chrome.declarativeNetRequest.updateDynamicRules) return;
+  const rules = [
+    {
+      id: 1001,
+      priority: 1,
+      action: {
+        type: "modifyHeaders",
+        requestHeaders: [
+          { header: "Referer", operation: "set", value: "https://docs.qq.com/" }
+        ]
+      },
+      condition: {
+        urlFilter: "docs.qq.com",
+        resourceTypes: ["xmlhttprequest", "image", "other", "sub_frame"]
+      }
+    }
+  ];
+
+  const extId = chrome?.runtime?.id;
+  if (extId) {
+    const weiboSites = [
+      { idBase: 1002, originIdBase: 1005, urlFilter: "||weibo.com/", excludedRequestDomains: ["s.weibo.com", "m.s.weibo.com"], referer: "https://weibo.com/", origin: "https://weibo.com", prio: 1 },
+      { idBase: 1003, originIdBase: 1006, urlFilter: "||s.weibo.com/", excludedRequestDomains: ["m.s.weibo.com"], referer: "https://s.weibo.com/", origin: "https://s.weibo.com", prio: 2 },
+      { idBase: 1004, originIdBase: 1007, urlFilter: "||m.s.weibo.com/", excludedRequestDomains: undefined, referer: "https://m.s.weibo.com/", origin: "https://m.s.weibo.com", prio: 3 }
+    ];
+    for (const site of weiboSites) {
+      const baseCond = {
+        urlFilter: site.urlFilter,
+        initiatorDomains: [extId],
+        resourceTypes: ["xmlhttprequest"],
+        ...(site.excludedRequestDomains ? { excludedRequestDomains: site.excludedRequestDomains } : {})
+      };
+      rules.push({
+        id: site.idBase,
+        priority: site.prio,
+        action: { type: "modifyHeaders", requestHeaders: [{ header: "Referer", operation: "set", value: site.referer }] },
+        condition: baseCond
+      });
+      rules.push({
+        id: site.originIdBase,
+        priority: site.prio + 3,
+        action: { type: "modifyHeaders", requestHeaders: [{ header: "Origin", operation: "set", value: site.origin }] },
+        condition: { ...baseCond, requestMethods: ["post"] }
+      });
+    }
   }
+
+  chrome.declarativeNetRequest.updateDynamicRules({
+    removeRuleIds: [1001, 1002, 1003, 1004, 1005, 1006, 1007],
+    addRules: rules
+  }).catch((e) => console.warn("DeclarativeNetRequest init:", e));
 }
 initRefererRules();
 if (chrome.runtime.onInstalled) chrome.runtime.onInstalled.addListener(initRefererRules);
@@ -581,7 +615,7 @@ function directExtractDocTasks(targetSheetId, linkColLetter, filterAccount, stri
           let contentVal = "";
           try {
             contentVal = (tools.getCellEditValue(wb, r, contentCol, sid, contentCell) || "").toString().trim();
-          } catch (_) {}
+          } catch (error) { if (strictRead) throw error; }
           if (!contentVal) continue;
 
           const linkCell = target.getCellDataAtPosition(r, linkCol);
@@ -700,12 +734,18 @@ async function directCheckWeiboPlatformReady() {
       document.querySelector('textarea[placeholder*="新鲜事"]') ||
       document.querySelector('.n-input textarea') ||
       document.querySelector('textarea');
-    const accountNodes = Array.from(document.querySelectorAll('.account_selector_checkbox, .n-checkbox__label'));
+    const selectorNodes = Array.from(document.querySelectorAll('.account_selector_checkbox'));
+    const accountNodes = selectorNodes.length > 0
+      ? selectorNodes
+      : Array.from(document.querySelectorAll('.n-checkbox__label'));
     const hasAccountCheckboxes = accountNodes.length > 0;
+    const isNonAccountOption = (name) => !name || name.length < 2 || name.length > 32
+      || /^(全选|全不选|反选|取消|确认|确定|发布|保存并发布|定时发布|仅看已选)$/.test(name)
+      || /(?:仅蓝v|仅视频|同时评论|评论给原微博|仅自己可见)/i.test(name);
     const accounts = Array.from(new Set(
       accountNodes
         .map((el) => String(el.textContent || "").trim())
-        .filter((name) => name && name.length >= 2 && name.length <= 32 && !/^(全选|取消|确认|确定|发布)$/.test(name))
+        .filter((name) => !isNonAccountOption(name))
     ));
     return {
       ok: true,
@@ -775,10 +815,13 @@ async function directPostToWeiboPlatform(task, isDryRun) {
     const rawAccountList = Array.isArray(task.accounts) && task.accounts.length > 0
       ? task.accounts
       : (task.account ? [task.account] : []);
-    const targetAccounts = rawAccountList.map((a) => String(a || "").trim()).filter(Boolean);
+    const targetAccounts = rawAccountList
+      .flatMap((a) => String(a || "").split(/[、，,]+/))
+      .map((a) => a.trim())
+      .filter(Boolean);
     const targetAccount = targetAccounts[0] || "";
     const content = (task.content || "").trim();
-    if (!content) return { ok: false, error: "发博内容为空" };
+    if (!content) return { ok: false, submitted: false, error: "发博内容为空" };
 
     const norm = (s) =>
       String(s || "")
@@ -843,7 +886,7 @@ async function directPostToWeiboPlatform(task, isDryRun) {
           if (lines.length !== 1) continue;
           const checkedNorm = norm(lines[0]);
           if (!checkedNorm || targetNormSet.has(checkedNorm)) continue;
-          if (lines[0].includes("评论") || lines[0].includes("仅蓝V") || lines[0].includes("仅视频")) continue;
+          if (/评论|仅蓝v|仅视频|^全选$|仅自己可见/i.test(lines[0])) continue;
           cb.click();
           clickedAny = true;
         }
@@ -877,9 +920,9 @@ async function directPostToWeiboPlatform(task, isDryRun) {
         return Array.from(roots);
       };
       const exact = matches(spec.norm);
-      if (exact.length) return exact.length === 1 ? exact[0] : null;
+      if (exact.length) return exact.find((el) => !isBoxChecked(el)) || exact[0];
       const base = spec.baseNorm && spec.baseNorm !== spec.norm ? matches(spec.baseNorm) : [];
-      return base.length === 1 ? base[0] : null;
+      return base.length ? (base.find((el) => !isBoxChecked(el)) || base[0]) : null;
     }
 
     async function ensureChecked(el) {
@@ -921,6 +964,15 @@ async function directPostToWeiboPlatform(task, isDryRun) {
       };
 
       // 第一阶段：先探测当前已激活的分类 Tab (0次切换，即时命中)
+      const seenAccountLabels = new Set();
+      const collectVisibleLabels = () => {
+        for (const n of document.querySelectorAll('.n-checkbox__label')) {
+          if (!isVisible(n)) continue;
+          const lbl = (n.innerText || n.textContent || "").trim();
+          if (lbl) seenAccountLabels.add(lbl);
+        }
+      };
+      collectVisibleLabels();
       await tryCheckPendingInCurrentDom();
 
       // 第二阶段：若仍有未勾选账号，依次遍历所有可用分类 Tab（热点、军事、垂类、填充、游戏）
@@ -944,6 +996,7 @@ async function directPostToWeiboPlatform(task, isDryRun) {
             clickTarget.dispatchEvent?.(new MouseEvent("mouseup", { bubbles: true, cancelable: true, view: window }));
           } catch (_) {}
           clickTarget.click?.();
+          if (clickTarget !== tabBtn) tabBtn.click?.();
 
           // 弹性等待 Naive UI 异步挂载该分类下的所有账号 (最多轮询 12 次，每 100ms 探测一次)
           for (let poll = 0; poll < 12; poll++) {
@@ -952,6 +1005,7 @@ async function directPostToWeiboPlatform(task, isDryRun) {
             if (anyPending) break;
           }
 
+          collectVisibleLabels();
           const checkedHere = await tryCheckPendingInCurrentDom();
           if (checkedHere) {
             await clearOtherCheckedAccounts();
@@ -972,11 +1026,13 @@ async function directPostToWeiboPlatform(task, isDryRun) {
           if (targetTab) {
             const clickTarget = targetTab.querySelector?.(".n-tabs-tab__label") || targetTab;
             clickTarget.click?.();
+            if (clickTarget !== targetTab) targetTab.click?.();
             for (let poll = 0; poll < 10; poll++) {
               await new Promise((r) => setTimeout(r, 100));
               const anyPending = targetSpecs.some((s) => !checkedSet.has(s.raw) && findAccountInCurrentDom(s));
               if (anyPending) break;
             }
+            collectVisibleLabels();
             const checkedHere = await tryCheckPendingInCurrentDom();
             if (checkedHere) {
               await clearOtherCheckedAccounts();
@@ -1019,10 +1075,8 @@ async function directPostToWeiboPlatform(task, isDryRun) {
       accountMatched = missingSpecs.length === 0;
 
       if (!accountMatched) {
-        const allVisibleLabels = Array.from(document.querySelectorAll('.n-checkbox__label'))
-          .filter(isVisible)
-          .map((n) => (n.innerText || n.textContent || "").trim())
-          .filter(Boolean);
+        collectVisibleLabels();
+        const allVisibleLabels = Array.from(seenAccountLabels);
         const availableAccounts = allVisibleLabels
           .slice(0, 20)
           .join("、");
@@ -1031,6 +1085,7 @@ async function directPostToWeiboPlatform(task, isDryRun) {
 
         return {
           ok: false,
+          submitted: false,
           error: `未在发稿中台各分类下找到目标账号 [${missingLabel}]（当前可见账号共${allVisibleLabels.length}个，示例: ${availableAccounts || "未加载"}${tabDiag}），已阻断发送以防发错账号`,
         };
       }
@@ -1049,7 +1104,7 @@ async function directPostToWeiboPlatform(task, isDryRun) {
         if (lines.length !== 1) continue;
         const checkedNorm = norm(lines[0]);
         if (!checkedNorm || targetNormSet.has(checkedNorm)) continue;
-        if (lines[0].includes("评论") || lines[0].includes("仅蓝V") || lines[0].includes("仅视频")) continue;
+        if (/评论|仅蓝v|仅视频|^全选$|仅自己可见/i.test(lines[0])) continue;
         extraChecked.push(lines[0]);
       }
       if (extraChecked.length) {
@@ -1440,7 +1495,7 @@ async function directPostToWeiboPlatform(task, isDryRun) {
 
       // 页内指纹级防重复发布锁：60秒内同一页面绝不二次点击发布相同正文！
       // 只在真正点击前写入。按钮不可用或用户已停止时不能占锁，否则合法重试会被误拦。
-      const postFingerprint = `${targetAccount}::${content}`;
+      const postFingerprint = `${targetAccounts.join(",") || targetAccount}::${content}`;
       window.__weiboPostedFingerprints = window.__weiboPostedFingerprints || {};
       if (window.__weiboPostedFingerprints[postFingerprint] && Date.now() - window.__weiboPostedFingerprints[postFingerprint] < 60000) {
         return { ok: false, submitted: false, error: "已拦截重复提交：60秒内该页面已对该博文执行过发布动作，已自动阻断二次点击" };
@@ -4190,7 +4245,7 @@ async function writeDingTalkCellInTab(tabId, cellAddr, linkValue, targetSheetId,
   return { ok: false, error: `钉钉单元格 ${coords.normAddr} 写入后回读校验未生效` };
 }
 
-async function findOrCreateTab(urlMatch, createUrl, shouldActivate = false) {
+async function findOrCreateTab(urlMatch, createUrl, shouldActivate = false, onCreate = null) {
   const cleanMatch = String(urlMatch || "").trim();
   const cleanCreate = String(createUrl || "").trim();
 
@@ -4237,7 +4292,11 @@ async function findOrCreateTab(urlMatch, createUrl, shouldActivate = false) {
     }
   }
 
-  return await chrome.tabs.create({ url: cleanCreate, active: shouldActivate });
+  const createdTab = await chrome.tabs.create({ url: cleanCreate, active: shouldActivate });
+  if (typeof onCreate === "function" && createdTab) {
+    try { onCreate(createdTab); } catch (_) {}
+  }
+  return createdTab;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -4530,6 +4589,7 @@ async function startPipeline(config, reservation = null) {
   let runnerWin = null;
   let weiboTab = null;
   let heldAwakeTabId = null;
+  const createdSilentWeiboTabIds = new Set();
   let contentLockKey = "";
   let contentLockKeys = [];
   let contentLockOwned = false;
@@ -4581,7 +4641,8 @@ async function startPipeline(config, reservation = null) {
       weiboTab = await findOrCreateTab(
         firstIsPoll ? "weibo.com" : "ai-publish-platform.weibo.com",
         initialUrl,
-        false
+        false,
+        (tab) => { if (tab?.id) createdSilentWeiboTabIds.add(tab.id); }
       );
       appendLog("已使用当前浏览器里的后台标签页发博，不另开窗口", "info");
     } else {
@@ -4604,6 +4665,7 @@ async function startPipeline(config, reservation = null) {
       }
       if (effectiveSilent) {
         weiboTab = await chrome.tabs.create({ url: initialUrl, active: false });
+        if (weiboTab?.id) createdSilentWeiboTabIds.add(weiboTab.id);
       } else {
         weiboTab = await chrome.tabs.create({ url: initialUrl, active: true });
       }
@@ -4630,6 +4692,7 @@ async function startPipeline(config, reservation = null) {
           }).catch(() => {});
           runnerWin = null;
         } else {
+          if (weiboTab?.id) createdSilentWeiboTabIds.delete(weiboTab.id);
           await chrome.tabs.update(weiboTab.id, { active: true }).catch(() => {});
         }
         throw new Error(
@@ -4665,6 +4728,7 @@ async function startPipeline(config, reservation = null) {
       }
       if (effectiveSilent) {
         weiboTab = await chrome.tabs.create({ url: targetUrl, active: false });
+        if (weiboTab?.id) createdSilentWeiboTabIds.add(weiboTab.id);
         await syncAwakeTab(weiboTab.id);
       } else {
         weiboTab = await chrome.tabs.create({ url: targetUrl, active: true });
@@ -4673,11 +4737,21 @@ async function startPipeline(config, reservation = null) {
       return await waitForTabLoaded(weiboTab.id, 15000, true);
     }
 
-    const { accountAliases = {} } = await chrome.storage.local.get(["accountAliases"]);
+    const { accountAliases = {}, disabledAccounts = [] } = await chrome.storage.local.get(["accountAliases", "disabledAccounts"]);
     const { publishLedger: initialLedger = [], __unwrittenReceipts__: initialUnwritten = [] } = await chrome.storage.local.get(["publishLedger", "__unwrittenReceipts__"]);
 
     const stripAcctSuffix = (val) => String(val || "").replace(/[（(].*?[）)]/g, "").replace(/-(?:投票|直发|转评|转发)$/u, "").trim();
     const compactAcct = (val) => String(val || "").replace(/\s+/g, "").toLowerCase();
+    const disabledAccountSet = new Set(
+      (Array.isArray(disabledAccounts) ? disabledAccounts : [])
+        .map((n) => compactAcct(n))
+        .filter(Boolean)
+    );
+    const isAccountDisabled = (acct) => {
+      const c = compactAcct(acct);
+      const stripped = compactAcct(stripAcctSuffix(acct));
+      return Boolean((c && disabledAccountSet.has(c)) || (stripped && disabledAccountSet.has(stripped)));
+    };
     const resolveAccountName = (rawAccount) => {
       const rawAcct = String(rawAccount || "").trim();
       let resolved = rawAcct;
@@ -4723,6 +4797,9 @@ async function startPipeline(config, reservation = null) {
       const taskSheetId = task.targetSheetId || parseTabSheetId(taskDocUrl);
       const isPoll = !!(task.poll && Array.isArray(task.poll.options) && task.poll.options.length >= 2);
       const resolvedAccount = resolveAccountName(task.account);
+      if (isAccountDisabled(resolvedAccount) || isAccountDisabled(task.account)) {
+        throw new Error(`账号 [${resolvedAccount || task.account}] 已在系统设置中移除/停用，已拦截发布与文档写回`);
+      }
 
       const { publishLedger: existingLedger = initialLedger, __unwrittenReceipts__ = initialUnwritten } = await chrome.storage.local.get(["publishLedger", "__unwrittenReceipts__"]);
       const allReceipts = [...existingLedger, ...__unwrittenReceipts__];
@@ -4765,7 +4842,7 @@ async function startPipeline(config, reservation = null) {
           const nextSheetId = nextTask.targetSheetId || parseTabSheetId(nextDocUrl);
           if (nextDocUrl !== taskDocUrl || nextSheetId !== taskSheetId) break;
           const nextResolved = resolveAccountName(nextTask.account);
-          if (!nextResolved || batchAccounts.has(nextResolved)) break;
+          if (!nextResolved || isAccountDisabled(nextResolved) || isAccountDisabled(nextTask.account) || batchAccounts.has(nextResolved)) break;
           const nextReceipt = findReceipt(nextTask, nextDocUrl, nextSheetId, nextResolved);
           const nextPending = !nextDryRun && hasPendingSubmission(nextResolved, nextTask.content);
           if (nextReceipt || nextPending) break;
@@ -5074,6 +5151,8 @@ async function startPipeline(config, reservation = null) {
                 );
                 postErr = null;
               }
+            } else if (checkSubmitRes && checkSubmitRes.submitted === false) {
+              postRes = { ok: false, submitted: false, error: errMsg };
             }
           } catch (retryErr) {
             postErr = retryErr;
@@ -5121,6 +5200,7 @@ async function startPipeline(config, reservation = null) {
           }).catch(() => {});
           runnerWin = null; // 保留窗口让用户扫码，不在 finally 关闭
         } else if (weiboTab?.id) {
+          createdSilentWeiboTabIds.delete(weiboTab.id);
           await chrome.tabs.update(weiboTab.id, { active: true }).catch(() => {});
           if (weiboTab.windowId) {
             await chrome.windows.update(weiboTab.windowId, { focused: true }).catch(() => {});
@@ -5361,7 +5441,10 @@ async function startPipeline(config, reservation = null) {
           try {
             if (currentDocTab?.id) {
               const aliveDocTab = await chrome.tabs.get(currentDocTab.id).catch(() => null);
-              if (!aliveDocTab) currentDocTab = null;
+              const targetDocBase = bDocUrl ? bDocUrl.split("?")[0].split("#")[0] : "";
+              if (!aliveDocTab || (targetDocBase && aliveDocTab.url && !String(aliveDocTab.url).includes(targetDocBase))) {
+                currentDocTab = null;
+              }
             }
             if (!currentDocTab?.id && bDocUrl) {
               currentDocTab = await findOrCreateTab(bDocUrl.split("?")[0], bDocUrl, false);
@@ -5443,6 +5526,13 @@ async function startPipeline(config, reservation = null) {
         } else {
           publishedCount++;
           appendLog(`[${bDocName}] 第 ${bTask.row} 行 (${bResolvedAccount || "默认"}) 已发布: ${postUrl}`, "success");
+          if (typeof maybeEnqueueAutoPinForPublishedPost === "function") {
+            maybeEnqueueAutoPinForPublishedPost({
+              postUrl,
+              content: bTask.content,
+              account: bResolvedAccount || bTask.account || "",
+            }).catch((err) => appendLog(`[话题置顶] 自动入队异常: ${err.message}`, "warn"));
+          }
         }
 
         successCount++;
@@ -5481,12 +5571,18 @@ async function startPipeline(config, reservation = null) {
       await releaseBackgroundTab(heldAwakeTabId).catch(() => {});
       heldAwakeTabId = null;
     }
-    // 自动清理后台静默独立发博窗口，确保用户浏览器洁净无残留
+    // 自动清理后台静默独立发博窗口与本次静默新建的发博标签页，确保用户浏览器洁净无残留
     if (runnerWin && runnerWin.id) {
       try {
         await chrome.windows.remove(runnerWin.id);
         appendLog("已自动关闭后台静默发博窗口", "info");
       } catch (_) {}
+    }
+    if (createdSilentWeiboTabIds.size > 0 && chrome.tabs && typeof chrome.tabs.remove === "function") {
+      for (const tabId of createdSilentWeiboTabIds) {
+        await chrome.tabs.remove(tabId).catch(() => {});
+      }
+      appendLog("已自动关闭本次静默新建的发博标签页", "info");
     }
     // 流水线结束后，尚存的待核对记录转为可人工补录/解除状态。
     activePendingSubmissionIds.clear();
@@ -5597,10 +5693,16 @@ ensureScheduleHeartbeat();
 chrome.runtime.onInstalled.addListener(() => {
   ensureScheduleHeartbeat();
   rearmPendingSchedules();
+  if (typeof ensureTopicPinAlarms === "function") {
+    ensureTopicPinAlarms({ recoverRunningTasks: true }).catch(() => {});
+  }
 });
 chrome.runtime.onStartup.addListener(() => {
   ensureScheduleHeartbeat();
   rearmPendingSchedules();
+  if (typeof ensureTopicPinAlarms === "function") {
+    ensureTopicPinAlarms({ recoverRunningTasks: true }).catch(() => {});
+  }
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -5708,7 +5810,24 @@ async function finalizeScheduledBatch(taskIds, error) {
 }
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm?.name === "topicPinTick" && typeof processTopicPinQueue === "function") {
+    await processTopicPinQueue().catch((err) => appendLog(`[话题置顶] 定时推进异常: ${err.message}`, "error"));
+    return;
+  }
+  if (alarm?.name === "topicMonitorTick" && typeof checkWeiboMonitorOnce === "function") {
+    await checkWeiboMonitorOnce()
+      .then((res) => {
+        if (res && res.ok === false && res.reason) {
+          appendLog(`[话题置顶] 巡检失败: ${res.reason}`, res.loginRequired ? "error" : "warn");
+        }
+      })
+      .catch((err) => appendLog(`[话题置顶] 巡检异常: ${err.message}`, "error"));
+    return;
+  }
   ensureScheduleHeartbeat();
+  if (alarm?.name === HEARTBEAT_ALARM_NAME && typeof ensureTopicPinAlarms === "function") {
+    await ensureTopicPinAlarms({ recoverRunningTasks: true }).catch(() => {});
+  }
   await cleanupExpiredDoneSchedules().catch(() => {});
   await sweepAndRunDueSchedules(alarm.name);
 });
@@ -6369,6 +6488,131 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === "RETRY_WRITE_BACK") {
     handleRetryWriteBack(request.payload || request)
       .then((res) => sendResponse(res))
+      .catch((err) => sendResponse({ ok: false, error: err.message || String(err) }));
+    return true;
+  }
+
+  if (request.action === "GET_TOPIC_PIN_STATE") {
+    Promise.all([
+      typeof getTopicPinConfig === "function" ? getTopicPinConfig() : {},
+      typeof getTopicPinTasks === "function" ? getTopicPinTasks() : [],
+      typeof getTopicMonitorStatus === "function" ? getTopicMonitorStatus() : null,
+    ])
+      .then(([config, tasks, monitorStatus]) => sendResponse({ ok: true, config, tasks, monitorStatus }))
+      .catch((err) => sendResponse({ ok: false, error: err.message || String(err) }));
+    return true;
+  }
+
+  if (request.action === "SAVE_TOPIC_PIN_CONFIG") {
+    saveTopicPinConfig(request.config || {})
+      .then((config) => sendResponse({ ok: true, config }))
+      .catch((err) => sendResponse({ ok: false, error: err.message || String(err) }));
+    return true;
+  }
+
+  if (request.action === "MANUAL_TOPIC_PIN") {
+    handleManualTopicPin(request.url)
+      .then((task) => sendResponse({ ok: true, task }))
+      .catch((err) => sendResponse({ ok: false, error: err.message || String(err) }));
+    return true;
+  }
+
+  if (request.action === "MANUAL_APPLY_HOST") {
+    handleManualApplyHost(request.payload || request)
+      .then((task) => sendResponse({ ok: true, task }))
+      .catch((err) => sendResponse({ ok: false, error: err.message || String(err) }));
+    return true;
+  }
+
+  if (request.action === "RETRY_TOPIC_PIN_TASK") {
+    (async () => {
+      const cfg = await getTopicPinConfig();
+      await withTopicPinMutation(async () => {
+        const tasks = await getTopicPinTasks();
+        const next = tasks.map((t) => {
+          if (t.id !== request.taskId) return t;
+          const resetTopics = (t.topics || []).map((tp) =>
+            tp && (tp.status === "error" || tp.status === "timeout")
+              ? { ...tp, status: "pending", note: "等待重试", pinAttempts: 0 }
+              : tp
+          );
+          return {
+            ...t,
+            status: "pending",
+            error: "",
+            nextCheckAt: null,
+            deadlineAt: Date.now() + cfg.maxWaitSec * 1000,
+            topics: resetTopics,
+            updatedAt: Date.now(),
+          };
+        });
+        await saveTopicPinTasks(next);
+      });
+      processTopicPinQueue().catch(() => {});
+      return { ok: true };
+    })()
+      .then((res) => sendResponse(res))
+      .catch((err) => sendResponse({ ok: false, error: err.message || String(err) }));
+    return true;
+  }
+
+  if (request.action === "RETRY_ALL_ERROR_TOPIC_PIN_TASKS") {
+    (async () => {
+      const cfg = await getTopicPinConfig();
+      let retriedCount = 0;
+      await withTopicPinMutation(async () => {
+        const tasks = await getTopicPinTasks();
+        const next = tasks.map((t) => {
+          if (t.status !== "error") return t;
+          retriedCount += 1;
+          const resetTopics = (t.topics || []).map((tp) =>
+            tp && (tp.status === "error" || tp.status === "timeout")
+              ? { ...tp, status: "pending", note: "等待重试", pinAttempts: 0 }
+              : tp
+          );
+          return {
+            ...t,
+            status: "pending",
+            error: "",
+            nextCheckAt: null,
+            deadlineAt: Date.now() + cfg.maxWaitSec * 1000,
+            topics: resetTopics,
+            updatedAt: Date.now(),
+          };
+        });
+        await saveTopicPinTasks(next);
+      });
+      if (retriedCount > 0) processTopicPinQueue().catch(() => {});
+      return { ok: true, retriedCount };
+    })()
+      .then((res) => sendResponse(res))
+      .catch((err) => sendResponse({ ok: false, error: err.message || String(err) }));
+    return true;
+  }
+
+  if (request.action === "REMOVE_TOPIC_PIN_TASK") {
+    withTopicPinMutation(async () => {
+      const tasks = await getTopicPinTasks();
+      await saveTopicPinTasks(tasks.filter((t) => t.id !== request.taskId));
+    })
+      .then(() => sendResponse({ ok: true }))
+      .catch((err) => sendResponse({ ok: false, error: err.message || String(err) }));
+    return true;
+  }
+
+  if (request.action === "CLEAR_DONE_TOPIC_PIN_TASKS") {
+    withTopicPinMutation(async () => {
+      const tasks = await getTopicPinTasks();
+      await saveTopicPinTasks(tasks.filter((t) => ["pending", "running", "waiting_review"].includes(t.status)));
+    })
+      .then(() => sendResponse({ ok: true }))
+      .catch((err) => sendResponse({ ok: false, error: err.message || String(err) }));
+    return true;
+  }
+
+  if (request.action === "RUN_TOPIC_MONITOR_NOW") {
+    checkWeiboMonitorOnce({ manual: true })
+      .then((res) => sendResponse({ ok: true, res }))
       .catch((err) => sendResponse({ ok: false, error: err.message || String(err) }));
     return true;
   }

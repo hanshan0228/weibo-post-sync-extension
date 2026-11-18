@@ -24,22 +24,27 @@
           </svg>
           大屏模式
         </button>
+        <span class="author-tag">by hanzhe</span>
       </div>
     </header>
 
     <!-- 统一全局 Segmented 导航栏 -->
     <nav class="nav-tabs" aria-label="主功能导航">
-      <button class="nav-tab active" id="tabNavSync">📋 同步发布</button>
+      <div class="nav-tab-indicator" id="navTabIndicator" aria-hidden="true"></div>
+      <button class="nav-tab" id="tabNavSync">📋 同步发布</button>
       <button class="nav-tab" id="tabNavSchedule">
         ⏰ 定时管理 <span class="nav-badge" id="schedBadge" style="display:none;">0</span>
       </button>
-      <button class="nav-tab" id="tabNavParser">✨ 任务解析</button>
+      <button class="nav-tab active" id="tabNavParser">✨ 任务解析</button>
       <button class="nav-tab" id="tabNavLedger">📚 发博账本</button>
+      <button class="nav-tab" id="tabNavTopicPin">
+        📌 话题置顶 <span class="nav-badge" id="topicPinBadge" style="display:none;">0</span>
+      </button>
       <button class="nav-tab" id="tabNavSettings">⚙️ 系统设置</button>
     </nav>
 
     <!-- 面板 1：同步发布 -->
-    <main id="panelSync" class="tab-panel active">
+    <main id="panelSync" class="tab-panel" style="display: none;">
       <section class="card config-card">
         <div class="section-header">
           <div class="section-title-group">
@@ -82,9 +87,9 @@
 
       <!-- 控制按钮与进度条 -->
       <section class="card action-card">
-        <div id="dryRunActiveBanner" style="display: none; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 10px; margin-bottom: 10px; background: #FEF3C7; border: 1px solid #F59E0B; border-radius: 6px; font-size: 11px; color: #92400E;">
+        <div id="dryRunActiveBanner" class="notice-banner warning" style="display: none; gap: 8px; margin-bottom: 10px;">
           <span>🛡️ 当前处于<b>【安全演练调试模式】</b>，不会真实发博</span>
-          <button type="button" id="btnDisableDryRunQuick" class="btn-xs btn-outline" style="background: #FFFFFF; border-color: #F59E0B; color: #92400E;">关闭演练</button>
+          <button type="button" id="btnDisableDryRunQuick" class="btn-xs btn-outline">关闭演练</button>
         </div>
         <div class="btn-group">
           <button id="btnAddToSchedule" class="btn btn-primary" title="将当前勾选任务加入定时队列">
@@ -178,7 +183,7 @@
     </main>
 
     <!-- 面板 3：任务解析 -->
-    <main id="panelParser" class="tab-panel" style="display: none;">
+    <main id="panelParser" class="tab-panel active">
       <section class="card parser-card">
         <div class="section-header">
           <div class="section-title-group">
@@ -199,7 +204,10 @@
             <input type="checkbox" id="taskParserPollQuickToggle">
             <span>📊 优先作为投票任务解析</span>
           </label>
-          <button id="btnParseTasks" class="btn-sm btn-primary">🔍 智能解析预览</button>
+          <div style="display: flex; align-items: center; gap: 6px;">
+            <button id="btnPasteParser" class="btn-sm btn-outline" title="一键粘贴剪贴板内容到解析框">📋 一键粘贴</button>
+            <button id="btnParseTasks" class="btn-sm btn-primary">🔍 智能解析预览</button>
+          </div>
         </div>
 
         <div class="list-scroll large-list" id="parsedTasksPreviewContainer">
@@ -246,6 +254,239 @@
           <div class="empty-placeholder">暂无历史发博记录</div>
         </div>
       </section>
+    </main>
+
+    <!-- 面板 4.5：话题置顶与主持人申请 -->
+    <main id="panelTopicPin" class="tab-panel" style="display: none;">
+      <!-- 顶部概览 KPI 条 -->
+      <section class="topic-kpi-grid mb-10" id="topicKpiGrid">
+        <button type="button" class="topic-kpi-card is-active" data-kpi-filter="active" title="点击筛选进行中/审核中任务">
+          <span class="topic-kpi-label">⏳ 进行/审核中</span>
+          <strong class="topic-kpi-val" id="topicKpiActive">0</strong>
+        </button>
+        <button type="button" class="topic-kpi-card is-done" data-kpi-filter="done" title="点击筛选已完成任务">
+          <span class="topic-kpi-label">✅ 已置顶/完成</span>
+          <strong class="topic-kpi-val" id="topicKpiDone">0</strong>
+        </button>
+        <button type="button" class="topic-kpi-card is-error" data-kpi-filter="error" title="点击筛选异常任务">
+          <span class="topic-kpi-label">⚠️ 异常待处理</span>
+          <strong class="topic-kpi-val" id="topicKpiError">0</strong>
+        </button>
+        <button type="button" class="topic-kpi-card is-all" data-kpi-filter="all" title="点击查看全部任务">
+          <span class="topic-kpi-label">📋 队列总计</span>
+          <strong class="topic-kpi-val" id="topicKpiTotal">0</strong>
+        </button>
+      </section>
+
+      <section class="card mb-10">
+        <div class="section-header">
+          <span class="section-title">🤖 自动置顶与账号巡检</span>
+          <span class="count-pill">自动模式</span>
+        </div>
+        <div class="switches-group" style="margin-top: 0; padding-top: 0; border-top: none;">
+          <div class="switch-row">
+            <div class="switch-label-group">
+              <span class="switch-title">📌 发博成功后自动申请并置顶</span>
+              <span class="switch-desc">真实发博拿到链接后自动检测 #话题#、申请主持人并置顶</span>
+            </div>
+            <label class="toggle-switch">
+              <input type="checkbox" id="topicAutoPublishToggle">
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div class="switch-row">
+            <div class="switch-label-group">
+              <span class="switch-title">📡 定时巡检微博主页新博</span>
+              <span class="switch-desc">按自定义间隔（含±15%防风控抖动）检查目标 UID 最新微博</span>
+            </div>
+            <label class="toggle-switch">
+              <input type="checkbox" id="topicAutoMonitorToggle">
+              <span class="slider"></span>
+            </label>
+          </div>
+        </div>
+        <div class="topic-monitor-bar">
+          <input type="text" id="topicMonitorUidInput" class="ui-input flex-1" placeholder="监控微博 UID（如 1618051664）">
+          <div class="topic-interval-group">
+            <span class="topic-unit-label">间隔</span>
+            <input type="number" id="topicMonitorIntervalSec" class="ui-input" style="width:62px; text-align:center;" min="60" max="3600" value="150" title="扫描微博主页间隔秒数（最小60秒）">
+            <span class="topic-unit-label">秒</span>
+          </div>
+          <button type="button" id="btnSaveTopicMonitorUid" class="btn-sm btn-outline">保存</button>
+          <button type="button" id="btnRunTopicMonitorNow" class="btn-sm btn-primary-outline">📡 立即巡检</button>
+        </div>
+        <div id="topicMonitorStatusText" class="topic-monitor-status"></div>
+      </section>
+
+      <details class="card collapsible-box topic-details-card mb-10" id="topicScheduleCard">
+        <summary class="topic-details-summary">
+          <span>⏰ 定时启动与运行计划（时间窗口 / 运行时长）</span>
+          <span class="count-pill" id="topicScheduleStatusPill">未启用</span>
+        </summary>
+        <div class="topic-details-body">
+          <div class="switch-row" style="padding: 2px 0;">
+            <div class="switch-label-group">
+              <span class="switch-title">启用自动运行计划</span>
+              <span class="switch-desc">按时段自动启动/停止主页巡检，或运行 N 小时后自动停止</span>
+            </div>
+            <label class="toggle-switch">
+              <input type="checkbox" id="topicSchedEnabled">
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div class="form-row" style="gap:6px;">
+            <label style="font-size:11.5px; color:var(--text-sub);">计划模式：</label>
+            <select id="topicSchedMode" class="ui-select flex-1">
+              <option value="window">时间窗口（每天在指定时段自动启停）</option>
+              <option value="duration">运行时长（启动后运行 N 小时停止）</option>
+            </select>
+          </div>
+          <div>
+            <label class="modal-form-label" style="margin-bottom:4px; display:block;">运行星期</label>
+            <div class="topic-weekdays-row">
+              <label class="checkbox-label"><input type="checkbox" class="topic-wd-cb" data-day="0" checked> 周一</label>
+              <label class="checkbox-label"><input type="checkbox" class="topic-wd-cb" data-day="1" checked> 周二</label>
+              <label class="checkbox-label"><input type="checkbox" class="topic-wd-cb" data-day="2" checked> 周三</label>
+              <label class="checkbox-label"><input type="checkbox" class="topic-wd-cb" data-day="3" checked> 周四</label>
+              <label class="checkbox-label"><input type="checkbox" class="topic-wd-cb" data-day="4" checked> 周五</label>
+              <label class="checkbox-label"><input type="checkbox" class="topic-wd-cb" data-day="5" checked> 周六</label>
+              <label class="checkbox-label"><input type="checkbox" class="topic-wd-cb" data-day="6" checked> 周日</label>
+            </div>
+          </div>
+          <div id="topicSchedWindowFields" class="form-row" style="gap:6px;">
+            <label style="font-size:11.5px; color:var(--text-sub);">开始</label>
+            <input type="time" id="topicSchedStart" class="ui-input" value="07:00">
+            <label style="font-size:11.5px; color:var(--text-sub);">结束</label>
+            <input type="time" id="topicSchedEnd" class="ui-input" value="22:59">
+            <span style="font-size:10.5px; color:var(--text-sub);">（支持跨午夜）</span>
+          </div>
+          <div id="topicSchedDurationFields" class="form-row" style="gap:6px; display:none;">
+            <label style="font-size:11.5px; color:var(--text-sub);">运行时长</label>
+            <input type="number" id="topicSchedDuration" class="ui-input" style="width:80px;" min="0.5" max="24" step="0.5" value="8">
+            <span style="font-size:11.5px; color:var(--text-sub);">小时后自动停止</span>
+          </div>
+          <button type="button" id="btnSaveTopicSchedule" class="btn btn-primary btn-sm">💾 保存运行计划</button>
+        </div>
+      </details>
+
+      <section class="card mb-10">
+        <div class="section-header">
+          <span class="section-title">✋ 手动置顶 / 申请主持人</span>
+          <span class="count-pill">手动模式</span>
+        </div>
+        <div style="display:flex; flex-direction:column; gap:8px;">
+          <div class="topic-action-block">
+            <label class="modal-form-label" style="margin-bottom:5px; display:block;">1. 手动微博链接置顶 <span class="topic-sub-hint">支持多条链接空格/逗号/换行分隔</span></label>
+            <div class="form-row" style="gap:6px;">
+              <input type="text" id="manualPinUrlInput" class="ui-input flex-1" placeholder="粘贴微博链接（https://weibo.com/...），支持多条">
+              <button type="button" id="btnPasteManualPinUrl" class="btn-sm btn-outline" title="从剪贴板粘贴微博链接">📋 粘贴</button>
+              <button type="button" id="btnManualPinSubmit" class="btn-sm btn-primary">📌 立即置顶</button>
+            </div>
+          </div>
+          <div class="topic-action-block">
+            <label class="modal-form-label" style="margin-bottom:5px; display:block;">2. 手动申请话题主持人</label>
+            <div class="form-row" style="gap:6px;">
+              <input type="text" id="manualApplyInput" class="ui-input flex-1" placeholder="输入 #话题名称# 或微博链接...">
+              <button type="button" id="btnManualApplySubmit" class="btn-sm btn-secondary">🙋 申请主持人</button>
+            </div>
+            <div class="topic-apply-options">
+              <label class="checkbox-label topic-opt-pill">
+                <input type="checkbox" id="manualApplyFastMode">
+                <span>⚡ 快速模式</span>
+              </label>
+              <label class="checkbox-label topic-opt-pill">
+                <input type="checkbox" id="manualApplyAutoPin">
+                <span>📌 申请后自动置顶（需输入微博链接）</span>
+              </label>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card mb-10">
+        <div class="section-header">
+          <div class="section-title-group">
+            <span class="section-title">📋 置顶任务队列</span>
+            <span class="count-pill" id="topicPinQueueCount">0 条</span>
+          </div>
+          <div class="section-actions">
+            <button type="button" id="btnRefreshTopicPins" class="btn-xs btn-outline" title="刷新置顶队列与巡检状态">🔄 刷新</button>
+            <button type="button" id="btnRetryAllErrorTopicPins" class="btn-xs btn-outline" style="display:none;" title="一键重试全部异常任务">🔁 重试异常</button>
+            <button type="button" id="btnClearDoneTopicPins" class="btn-xs btn-outline">🧹 清理已完成</button>
+          </div>
+        </div>
+        <div class="filter-toolbar" style="margin-bottom: 6px;">
+          <div class="filter-chips" id="topicPinFilterChips">
+            <span class="filter-chip active" data-topic-filter="all">全部 (0)</span>
+            <span class="filter-chip" data-topic-filter="active">进行中 (0)</span>
+            <span class="filter-chip" data-topic-filter="done">已完成 (0)</span>
+            <span class="filter-chip" data-topic-filter="error">异常 (0)</span>
+          </div>
+        </div>
+        <div style="margin-bottom: 8px;">
+          <input type="text" id="topicPinSearchInput" class="ui-input" style="height: 28px;" placeholder="🔍 搜索 #话题#、微博链接或正文关键词...">
+        </div>
+        <div class="list-scroll large-list" id="topicPinListContainer" style="max-height: 260px;">
+          <div class="empty-placeholder">暂无话题置顶任务</div>
+        </div>
+      </section>
+
+      <details class="card collapsible-box topic-details-card" id="topicPinSettingsDetails">
+        <summary class="topic-details-summary">
+          <span>⚙️ 主持人资料、过滤规则与等待参数</span>
+          <span class="count-pill">高级配置</span>
+        </summary>
+        <div class="topic-details-body">
+          <div class="topic-form-grid-3">
+            <div>
+              <label class="modal-form-label">本账号昵称</label>
+              <input type="text" id="topicHostAccountName" class="ui-input" placeholder="默认 新浪热点">
+            </div>
+            <div>
+              <label class="modal-form-label">分类</label>
+              <input type="text" id="topicHostCategory" class="ui-input" placeholder="如: 社会">
+            </div>
+            <div>
+              <label class="modal-form-label">地区</label>
+              <input type="text" id="topicHostRegion" class="ui-input" placeholder="如: 全国">
+            </div>
+          </div>
+          <div class="topic-avatar-row">
+            <span style="font-size:11.5px; color:var(--text-sub); white-space:nowrap;">🖼️ 主持人头像：</span>
+            <input type="file" id="topicHostAvatarInput" accept="image/*" style="font-size:11px; flex:1; min-width:0;">
+            <span id="topicHostAvatarStatus" class="count-pill">未上传</span>
+          </div>
+          <div class="topic-apply-options">
+            <label class="checkbox-label topic-opt-pill"><input type="checkbox" id="topicSkipVotes" checked> 跳过投票微博</label>
+            <label class="checkbox-label topic-opt-pill"><input type="checkbox" id="topicSkipThird" checked> 跳过第3个话题</label>
+          </div>
+          <div class="topic-form-grid-2">
+            <div>
+              <label class="modal-form-label" style="margin-bottom:3px; display:block;">豁免话题（每行或逗号分隔）</label>
+              <textarea id="topicSkipTopicsInput" rows="2" class="ui-textarea" placeholder="热知识点&#10;人微阎轻"></textarea>
+            </div>
+            <div>
+              <label class="modal-form-label" style="margin-bottom:3px; display:block;">正文跳过关键词（每行或逗号分隔）</label>
+              <textarea id="topicSkipKeywordsInput" rows="2" class="ui-textarea" placeholder="抽奖&#10;前主编"></textarea>
+            </div>
+          </div>
+          <div class="topic-form-grid-3">
+            <div>
+              <label class="modal-form-label">申请后等待(秒)</label>
+              <input type="number" id="topicMinWaitSec" class="ui-input" min="15" max="600" value="120">
+            </div>
+            <div>
+              <label class="modal-form-label">轮询间隔(秒)</label>
+              <input type="number" id="topicPollIntervalSec" class="ui-input" min="20" max="600" value="60">
+            </div>
+            <div>
+              <label class="modal-form-label">超时上限(秒)</label>
+              <input type="number" id="topicMaxWaitSec" class="ui-input" min="60" max="3600" value="600">
+            </div>
+          </div>
+          <button type="button" id="btnSaveTopicPinConfig" class="btn btn-primary btn-sm">💾 保存置顶配置</button>
+        </div>
+      </details>
     </main>
 
     <!-- 面板 5：系统设置中心 (统一收拢全部功能开关与规则) -->
@@ -303,7 +544,32 @@
         <textarea id="taskParserStripKeywords" rows="3" class="ui-textarea" placeholder="输入需剔除的口癖，如：&#10;辛苦老师发布&#10;麻烦尽快发一下&#10;已核对"></textarea>
       </section>
 
-      <!-- 卡片 3：账号别名字典 -->
+      <!-- 卡片 3：支持的发布账号管理 -->
+      <section class="card accounts-manage-card mb-10">
+        <div class="section-header">
+          <div class="section-title-group">
+            <span class="section-title">👤 支持的发布账号管理</span>
+            <span class="count-pill" id="supportedAccountsCountBadge">0 个账号</span>
+          </div>
+          <div class="section-actions">
+            <button id="btnResetDefaultAccounts" class="btn-xs btn-outline">🔄 恢复默认</button>
+          </div>
+        </div>
+
+        <div class="notice-banner info">
+          <span>💡 列出当前支持任务解析与发博的账号；删除已下线账号可避免解析抽号、发博及写回文档出错</span>
+        </div>
+
+        <div class="form-row" style="gap: 6px; margin-bottom: 8px;">
+          <input type="text" id="newSupportedAccountInput" class="ui-input flex-1" placeholder="输入新增发布账号名称（与发稿中台一致）...">
+          <button type="button" id="btnAddSupportedAccount" class="btn-xs btn-primary">＋ 新增账号</button>
+        </div>
+
+        <div class="account-tags-grid" id="supportedAccountsListContainer"></div>
+        <div class="disabled-accounts-wrap" id="disabledAccountsWrap" style="display: none;"></div>
+      </section>
+
+      <!-- 卡片 4：账号别名字典 -->
       <section class="card accounts-card">
         <div class="section-header">
           <div class="section-title-group">

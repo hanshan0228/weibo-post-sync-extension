@@ -17,45 +17,126 @@ document.addEventListener("DOMContentLoaded", async () => {
   const tabNavSchedule = document.getElementById("tabNavSchedule");
   const tabNavParser = document.getElementById("tabNavParser");
   const tabNavLedger = document.getElementById("tabNavLedger");
+  const tabNavTopicPin = document.getElementById("tabNavTopicPin");
   const tabNavSettings = document.getElementById("tabNavSettings");
 
   const panelSync = document.getElementById("panelSync");
   const panelSchedule = document.getElementById("panelSchedule");
   const panelParser = document.getElementById("panelParser");
   const panelLedger = document.getElementById("panelLedger");
+  const panelTopicPin = document.getElementById("panelTopicPin");
   const panelSettings = document.getElementById("panelSettings");
   const schedBadge = document.getElementById("schedBadge");
+  const topicPinBadge = document.getElementById("topicPinBadge");
+
+  const navTabIndicator = document.getElementById("navTabIndicator");
+  const tabOrder = ["sync", "schedule", "parser", "ledger", "topicPin", "settings"];
+  let activeTabName = "parser";
+
+  const syncNavIndicator = (activeBtn, instant = false) => {
+    if (!navTabIndicator || !activeBtn) return;
+    const width = activeBtn.offsetWidth || 0;
+    const left = activeBtn.offsetLeft || 0;
+    if (width <= 0) {
+      activeBtn.classList.add("is-fallback-bg");
+      return;
+    }
+    activeBtn.classList.remove("is-fallback-bg");
+    if (instant) {
+      navTabIndicator.style.transition = "none";
+    }
+    navTabIndicator.style.width = `${width}px`;
+    navTabIndicator.style.transform = `translate3d(${left}px, 0, 0)`;
+    navTabIndicator.style.opacity = "1";
+    if (instant) {
+      navTabIndicator.offsetWidth;
+      navTabIndicator.style.transition = "";
+    }
+  };
+
+  const animatePanelEnter = (panel, dir) => {
+    if (!panel) return;
+    if (typeof panel.style?.setProperty === "function") {
+      panel.style.setProperty("--panel-enter-x", dir > 0 ? "10px" : dir < 0 ? "-10px" : "0px");
+    }
+    panel.classList.remove("is-entering");
+    void panel.offsetWidth;
+    panel.classList.add("is-entering");
+  };
 
   const switchTab = (tabName) => {
-    [tabNavSync, tabNavSchedule, tabNavParser, tabNavLedger, tabNavSettings].forEach((btn) => btn?.classList.remove("active"));
-    [panelSync, panelSchedule, panelParser, panelLedger, panelSettings].forEach((p) => { if (p) p.style.display = "none"; });
+    const prevIdx = tabOrder.indexOf(activeTabName);
+    const nextIdx = tabOrder.indexOf(tabName);
+    const dir = prevIdx !== -1 && nextIdx !== -1 && prevIdx !== nextIdx ? (nextIdx > prevIdx ? 1 : -1) : 0;
+    activeTabName = tabName;
+
+    [tabNavSync, tabNavSchedule, tabNavParser, tabNavLedger, tabNavTopicPin, tabNavSettings].forEach((btn) => {
+      btn?.classList.remove("active", "is-fallback-bg");
+    });
+    [panelSync, panelSchedule, panelParser, panelLedger, panelTopicPin, panelSettings].forEach((p) => {
+      if (p) {
+        p.style.display = "none";
+        p.classList.remove("is-entering");
+      }
+    });
+
+    let activeBtn = null;
+    let activePanel = null;
 
     if (tabName === "sync") {
-      tabNavSync?.classList.add("active");
-      if (panelSync) panelSync.style.display = "block";
+      activeBtn = tabNavSync;
+      activePanel = panelSync;
     } else if (tabName === "schedule") {
-      tabNavSchedule?.classList.add("active");
-      if (panelSchedule) panelSchedule.style.display = "block";
+      activeBtn = tabNavSchedule;
+      activePanel = panelSchedule;
       refreshScheduleQueue();
     } else if (tabName === "parser") {
-      tabNavParser?.classList.add("active");
-      if (panelParser) panelParser.style.display = "block";
+      activeBtn = tabNavParser;
+      activePanel = panelParser;
     } else if (tabName === "ledger") {
-      tabNavLedger?.classList.add("active");
-      if (panelLedger) panelLedger.style.display = "block";
+      activeBtn = tabNavLedger;
+      activePanel = panelLedger;
       renderLedgerList();
+    } else if (tabName === "topicPin") {
+      activeBtn = tabNavTopicPin;
+      activePanel = panelTopicPin;
+      refreshTopicPinState();
     } else if (tabName === "settings") {
-      tabNavSettings?.classList.add("active");
-      if (panelSettings) panelSettings.style.display = "block";
+      activeBtn = tabNavSettings;
+      activePanel = panelSettings;
+      renderSupportedAccountsList();
       renderAliasList();
       updateSchedulePauseUI();
     }
+
+    if (activeBtn) {
+      activeBtn.classList.add("active");
+      syncNavIndicator(activeBtn);
+    }
+    if (activePanel) {
+      activePanel.style.display = "block";
+      animatePanelEnter(activePanel, dir);
+    }
   };
+
+  if (typeof requestAnimationFrame === "function") {
+    requestAnimationFrame(() => {
+      const initialActive = document.querySelector(".nav-tab.active");
+      if (initialActive) syncNavIndicator(initialActive, true);
+    });
+  }
+  if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+    window.addEventListener("resize", () => {
+      const currentActive = document.querySelector(".nav-tab.active");
+      if (currentActive) syncNavIndicator(currentActive, true);
+    });
+  }
 
   tabNavSync?.addEventListener("click", () => switchTab("sync"));
   tabNavSchedule?.addEventListener("click", () => switchTab("schedule"));
   tabNavParser?.addEventListener("click", () => switchTab("parser"));
   tabNavLedger?.addEventListener("click", () => switchTab("ledger"));
+  tabNavTopicPin?.addEventListener("click", () => switchTab("topicPin"));
   tabNavSettings?.addEventListener("click", () => switchTab("settings"));
 
   // ── 3. 折叠日志面板 ──
@@ -155,11 +236,20 @@ document.addEventListener("DOMContentLoaded", async () => {
   const taskParserStripKeywords = document.getElementById("taskParserStripKeywords");
   const taskParserPollToggle = document.getElementById("taskParserPollQuickToggle") || document.getElementById("taskParserPollToggle");
   const parserCountBadge = document.getElementById("parserCountBadge");
+  const btnPasteParser = document.getElementById("btnPasteParser");
   const btnParseTasks = document.getElementById("btnParseTasks");
   const btnClearParser = document.getElementById("btnClearParser");
   const parsedTasksPreviewContainer = document.getElementById("parsedTasksPreviewContainer");
   const btnParserToSchedule = document.getElementById("btnParserToSchedule");
   const btnParserRunNow = document.getElementById("btnParserRunNow");
+
+  // 支持的发布账号管理控件
+  const supportedAccountsListContainer = document.getElementById("supportedAccountsListContainer");
+  const supportedAccountsCountBadge = document.getElementById("supportedAccountsCountBadge");
+  const newSupportedAccountInput = document.getElementById("newSupportedAccountInput");
+  const btnAddSupportedAccount = document.getElementById("btnAddSupportedAccount");
+  const btnResetDefaultAccounts = document.getElementById("btnResetDefaultAccounts");
+  const disabledAccountsWrap = document.getElementById("disabledAccountsWrap");
 
   // 账号别名控件
   const aliasListContainer = document.getElementById("aliasListContainer");
@@ -199,6 +289,8 @@ document.addEventListener("DOMContentLoaded", async () => {
   let scannedTasks = [];
   let cachedScheduledTasks = [];
   let cachedPlatformAccounts = [];
+  let customAccounts = [];
+  let disabledAccounts = [];
   let currentSchedFilter = "pending";
   let currentSchedDoc = "all";
   let currentTaskDocFilter = "all";
@@ -243,13 +335,20 @@ document.addEventListener("DOMContentLoaded", async () => {
     { id: "slot_2", name: "文档 2 (副表)", url: "", linkCol: "E" },
   ];
 
-  chrome.storage.local.get(["docPresets", "docUrl", "linkCol", "dryRun", "silentMode", "cachedScannedTasks", "cachedScannedAt", "scheduledTasks", "cachedPlatformAccounts", "docSlotsCollapsed"], (stored) => {
+  chrome.storage.local.get(["docPresets", "docUrl", "linkCol", "dryRun", "silentMode", "cachedScannedTasks", "cachedScannedAt", "scheduledTasks", "cachedPlatformAccounts", "customAccounts", "disabledAccounts", "docSlotsCollapsed"], (stored) => {
     if (Array.isArray(stored.scheduledTasks)) {
       cachedScheduledTasks = stored.scheduledTasks;
     }
     if (Array.isArray(stored.cachedPlatformAccounts)) {
-      cachedPlatformAccounts = stored.cachedPlatformAccounts.filter((n) => typeof n === "string" && n.trim());
+      cachedPlatformAccounts = stored.cachedPlatformAccounts.filter((n) => isValidCachedPlatformAccount(n));
     }
+    if (Array.isArray(stored.customAccounts)) {
+      customAccounts = Array.from(new Set(stored.customAccounts.map((n) => String(n || "").trim()).filter(Boolean)));
+    }
+    if (Array.isArray(stored.disabledAccounts)) {
+      disabledAccounts = Array.from(new Set(stored.disabledAccounts.map((n) => String(n || "").trim()).filter(Boolean)));
+    }
+    renderSupportedAccountsList();
     if (Array.isArray(stored.docPresets) && stored.docPresets.length > 0) {
       docSlots = stored.docPresets;
     } else if (stored.docUrl) {
@@ -1158,7 +1257,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   function parseTableTime(timeStr) {
     const raw = String(timeStr || "")
       .replace(/：/g, ":")
-      .replace(/(\d{1,2})[点时](\d{1,2})?分?/g, (_, h, min) => `${h}:${min || "00"}`)
+      .replace(/(\d{1,2})[点时](\d{1,2})?分?/g, (_, h, min) => `${h}:${String(min || "00").padStart(2, "0")}`)
       .trim();
     const now = new Date();
 
@@ -1538,6 +1637,9 @@ document.addEventListener("DOMContentLoaded", async () => {
         optsHtml += `<option value="${escapeHtml(url)}">${escapeHtml(val.name)} (${val.count})</option>`;
       });
       schedDocFilter.innerHTML = optsHtml;
+      if (currentSchedDoc !== "all" && !docMap.has(currentSchedDoc)) {
+        currentSchedDoc = "all";
+      }
       schedDocFilter.value = currentSchedDoc;
     }
 
@@ -1844,6 +1946,8 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (editModalPollOpt2) editModalPollOpt2.value = "";
       if (editModalPollOpt3) editModalPollOpt3.value = "";
       if (editModalPollOpt4) editModalPollOpt4.value = "";
+      const defaultDayRadio = document.querySelector('input[name="editPollDays"][value="30"]');
+      if (defaultDayRadio) defaultDayRadio.checked = true;
     }
 
     scheduleEditModal.style.display = "flex";
@@ -1909,6 +2013,10 @@ document.addEventListener("DOMContentLoaded", async () => {
       let fireStr = "";
       if (newDateVal) {
         fireTs = new Date(newDateVal).getTime();
+        if (!Number.isFinite(fireTs) || fireTs <= 0) {
+          alert("计划发布时间格式无效！");
+          return;
+        }
         fireStr = newDateVal.replace("T", " ");
       }
 
@@ -2026,16 +2134,18 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   // ── 10. 日志与全局通信 ──
   function renderLogItem(msg, type = "info", timeStr = null) {
-    const isNearBottom = logWindow
-      ? (logWindow.scrollHeight - logWindow.scrollTop - logWindow.clientHeight < 32)
-      : true;
+    const isNearTop = logWindow ? (logWindow.scrollTop < 32) : true;
     const item = document.createElement("div");
     item.className = `log-item ${type}`;
     const time = timeStr || new Date().toLocaleTimeString("zh-CN", { hour12: false });
     item.textContent = `[${time}] ${msg}`;
-    logWindow.appendChild(item);
-    if (isNearBottom) {
-      logWindow.scrollTop = logWindow.scrollHeight;
+    if (typeof logWindow.prepend === "function") {
+      logWindow.prepend(item);
+    } else {
+      logWindow.insertBefore(item, logWindow.firstChild || null);
+    }
+    if (isNearTop) {
+      logWindow.scrollTop = 0;
     }
     if (logStatusPeek) logStatusPeek.textContent = msg.substring(0, 30);
     if (type === "error" && logWindow?.classList.contains("collapsed")) {
@@ -2081,6 +2191,10 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (panelLedger && panelLedger.style.display !== "none") {
         renderLedgerList();
       }
+    }
+
+    if (request.action === "TOPIC_PIN_UPDATED") {
+      refreshTopicPinState();
     }
 
     if (request.action === "TASK_ITEM_COMPLETED") {
@@ -2332,7 +2446,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         const count = publishLedger.filter((i) => i.docName === name).length;
         ledgerDocFilter.innerHTML += `<option value="${escapeHtml(name)}">${escapeHtml(name)} (${count})</option>`;
       });
-      ledgerDocFilter.value = curVal || "all";
+      ledgerDocFilter.value = (curVal && docNames.includes(curVal)) ? curVal : "all";
     }
 
     const filtered = filterLedgerItems(publishLedger);
@@ -2523,7 +2637,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   ledgerDocFilter?.addEventListener("change", () => renderLedgerList());
 
   btnExportLedgerCsv?.addEventListener("click", async () => {
-    const { publishLedger = [] } = await chrome.storage.local.get(["publishLedger"]);
+    const publishLedger = await getVisibleLedger();
     if (publishLedger.length === 0) {
       appendLog("当前账本为空，暂无可导出的数据", "warn");
       return;
@@ -2710,15 +2824,12 @@ document.addEventListener("DOMContentLoaded", async () => {
     "民生温度计",
     "新浪非遗",
     "新浪颜选",
-    "新浪运动",
-    "新浪航天",
     "新浪科普",
     "新浪生活",
     "新浪民生",
     "新浪文旅",
     "新浪手机",
     "新浪天文",
-    "新浪医典",
     "新浪出行",
     "新浪军事",
     "新浪热点",
@@ -2760,26 +2871,174 @@ document.addEventListener("DOMContentLoaded", async () => {
     return String(str || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   }
 
-  function getActiveOfficialAccounts() {
-    if (Array.isArray(cachedPlatformAccounts) && cachedPlatformAccounts.length >= 2) {
-      return Array.from(new Set(cachedPlatformAccounts));
-    }
-    return KNOWN_OFFICIAL_ACCOUNTS;
+  function isValidCachedPlatformAccount(name) {
+    const clean = typeof name === "string" ? name.trim() : "";
+    if (!clean || clean.length < 2 || clean.length > 32) return false;
+    if (/^(全选|全不选|反选|取消|确认|确定|发布|保存并发布|定时发布|仅看已选)$/.test(clean)) return false;
+    if (/(?:仅蓝v|仅视频|同时评论|评论给原微博|仅自己可见)/i.test(clean)) return false;
+    if (["新浪运动", "新浪航天", "新浪医典"].includes(clean)) return false;
+    return true;
   }
 
+  function getDisabledAccountSet() {
+    return new Set(
+      (Array.isArray(disabledAccounts) ? disabledAccounts : [])
+        .map((n) => String(n || "").trim().toLowerCase())
+        .filter(Boolean)
+    );
+  }
+
+  function getActiveOfficialAccounts() {
+    const cleanedCached = (Array.isArray(cachedPlatformAccounts) && cachedPlatformAccounts.length >= 2)
+      ? Array.from(new Set(cachedPlatformAccounts.map((n) => String(n || "").trim()).filter(isValidCachedPlatformAccount)))
+      : [];
+    const baseList = cleanedCached.length >= 2 ? cleanedCached : KNOWN_OFFICIAL_ACCOUNTS;
+    const disabledSet = getDisabledAccountSet();
+    const result = [];
+    const seen = new Set();
+    for (const raw of [...baseList, ...(Array.isArray(customAccounts) ? customAccounts : [])]) {
+      const name = String(raw || "").trim();
+      if (!name || !isValidCachedPlatformAccount(name)) continue;
+      const lower = name.toLowerCase();
+      if (disabledSet.has(lower) || seen.has(lower)) continue;
+      seen.add(lower);
+      result.push(name);
+    }
+    return result;
+  }
+
+  async function saveSupportedAccountsState() {
+    await chrome.storage.local.set({
+      customAccounts: Array.isArray(customAccounts) ? customAccounts : [],
+      disabledAccounts: Array.isArray(disabledAccounts) ? disabledAccounts : [],
+    });
+  }
+
+  function renderSupportedAccountsList() {
+    if (!supportedAccountsListContainer) return;
+    const activeAccounts = getActiveOfficialAccounts();
+    const customSet = new Set((customAccounts || []).map((n) => String(n || "").trim().toLowerCase()));
+    if (supportedAccountsCountBadge) {
+      supportedAccountsCountBadge.textContent = `${activeAccounts.length} 个账号`;
+    }
+
+    supportedAccountsListContainer.innerHTML = "";
+    if (activeAccounts.length === 0) {
+      supportedAccountsListContainer.innerHTML = `<div class="empty-placeholder" style="width:100%;padding:10px 0;">暂无可用发布账号，请新增或点击【恢复默认】</div>`;
+    } else {
+      activeAccounts.forEach((acct) => {
+        const pill = document.createElement("span");
+        const isCustom = customSet.has(acct.toLowerCase());
+        pill.className = `account-tag-pill${isCustom ? " is-custom" : ""}`;
+        const labelSpan = document.createElement("span");
+        labelSpan.textContent = acct;
+        const delBtn = document.createElement("button");
+        delBtn.type = "button";
+        delBtn.className = "account-tag-del";
+        delBtn.dataset.acct = acct;
+        delBtn.title = "移除该发布账号";
+        delBtn.textContent = "✕";
+        delBtn.addEventListener("click", async () => {
+          const lower = acct.toLowerCase();
+          customAccounts = (customAccounts || []).filter((n) => String(n || "").trim().toLowerCase() !== lower);
+          if (!disabledAccounts.some((n) => String(n || "").trim().toLowerCase() === lower)) {
+            disabledAccounts = [...disabledAccounts, acct];
+          }
+          await saveSupportedAccountsState();
+          renderSupportedAccountsList();
+          appendLog(`已移除发布账号 [${acct}]（解析抽号与写回均将跳过）`, "info");
+        });
+        pill.appendChild(labelSpan);
+        pill.appendChild(delBtn);
+        supportedAccountsListContainer.appendChild(pill);
+      });
+    }
+
+    if (disabledAccountsWrap) {
+      const removed = (disabledAccounts || []).filter(Boolean);
+      if (removed.length === 0) {
+        disabledAccountsWrap.style.display = "none";
+        disabledAccountsWrap.innerHTML = "";
+      } else {
+        disabledAccountsWrap.style.display = "flex";
+        disabledAccountsWrap.innerHTML = `<span>已移除（点击恢复）：</span>`;
+        removed.forEach((acct) => {
+          const chip = document.createElement("button");
+          chip.type = "button";
+          chip.className = "disabled-account-chip";
+          chip.textContent = `＋ ${acct}`;
+          chip.title = `点击恢复发布账号 [${acct}]`;
+          chip.addEventListener("click", async () => {
+            const lower = acct.toLowerCase();
+            disabledAccounts = disabledAccounts.filter((n) => String(n || "").trim().toLowerCase() !== lower);
+            const activeLower = new Set(getActiveOfficialAccounts().map((n) => n.toLowerCase()));
+            if (!activeLower.has(lower)) {
+              customAccounts = [...customAccounts, acct];
+            }
+            await saveSupportedAccountsState();
+            renderSupportedAccountsList();
+            appendLog(`已恢复发布账号 [${acct}]`, "success");
+          });
+          disabledAccountsWrap.appendChild(chip);
+        });
+      }
+    }
+  }
+
+  async function handleAddSupportedAccount() {
+    const raw = (newSupportedAccountInput?.value || "").trim().replace(/^@+/, "");
+    if (!raw) {
+      appendLog("请输入要新增的发布账号名称", "warn");
+      return;
+    }
+    if (!isValidCachedPlatformAccount(raw)) {
+      appendLog(`账号名称 [${raw}] 格式无效或属于系统保留选项`, "warn");
+      return;
+    }
+    const lower = raw.toLowerCase();
+    disabledAccounts = (disabledAccounts || []).filter((n) => String(n || "").trim().toLowerCase() !== lower);
+    const activeLower = new Set(getActiveOfficialAccounts().map((n) => n.toLowerCase()));
+    if (!activeLower.has(lower)) {
+      customAccounts = [...(customAccounts || []), raw];
+    }
+    await saveSupportedAccountsState();
+    if (newSupportedAccountInput) newSupportedAccountInput.value = "";
+    renderSupportedAccountsList();
+    appendLog(`已添加支持发布账号: [${raw}]`, "success");
+  }
+
+  btnAddSupportedAccount?.addEventListener("click", handleAddSupportedAccount);
+  newSupportedAccountInput?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      handleAddSupportedAccount();
+    }
+  });
+  btnResetDefaultAccounts?.addEventListener("click", async () => {
+    customAccounts = [];
+    disabledAccounts = [];
+    await saveSupportedAccountsState();
+    renderSupportedAccountsList();
+    appendLog("已恢复默认支持的发布账号列表", "success");
+  });
+
   function buildKnownAccountLookup(aliases) {
+    const disabledSet = getDisabledAccountSet();
     const map = new Map();
     for (const name of getActiveOfficialAccounts()) {
       map.set(name.toLowerCase(), name);
     }
     for (const [k, v] of Object.entries(BUILTIN_OFFICIAL_ALIASES)) {
-      map.set(k.toLowerCase(), v);
+      if (!disabledSet.has(String(v || "").trim().toLowerCase())) {
+        map.set(k.toLowerCase(), v);
+      }
     }
     for (const [k, v] of Object.entries(aliases || {})) {
       const key = String(k || "").trim();
       const val = String(v || "").trim();
-      if (val) map.set(val.toLowerCase(), val);
-      if (key && val) map.set(key.toLowerCase(), val);
+      if (!val || disabledSet.has(val.toLowerCase())) continue;
+      map.set(val.toLowerCase(), val);
+      if (key) map.set(key.toLowerCase(), val);
     }
     const keysSorted = Array.from(map.keys()).sort((a, b) => b.length - a.length);
     return { map, keysSorted };
@@ -2788,18 +3047,33 @@ document.addEventListener("DOMContentLoaded", async () => {
   function resolveSingleAccountName(rawName, aliases) {
     const clean = String(rawName || "").replace(/值班$/, "").trim();
     if (!clean) return "";
-    if (aliases && aliases[clean]) return aliases[clean];
+    const disabledSet = getDisabledAccountSet();
+    const resolveIfEnabled = (candidate) => {
+      const val = String(candidate || "").trim();
+      if (!val || disabledSet.has(val.toLowerCase())) return "";
+      return val;
+    };
+    if (aliases && aliases[clean]) {
+      const hit = resolveIfEnabled(aliases[clean]);
+      if (hit) return hit;
+    }
     const lower = clean.toLowerCase();
     for (const [k, v] of Object.entries(aliases || {})) {
-      if (lower === k.toLowerCase()) return v;
+      if (lower === k.toLowerCase()) {
+        const hit = resolveIfEnabled(v);
+        if (hit) return hit;
+      }
     }
     for (const [k, v] of Object.entries(BUILTIN_OFFICIAL_ALIASES)) {
-      if (lower === k.toLowerCase()) return v;
+      if (lower === k.toLowerCase()) {
+        const hit = resolveIfEnabled(v);
+        if (hit) return hit;
+      }
     }
     for (const official of getActiveOfficialAccounts()) {
       if (lower === official.toLowerCase()) return official;
     }
-    return clean;
+    return disabledSet.has(lower) ? "" : clean;
   }
 
   taskParserStripKeywords?.addEventListener("change", () => {
@@ -2895,6 +3169,11 @@ document.addEventListener("DOMContentLoaded", async () => {
   function extractAccountsFromLine(line, aliases) {
     const text = normalizeUnicodeSpaces(line);
     const found = [];
+    const hasSmallAccountsOnly =
+      /(?:\d+\s*(?:个)?\s*小号|(?:其他所有|全部)\s*小号)/.test(text) &&
+      !/大号/.test(text) &&
+      !/[+＋]\s*(?:\d+\s*(?:个)?|其他所有|全部)?\s*小号/.test(text) &&
+      !/(?:和|与|跟|及|加上|带着|以及|还有|另外)\s*(?:\d+\s*(?:个)?|其他所有|全部)?\s*小号/.test(text);
 
     // 1. 先按最长完整账号/别名匹配（支持 "@BOOM 视频" 这类中间带空格的账号写法），并按文本出现顺序排列
     const { map, keysSorted } = buildKnownAccountLookup(aliases);
@@ -2916,19 +3195,21 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
 
     // 2. 提取普通 @ 用户名（仅扫描未被已知含空格别名消费的 @ 片段，避免 "@新浪 AI" 误拆出 "新浪"）
+    //    若整行仅指定 N小号/全部小号 且无“大号/+小号/和小号”意图，则 @xxx值班 仅视为群内呼叫，不计入发布账号
     for (const m of textForAtScan.matchAll(/@\s*([^\s、，,：:。！!~～)）；;]+)/g)) {
+      if (hasSmallAccountsOnly && /值班$/.test(m[1])) continue;
       const name = resolveSingleAccountName(m[1], aliases);
       if (name && !found.includes(name)) found.push(name);
     }
 
-    // 3. 支持“大号”关键词映射
-    if (/(?:大号|新浪热点值班)/.test(text) && !found.includes("新浪热点")) {
+    // 3. 支持“大号”关键词映射（纯小号指令中的“@新浪热点值班”不触发大号）
+    if ((/大号/.test(text) || (!hasSmallAccountsOnly && /新浪热点值班/.test(text))) && !found.includes("新浪热点") && !getDisabledAccountSet().has("新浪热点")) {
       found.push("新浪热点");
     }
 
     // 4. 如果行中含已知账号名且带有账号指令/标签语境，补充匹配（最长优先并消费已匹配片段，避免子串误命中）
     if (/^(?:位置|账号|发稿账号|发博账号|转发账号|微博账号|发布账号|账户)[：:]/i.test(text) || found.length === 0) {
-      let scanLower = text.toLowerCase();
+      let scanLower = (hasSmallAccountsOnly ? text.replace(/@?\s*[^\s、，,：:。！!~～)）；;]*值班/g, " ") : text).toLowerCase();
       for (const key of keysSorted) {
         if (key.length < 2) continue;
         if (scanLower.includes(key)) {
@@ -3597,6 +3878,54 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
   });
 
+  btnPasteParser?.addEventListener("click", async () => {
+    if (!taskParserInput) return;
+    try {
+      let text = "";
+      let readErr = null;
+      if (typeof navigator !== "undefined" && navigator.clipboard && typeof navigator.clipboard.readText === "function") {
+        try {
+          text = await navigator.clipboard.readText();
+        } catch (err) {
+          readErr = err;
+        }
+      }
+      if (!text && typeof document !== "undefined" && typeof document.execCommand === "function") {
+        if (taskParserInput.style.display === "none") {
+          taskParserInput.style.display = "block";
+          if (btnToggleParserInput) btnToggleParserInput.textContent = "🔼 收起原文";
+        }
+        const prevValue = taskParserInput.value || "";
+        taskParserInput.value = "";
+        taskParserInput.focus?.();
+        const pasted = document.execCommand("paste");
+        if (pasted || taskParserInput.value) {
+          text = taskParserInput.value || "";
+          readErr = null;
+        } else {
+          taskParserInput.value = prevValue;
+        }
+      }
+      if (readErr && !text) throw readErr;
+      if (!String(text || "").trim()) {
+        appendLog("剪贴板为空或未包含可粘贴的文本", "warn");
+        return;
+      }
+      if (taskParserInput.style.display === "none") {
+        taskParserInput.style.display = "block";
+        if (btnToggleParserInput) btnToggleParserInput.textContent = "🔼 收起原文";
+      }
+      taskParserInput.value = text;
+      taskParserInput.focus?.();
+      btnPasteParser.textContent = "✅ 已粘贴";
+      setTimeout(() => {
+        btnPasteParser.textContent = "📋 一键粘贴";
+      }, 1500);
+    } catch (err) {
+      appendLog(`读取剪贴板失败: ${err.message || "请检查浏览器剪贴板权限"}`, "warn");
+    }
+  });
+
   btnClearParser?.addEventListener("click", () => {
     if (taskParserInput) taskParserInput.value = "";
     parsedTaskGroups = [];
@@ -3617,9 +3946,6 @@ document.addEventListener("DOMContentLoaded", async () => {
   btnParserRunNow?.addEventListener("click", async () => {
     if (parsedTaskGroups.length === 0) return;
     const isDryRun = dryRunToggle.checked;
-    if (!isDryRun && !confirm(`当前处于【真实发博模式】，确认要立即向中台批量发送这 ${parsedTaskGroups.length} 条解析任务吗？`)) {
-      return;
-    }
 
     updatePipelineControls(true);
     appendLog(`🚀 开始批量执行任务解析生成的 ${parsedTaskGroups.length} 条任务 [${isDryRun ? "安全演练" : "真实发布"}]...`, "info");
@@ -3674,4 +4000,522 @@ document.addEventListener("DOMContentLoaded", async () => {
       .replace(/>/g, "&gt;")
       .replace(/"/g, "&quot;");
   }
+
+  // ── 话题置顶与主持人申请面板控制器 ──
+  let cachedTopicPinConfig = null;
+  let cachedTopicPinTasks = [];
+  let currentTopicPinFilter = "all";
+
+  async function refreshTopicPinState() {
+    try {
+      const resp = await chrome.runtime.sendMessage({ action: "GET_TOPIC_PIN_STATE" });
+      if (!resp?.ok) return;
+      cachedTopicPinConfig = resp.config || {};
+      const tasks = Array.isArray(resp.tasks) ? resp.tasks : [];
+      cachedTopicPinTasks = tasks;
+      const monitorStatus = resp.monitorStatus || null;
+
+      const activeCount = tasks.filter((t) => ["pending", "running", "waiting_review"].includes(t.status)).length;
+      if (topicPinBadge) {
+        topicPinBadge.textContent = String(activeCount);
+        topicPinBadge.style.display = activeCount > 0 ? "inline-block" : "none";
+      }
+
+      const autoPub = document.getElementById("topicAutoPublishToggle");
+      const autoMon = document.getElementById("topicAutoMonitorToggle");
+      const monUid = document.getElementById("topicMonitorUidInput");
+      const monInt = document.getElementById("topicMonitorIntervalSec");
+      const schedEnabled = document.getElementById("topicSchedEnabled");
+      const schedMode = document.getElementById("topicSchedMode");
+      const schedStart = document.getElementById("topicSchedStart");
+      const schedEnd = document.getElementById("topicSchedEnd");
+      const schedDur = document.getElementById("topicSchedDuration");
+      const hostName = document.getElementById("topicHostAccountName");
+      const hostCat = document.getElementById("topicHostCategory");
+      const hostReg = document.getElementById("topicHostRegion");
+      const avatarStatus = document.getElementById("topicHostAvatarStatus");
+      const skipVotes = document.getElementById("topicSkipVotes");
+      const skipThird = document.getElementById("topicSkipThird");
+      const skipTopics = document.getElementById("topicSkipTopicsInput");
+      const skipKw = document.getElementById("topicSkipKeywordsInput");
+      const minWait = document.getElementById("topicMinWaitSec");
+      const pollInt = document.getElementById("topicPollIntervalSec");
+      const maxWait = document.getElementById("topicMaxWaitSec");
+
+      if (autoPub) autoPub.checked = Boolean(cachedTopicPinConfig.autoPinOnPublish);
+      if (autoMon) autoMon.checked = Boolean(cachedTopicPinConfig.autoMonitorEnabled);
+      if (monUid && document.activeElement !== monUid) monUid.value = cachedTopicPinConfig.monitorUid || "";
+      if (monInt && document.activeElement !== monInt) monInt.value = String(cachedTopicPinConfig.monitorIntervalSec || 150);
+
+      const sched = cachedTopicPinConfig.schedule || {};
+      if (schedEnabled) schedEnabled.checked = Boolean(sched.enabled);
+      const schedPill = document.getElementById("topicScheduleStatusPill");
+      if (schedPill) {
+        schedPill.textContent = sched.enabled ? "已启用" : "未启用";
+      }
+      if (schedMode) schedMode.value = sched.mode === "duration" ? "duration" : "window";
+      if (schedStart && document.activeElement !== schedStart) schedStart.value = sched.start || "07:00";
+      if (schedEnd && document.activeElement !== schedEnd) schedEnd.value = sched.end || "22:59";
+      if (schedDur && document.activeElement !== schedDur) schedDur.value = String(sched.durationHours ?? 8);
+      const wdSet = new Set(Array.isArray(sched.weekdays) ? sched.weekdays : [0, 1, 2, 3, 4, 5, 6]);
+      document.querySelectorAll(".topic-wd-cb").forEach((cb) => {
+        cb.checked = wdSet.has(Number(cb.dataset.day));
+      });
+      syncTopicScheduleModeFields();
+      if (hostName && document.activeElement !== hostName) hostName.value = cachedTopicPinConfig.hostAccountName || "新浪热点";
+      if (hostCat && document.activeElement !== hostCat) hostCat.value = cachedTopicPinConfig.hostApply?.category || "社会";
+      if (hostReg && document.activeElement !== hostReg) hostReg.value = cachedTopicPinConfig.hostApply?.region || "全国";
+      if (avatarStatus) {
+        avatarStatus.textContent = cachedTopicPinConfig.hostApply?.imageDataUrl
+          ? `已自定义 (${cachedTopicPinConfig.hostApply?.imageName || "头像"})`
+          : "已内置默认 (主持人.png)";
+      }
+      if (skipVotes) skipVotes.checked = cachedTopicPinConfig.skipVotes !== false;
+      if (skipThird) skipThird.checked = cachedTopicPinConfig.skipThirdTopic !== false;
+      if (skipTopics && document.activeElement !== skipTopics) skipTopics.value = (cachedTopicPinConfig.skipTopics || []).join("\n");
+      if (skipKw && document.activeElement !== skipKw) skipKw.value = (cachedTopicPinConfig.skipKeywords || []).join("\n");
+      if (minWait && document.activeElement !== minWait) minWait.value = String(cachedTopicPinConfig.minWaitSec || 120);
+      if (pollInt && document.activeElement !== pollInt) pollInt.value = String(cachedTopicPinConfig.pollIntervalSec || 60);
+      if (maxWait && document.activeElement !== maxWait) maxWait.value = String(cachedTopicPinConfig.maxWaitSec || 600);
+
+      renderTopicPinList(tasks);
+
+      const monStatusEl = document.getElementById("topicMonitorStatusText");
+      if (monStatusEl) {
+        const parts = [];
+        const fmtTime = (ms) => new Date(ms).toLocaleTimeString("zh-CN", { hour12: false });
+        if (cachedTopicPinConfig.autoMonitorEnabled) {
+          parts.push(monitorStatus?.alarmActive ? "🟢 巡检运行中" : "🟡 巡检已开启(待恢复闹钟)");
+        } else if (cachedTopicPinConfig.schedule?.enabled && cachedTopicPinConfig.schedule?.mode === "window") {
+          parts.push("⏸️ 按时间窗口计划待机中");
+        } else {
+          parts.push("⚪ 定时巡检未开启");
+        }
+        if (monitorStatus?.nextRunAt && monitorStatus.nextRunAt > Date.now() - 60000) {
+          parts.push(`下次: ${fmtTime(monitorStatus.nextRunAt)}`);
+        }
+        if (monitorStatus?.lastRunAt) {
+          const outcomeTxt = monitorStatus.ok === false
+            ? `异常: ${monitorStatus.reason || "未知"}`
+            : monitorStatus.skippedBySchedule
+              ? (monitorStatus.reason || "窗口外跳过")
+              : monitorStatus.newPost
+                ? "发现新微博"
+                : "无新微博";
+          parts.push(`上次: ${fmtTime(monitorStatus.lastRunAt)} (${outcomeTxt})`);
+        }
+        monStatusEl.textContent = parts.join(" · ");
+        monStatusEl.classList.remove("is-running", "is-error");
+        if (monitorStatus?.ok === false) {
+          monStatusEl.classList.add("is-error");
+        } else if (cachedTopicPinConfig.autoMonitorEnabled && monitorStatus?.alarmActive) {
+          monStatusEl.classList.add("is-running");
+        }
+      }
+    } catch {
+      // ignore in test environments without background
+    }
+  }
+
+  function renderTopicPinList(tasks = []) {
+    const container = document.getElementById("topicPinListContainer");
+    const countPill = document.getElementById("topicPinQueueCount");
+    const retryAllBtn = document.getElementById("btnRetryAllErrorTopicPins");
+    const filterChipsWrap = document.getElementById("topicPinFilterChips");
+    const searchInput = document.getElementById("topicPinSearchInput");
+
+    const isActiveStatus = (s) => ["pending", "running", "waiting_review"].includes(s);
+    const isDoneStatus = (s) => ["done", "skipped"].includes(s);
+    const counts = {
+      all: tasks.length,
+      active: tasks.filter((t) => isActiveStatus(t.status)).length,
+      done: tasks.filter((t) => isDoneStatus(t.status)).length,
+      error: tasks.filter((t) => t.status === "error").length,
+    };
+
+    if (countPill) countPill.textContent = `${tasks.length} 条`;
+    const kpiActive = document.getElementById("topicKpiActive");
+    const kpiDone = document.getElementById("topicKpiDone");
+    const kpiError = document.getElementById("topicKpiError");
+    const kpiTotal = document.getElementById("topicKpiTotal");
+    if (kpiActive) kpiActive.textContent = String(counts.active);
+    if (kpiDone) kpiDone.textContent = String(counts.done);
+    if (kpiError) kpiError.textContent = String(counts.error);
+    if (kpiTotal) kpiTotal.textContent = String(counts.all);
+    document.querySelectorAll(".topic-kpi-card").forEach((card) => {
+      card.classList.toggle("is-selected", card.dataset.kpiFilter === currentTopicPinFilter);
+    });
+    if (retryAllBtn) {
+      retryAllBtn.style.display = counts.error > 0 ? "inline-flex" : "none";
+      retryAllBtn.textContent = `🔁 重试异常 (${counts.error})`;
+    }
+    if (filterChipsWrap) {
+      const labelMap = {
+        all: `全部 (${counts.all})`,
+        active: `进行中 (${counts.active})`,
+        done: `已完成 (${counts.done})`,
+        error: `异常 (${counts.error})`,
+      };
+      filterChipsWrap.querySelectorAll(".filter-chip").forEach((chip) => {
+        const key = chip.dataset.topicFilter;
+        if (labelMap[key]) chip.textContent = labelMap[key];
+        chip.classList.toggle("active", key === currentTopicPinFilter);
+      });
+    }
+    if (!container) return;
+
+    const query = (searchInput?.value || "").trim().toLowerCase();
+    const filtered = tasks.filter((t) => {
+      if (currentTopicPinFilter === "active" && !isActiveStatus(t.status)) return false;
+      if (currentTopicPinFilter === "done" && !isDoneStatus(t.status)) return false;
+      if (currentTopicPinFilter === "error" && t.status !== "error") return false;
+      if (query) {
+        const topicsText = (t.topics || []).map((tp) => `#${tp.hashtag}# ${tp.note || ""}`).join(" ").toLowerCase();
+        const hay = `${t.postUrl || ""} ${t.text || ""} ${t.error || ""} ${topicsText}`.toLowerCase();
+        if (!hay.includes(query)) return false;
+      }
+      return true;
+    });
+
+    if (tasks.length === 0) {
+      container.innerHTML = `<div class="empty-placeholder">暂无话题置顶任务</div>`;
+      return;
+    }
+    if (filtered.length === 0) {
+      container.innerHTML = `<div class="empty-placeholder">当前筛选条件下无匹配任务</div>`;
+      return;
+    }
+
+    const statusBadgeMap = {
+      pending: ["pending", "待处理"],
+      running: ["firing", "执行中"],
+      waiting_review: ["pending", "审核等待中"],
+      done: ["done", "已完成"],
+      error: ["error", "异常"],
+      skipped: ["done", "已跳过"],
+    };
+    const modeLabelMap = {
+      auto_publish: "发后自动",
+      auto_monitor: "主页巡检",
+      manual_pin: "手动置顶",
+      manual_apply: "手动申请",
+    };
+
+    container.innerHTML = filtered.map((task) => {
+      const [cls, label] = statusBadgeMap[task.status] || ["pending", task.status];
+      const modeLabel = modeLabelMap[task.mode] || task.mode;
+      const topicsHtml = (task.topics || []).map((tp) => {
+        const tpStatus = tp.status;
+        const tpCls = tpStatus === "pinned" || tpStatus === "applied_done"
+          ? "done"
+          : tpStatus === "error" || tpStatus === "timeout"
+            ? "error"
+            : "pending";
+        const tpIcon = tpCls === "done" ? "✅" : tpCls === "error" ? "❌" : "⏳";
+        return `<span class="sched-status-pill ${tpCls}" style="margin-right:4px;margin-top:3px;display:inline-block;" title="${escapeHtml(tp.note || "")}">${tpIcon} #${escapeHtml(tp.hashtag)}# · ${escapeHtml(tp.note || tp.status)}</span>`;
+      }).join("");
+      const timeStamp = task.updatedAt || task.createdAt;
+      const timeStr = timeStamp ? new Date(timeStamp).toLocaleTimeString("zh-CN", { hour12: false }) : "";
+      const timeMeta = timeStr ? `<span class="sched-sub-meta">${timeStr}</span>` : "";
+      const postTitleHtml = task.postUrl
+        ? `<a href="${escapeHtml(task.postUrl)}" target="_blank" rel="noopener noreferrer" class="topic-post-link" title="点击在新标签页打开微博">${escapeHtml(task.postUrl)}</a>`
+        : `<span style="font-size:11px;color:var(--text-sub);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(task.text || "")}</span>`;
+      const textSnippet = task.postUrl && task.text
+        ? `<div style="font-size:11px;color:var(--text-sub);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(task.text)}</div>`
+        : "";
+      const waitHint = task.status === "waiting_review" && task.nextCheckAt
+        ? `<div style="font-size:10.5px;color:var(--text-sub);margin-top:2px;">下次复检: ${new Date(task.nextCheckAt).toLocaleTimeString("zh-CN", { hour12: false })}</div>`
+        : "";
+      const errHint = task.error
+        ? `<div style="font-size:11px;color:#DC2626;margin-top:2px;">${escapeHtml(task.error)}</div>`
+        : "";
+      const actionBtnHtml = task.status === "error"
+        ? `<button type="button" class="btn-xs btn-outline btn-topic-retry" data-task-id="${escapeHtml(task.id)}">重试</button>`
+        : task.status === "waiting_review"
+          ? `<button type="button" class="btn-xs btn-outline btn-topic-retry" data-task-id="${escapeHtml(task.id)}" title="立即触发一次复检">立即复检</button>`
+          : "";
+
+      const cardStateCls = task.status === "error"
+        ? "is-error"
+        : task.status === "waiting_review"
+          ? "is-waiting"
+          : isActiveStatus(task.status)
+            ? "is-active"
+            : "is-done";
+
+      return `
+        <div class="task-item topic-task-card ${cardStateCls}">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:6px;">
+            <div style="display:flex;align-items:center;gap:6px;min-width:0;">
+              <span class="sched-status-pill ${cls}">${label}</span>
+              <span class="count-pill">${modeLabel}</span>
+              ${timeMeta}
+              ${postTitleHtml}
+            </div>
+            <div style="display:flex;gap:4px;flex-shrink:0;">
+              ${actionBtnHtml}
+              <button type="button" class="btn-xs btn-outline btn-topic-remove" data-task-id="${escapeHtml(task.id)}">删除</button>
+            </div>
+          </div>
+          ${textSnippet}
+          <div>${topicsHtml}</div>
+          ${waitHint}${errHint}
+        </div>
+      `;
+    }).join("");
+
+    container.querySelectorAll(".btn-topic-retry").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        await chrome.runtime.sendMessage({ action: "RETRY_TOPIC_PIN_TASK", taskId: btn.dataset.taskId });
+        refreshTopicPinState();
+      });
+    });
+    container.querySelectorAll(".btn-topic-remove").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        await chrome.runtime.sendMessage({ action: "REMOVE_TOPIC_PIN_TASK", taskId: btn.dataset.taskId });
+        refreshTopicPinState();
+      });
+    });
+  }
+
+  function syncTopicScheduleModeFields() {
+    const mode = document.getElementById("topicSchedMode")?.value || "window";
+    const winEl = document.getElementById("topicSchedWindowFields");
+    const durEl = document.getElementById("topicSchedDurationFields");
+    if (winEl) winEl.style.display = mode === "window" ? "flex" : "none";
+    if (durEl) durEl.style.display = mode === "duration" ? "flex" : "none";
+  }
+
+  function collectTopicPinConfigFromUI(extra = {}) {
+    const base = cachedTopicPinConfig || {};
+    const weekdays = Array.from(document.querySelectorAll(".topic-wd-cb"))
+      .filter((cb) => cb.checked)
+      .map((cb) => Number(cb.dataset.day));
+    return {
+      ...base,
+      autoPinOnPublish: document.getElementById("topicAutoPublishToggle")?.checked ?? base.autoPinOnPublish,
+      autoMonitorEnabled: document.getElementById("topicAutoMonitorToggle")?.checked ?? base.autoMonitorEnabled,
+      monitorUid: document.getElementById("topicMonitorUidInput")?.value.trim() ?? base.monitorUid,
+      monitorIntervalSec: Number(document.getElementById("topicMonitorIntervalSec")?.value || base.monitorIntervalSec || 150),
+      hostAccountName: document.getElementById("topicHostAccountName")?.value.trim() || "新浪热点",
+      skipVotes: document.getElementById("topicSkipVotes")?.checked ?? true,
+      skipThirdTopic: document.getElementById("topicSkipThird")?.checked ?? true,
+      skipTopics: document.getElementById("topicSkipTopicsInput")?.value ?? base.skipTopics,
+      skipKeywords: document.getElementById("topicSkipKeywordsInput")?.value ?? base.skipKeywords,
+      minWaitSec: Number(document.getElementById("topicMinWaitSec")?.value || 120),
+      pollIntervalSec: Number(document.getElementById("topicPollIntervalSec")?.value || 60),
+      maxWaitSec: Number(document.getElementById("topicMaxWaitSec")?.value || 600),
+      hostApply: {
+        ...(base.hostApply || {}),
+        category: document.getElementById("topicHostCategory")?.value.trim() || "社会",
+        region: document.getElementById("topicHostRegion")?.value.trim() || "全国",
+        ...(extra.hostApply || {}),
+      },
+      schedule: {
+        ...(base.schedule || {}),
+        enabled: document.getElementById("topicSchedEnabled")?.checked ?? Boolean(base.schedule?.enabled),
+        mode: document.getElementById("topicSchedMode")?.value === "duration" ? "duration" : "window",
+        start: document.getElementById("topicSchedStart")?.value || "07:00",
+        end: document.getElementById("topicSchedEnd")?.value || "22:59",
+        durationHours: Number(document.getElementById("topicSchedDuration")?.value || 8),
+        weekdays: document.querySelectorAll(".topic-wd-cb").length > 0 ? weekdays : (base.schedule?.weekdays || [0, 1, 2, 3, 4, 5, 6]),
+      },
+      ...extra,
+    };
+  }
+
+  async function saveTopicPinConfigFromUI(extra = {}) {
+    const cfg = collectTopicPinConfigFromUI(extra);
+    const resp = await chrome.runtime.sendMessage({ action: "SAVE_TOPIC_PIN_CONFIG", config: cfg });
+    if (resp?.ok) {
+      cachedTopicPinConfig = resp.config;
+      appendLog("[话题置顶] 配置已保存", "success");
+      refreshTopicPinState();
+    } else {
+      appendLog(`[话题置顶] 保存失败: ${resp?.error || "未知错误"}`, "error");
+    }
+  }
+
+  document.getElementById("topicAutoPublishToggle")?.addEventListener("change", () => saveTopicPinConfigFromUI());
+  document.getElementById("topicAutoMonitorToggle")?.addEventListener("change", () => saveTopicPinConfigFromUI());
+  document.getElementById("btnSaveTopicMonitorUid")?.addEventListener("click", () => saveTopicPinConfigFromUI());
+  document.getElementById("topicSchedMode")?.addEventListener("change", syncTopicScheduleModeFields);
+  document.getElementById("topicSchedEnabled")?.addEventListener("change", () => saveTopicPinConfigFromUI());
+  document.getElementById("btnSaveTopicSchedule")?.addEventListener("click", () => saveTopicPinConfigFromUI());
+  document.getElementById("btnSaveTopicPinConfig")?.addEventListener("click", () => saveTopicPinConfigFromUI());
+
+  document.getElementById("btnRunTopicMonitorNow")?.addEventListener("click", async (e) => {
+    const btn = e.currentTarget || document.getElementById("btnRunTopicMonitorNow");
+    if (btn) btn.disabled = true;
+    try {
+      await saveTopicPinConfigFromUI();
+      const resp = await chrome.runtime.sendMessage({ action: "RUN_TOPIC_MONITOR_NOW" });
+      if (resp?.ok && resp.res?.ok !== false) {
+        const msg = resp.res?.newPost
+          ? "[话题置顶] 巡检发现新微博，已入队"
+          : resp.res?.skippedBySchedule
+            ? `[话题置顶] 巡检跳过: ${resp.res.reason || "不在运行窗口"}`
+            : "[话题置顶] 巡检完成，暂无新微博";
+        appendLog(msg, "info");
+        refreshTopicPinState();
+      } else {
+        appendLog(`[话题置顶] 巡检失败: ${resp?.res?.reason || resp?.error || "未知错误"}`, "error");
+        refreshTopicPinState();
+      }
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  });
+
+  async function submitManualPinUrls() {
+    const inp = document.getElementById("manualPinUrlInput");
+    const raw = inp?.value.trim() || "";
+    if (!raw) {
+      appendLog("[话题置顶] 请输入微博链接", "warn");
+      return;
+    }
+    const urls = Array.from(new Set(
+      raw.split(/[\s,，;；]+/).map((s) => s.trim()).filter(Boolean)
+    ));
+    const btn = document.getElementById("btnManualPinSubmit");
+    if (btn) btn.disabled = true;
+    try {
+      let okCount = 0;
+      const errors = [];
+      for (const url of urls) {
+        const resp = await chrome.runtime.sendMessage({ action: "MANUAL_TOPIC_PIN", url });
+        if (resp?.ok) {
+          okCount += 1;
+        } else {
+          errors.push(resp?.error || "未知错误");
+        }
+      }
+      if (okCount > 0) {
+        if (inp) inp.value = "";
+        appendLog(`[话题置顶] 已加入 ${okCount} 条手动置顶任务`, "success");
+        refreshTopicPinState();
+      }
+      if (errors.length > 0) {
+        appendLog(`[话题置顶] 手动置顶失败(${errors.length}条): ${errors[0]}`, "error");
+      }
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  document.getElementById("btnManualPinSubmit")?.addEventListener("click", submitManualPinUrls);
+  document.getElementById("manualPinUrlInput")?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      submitManualPinUrls();
+    }
+  });
+  document.getElementById("btnPasteManualPinUrl")?.addEventListener("click", async () => {
+    const inp = document.getElementById("manualPinUrlInput");
+    try {
+      const text = await navigator.clipboard?.readText?.();
+      if (!text || !text.trim()) {
+        appendLog("[话题置顶] 剪贴板为空，请先复制微博链接", "warn");
+        return;
+      }
+      if (inp) {
+        inp.value = text.trim();
+        inp.focus();
+      }
+      appendLog("[话题置顶] 已粘贴剪贴板链接", "info");
+    } catch (err) {
+      appendLog(`[话题置顶] 读取剪贴板失败: ${err?.message || err}`, "error");
+    }
+  });
+
+  async function submitManualApplyHost() {
+    const inp = document.getElementById("manualApplyInput");
+    const input = inp?.value.trim() || "";
+    const fastMode = Boolean(document.getElementById("manualApplyFastMode")?.checked);
+    const autoPin = Boolean(document.getElementById("manualApplyAutoPin")?.checked);
+    if (!input) {
+      appendLog("[话题置顶] 请输入话题名称或微博链接", "warn");
+      return;
+    }
+    const btn = document.getElementById("btnManualApplySubmit");
+    if (btn) btn.disabled = true;
+    try {
+      const resp = await chrome.runtime.sendMessage({
+        action: "MANUAL_APPLY_HOST",
+        payload: { input, fastMode, autoPin },
+      });
+      if (resp?.ok) {
+        if (inp) inp.value = "";
+        appendLog("[话题置顶] 已加入主持人申请队列", "success");
+        refreshTopicPinState();
+      } else {
+        appendLog(`[话题置顶] 手动申请失败: ${resp?.error || "未知错误"}`, "error");
+      }
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  document.getElementById("btnManualApplySubmit")?.addEventListener("click", submitManualApplyHost);
+  document.getElementById("manualApplyInput")?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      submitManualApplyHost();
+    }
+  });
+
+  document.getElementById("topicPinFilterChips")?.querySelectorAll(".filter-chip").forEach((chip) => {
+    chip.addEventListener("click", () => {
+      currentTopicPinFilter = chip.dataset.topicFilter || "all";
+      renderTopicPinList(cachedTopicPinTasks);
+    });
+  });
+
+  document.querySelectorAll(".topic-kpi-card").forEach((card) => {
+    card.addEventListener("click", () => {
+      currentTopicPinFilter = card.dataset.kpiFilter || "all";
+      renderTopicPinList(cachedTopicPinTasks);
+    });
+  });
+
+  document.getElementById("topicPinSearchInput")?.addEventListener("input", () => {
+    renderTopicPinList(cachedTopicPinTasks);
+  });
+
+  document.getElementById("btnRefreshTopicPins")?.addEventListener("click", () => {
+    refreshTopicPinState();
+  });
+
+  document.getElementById("btnRetryAllErrorTopicPins")?.addEventListener("click", async () => {
+    const resp = await chrome.runtime.sendMessage({ action: "RETRY_ALL_ERROR_TOPIC_PIN_TASKS" });
+    if (resp?.ok) {
+      appendLog(`[话题置顶] 已将 ${resp.retriedCount || 0} 条异常任务重新加入队列`, "success");
+      refreshTopicPinState();
+    } else {
+      appendLog(`[话题置顶] 批量重试失败: ${resp?.error || "未知错误"}`, "error");
+    }
+  });
+
+  document.getElementById("btnClearDoneTopicPins")?.addEventListener("click", async () => {
+    await chrome.runtime.sendMessage({ action: "CLEAR_DONE_TOPIC_PIN_TASKS" });
+    refreshTopicPinState();
+  });
+
+  document.getElementById("topicHostAvatarInput")?.addEventListener("change", (e) => {
+    const file = e.target?.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async () => {
+      await saveTopicPinConfigFromUI({
+        hostApply: {
+          ...(cachedTopicPinConfig?.hostApply || {}),
+          imageDataUrl: String(reader.result || ""),
+          imageName: file.name,
+        },
+      });
+    };
+    reader.readAsDataURL(file);
+  });
+
+  refreshTopicPinState();
 });

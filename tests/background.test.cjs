@@ -1006,5 +1006,126 @@ test('合并群发批次中任一账号内容锁被占用时立即释放已占�
   assert.ok('post::虚构小号2::并发测试正文' in h.data.__publishClaims__);
 });
 
+test('合并群发因中台缺少账号阻断时撤销待确认台账且不误拦后续单发', async () => {
+  const h = harness({});
+  stubPipeline(h);
+  h.run(`executeInTabDirect = async (id, func) => {
+    if (func === directCheckWeiboPlatformReady) return { ok: true, ready: true };
+    if (func === directPostToWeiboPlatform) {
+      return { ok: false, submitted: false, error: '未在发稿中台各分类下找到目标账号 [已下线账号]' };
+    }
+    return { ok: true };
+  };`);
+
+  const batchTasks = ['正常账号A', '已下线账号'].map((acct, idx) => ({
+    docName: '任务解析',
+    row: `${idx + 1}`,
+    targetCell: '-',
+    account: acct,
+    content: '缺号阻断测试正文',
+    imgUrls: [],
+  }));
+
+  await assert.rejects(
+    () => h.run(`startPipeline(${JSON.stringify({ docs: [], dryRun: false, silentMode: true, selectedTasks: batchTasks })})`),
+    /未在发稿中台各分类下找到目标账号/
+  );
+  assert.equal(h.data.publishLedger.length, 0);
+  assert.equal(h.data.__unwrittenReceipts__.length, 0);
+
+  h.run(`executeInTabDirect = async (id, func) => {
+    if (func === directCheckWeiboPlatformReady) return { ok: true, ready: true };
+    if (func === directPostToWeiboPlatform) return { ok: true, postUrl: 'https://weibo.com/100001/OK' };
+    return { ok: true };
+  };`);
+  const retryRes = await h.run(`startPipeline(${JSON.stringify({
+    docs: [],
+    dryRun: false,
+    silentMode: true,
+    selectedTasks: [batchTasks[0]],
+  })})`);
+  assert.equal(retryRes.published, 1);
+  assert.equal(h.data.publishLedger[0].postUrl, 'https://weibo.com/100001/OK');
+});
+
+test('静默模式新建的发博标签页在流水线结束后自动关闭，复用已有标签页时不关闭', async () => {
+  const h1 = harness();
+  h1.run('var actualFindOrCreateTab = findOrCreateTab;');
+  stubPipeline(h1);
+  h1.run('findOrCreateTab = actualFindOrCreateTab;');
+  h1.chrome.tabs.query = async () => [];
+  h1.chrome.tabs.create = async (value) => {
+    h1.calls.push(['tab.create', value]);
+    return { id: 88, ...value };
+  };
+  h1.chrome.tabs.get = async (id) => ({ id, url: 'https://ai-publish-platform.weibo.com/#/post', status: 'complete' });
+  h1.chrome.tabs.remove = async (id) => {
+    h1.calls.push(['tab.remove', id]);
+  };
+  const parserTask = { ...task, docUrl: '', targetCell: '-' };
+  await h1.run(`startPipeline(${JSON.stringify({ docs: [], dryRun: true, silentMode: true, selectedTasks: [parserTask] })})`);
+  assert.equal(h1.calls.filter(([type, arg]) => type === 'tab.create' && arg.active === false).length, 1);
+  assert.deepEqual(h1.calls.filter(([type]) => type === 'tab.remove'), [['tab.remove', 88]]);
+
+  const h2 = harness();
+  h2.run('var actualFindOrCreateTab = findOrCreateTab;');
+  stubPipeline(h2);
+  h2.run('findOrCreateTab = actualFindOrCreateTab;');
+  h2.chrome.tabs.query = async () => [{ id: 99, url: 'https://ai-publish-platform.weibo.com/#/post', status: 'complete' }];
+  h2.chrome.tabs.get = async (id) => ({ id, url: 'https://ai-publish-platform.weibo.com/#/post', status: 'complete' });
+  h2.chrome.tabs.remove = async (id) => {
+    h2.calls.push(['tab.remove', id]);
+  };
+  await h2.run(`startPipeline(${JSON.stringify({ docs: [], dryRun: true, silentMode: true, selectedTasks: [parserTask] })})`);
+  assert.equal(h2.calls.filter(([type]) => type === 'tab.remove').length, 0);
+});
+
+test('RETRY_TOPIC_PIN_TASK 重置失败或超时的子话题状态并触发队列重新处理', async () => {
+  const topicPinnerSource = fs.readFileSync(path.join(__dirname, '../background/topic_pinner.js'), 'utf8');
+  const h = harness({
+    topicPinTasks: [{
+      id: 'tpin_retry_1',
+      mode: 'manual_apply',
+      status: 'error',
+      postUrl: 'https://weibo.com/2318910945/Test',
+      topics: [
+        { hashtag: '失败话题', status: 'error', note: '提交失败', pinAttempts: 2 },
+        { hashtag: '已跳过话题', status: 'skipped_other_host', note: '已有竞争/其他主持人' },
+      ],
+    }],
+  });
+  h.run(topicPinnerSource);
+  h.context.__queueTriggered = false;
+  h.run(`processTopicPinQueue = async () => { __queueTriggered = true; };`);
+  const resp = await h.send({ action: 'RETRY_TOPIC_PIN_TASK', taskId: 'tpin_retry_1' });
+  assert.equal(resp.ok, true);
+  assert.equal(h.context.__queueTriggered, true);
+  const saved = h.data.topicPinTasks[0];
+  assert.equal(saved.status, 'pending');
+  assert.equal(saved.topics[0].status, 'pending');
+  assert.equal(saved.topics[0].pinAttempts, 0);
+  assert.equal(saved.topics[1].status, 'skipped_other_host');
+});
+
+test('initRefererRules 同时注册 docs.qq.com 与扩展后台直连微博 Referer/Origin 动态规则', async () => {
+  const h = harness();
+  let lastRulesPayload = null;
+  h.chrome.runtime.id = 'mock_ext_id_123';
+  h.chrome.declarativeNetRequest.updateDynamicRules = async (payload) => {
+    lastRulesPayload = payload;
+  };
+  await h.run('initRefererRules()');
+  assert.ok(lastRulesPayload);
+  assert.deepEqual(Array.from(lastRulesPayload.removeRuleIds), [1001, 1002, 1003, 1004, 1005, 1006, 1007]);
+  assert.equal(lastRulesPayload.addRules.length, 7);
+  const mWeiboReferer = lastRulesPayload.addRules.find((r) => r.id === 1004);
+  const mWeiboOrigin = lastRulesPayload.addRules.find((r) => r.id === 1007);
+  assert.equal(mWeiboReferer.action.requestHeaders[0].value, 'https://m.s.weibo.com/');
+  assert.deepEqual(Array.from(mWeiboReferer.condition.initiatorDomains), ['mock_ext_id_123']);
+  assert.equal(mWeiboOrigin.action.requestHeaders[0].value, 'https://m.s.weibo.com');
+  assert.deepEqual(Array.from(mWeiboOrigin.condition.requestMethods), ['post']);
+});
+
+
 
 

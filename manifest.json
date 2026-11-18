@@ -18,8 +18,10 @@
     "storage",
     "scripting",
     "alarms",
+    "cookies",
     "declarativeNetRequest",
-    "debugger"
+    "debugger",
+    "clipboardRead"
   ],
   "host_permissions": [
     "<all_urls>"
