@@ -27,8 +27,6 @@ const DEFAULT_TOPIC_PIN_CONFIG = {
   skipKeywords: [
     "习近平",
     "前主编",
-    "新浪新闻",
-    "头条新闻",
     "共产党",
     "毛泽东",
     "李克强",
@@ -57,6 +55,7 @@ let topicPinMutationQueue = Promise.resolve();
 let topicPinBrowserQueue = Promise.resolve();
 let topicPinBrowserWaiters = 0;
 let topicPinRunningPromise = null;
+let topicPinRerunRequested = false;
 let topicMonitorRunningPromise = null;
 let topicPinWorkerTabId = null;
 let topicPinWorkerWindowId = null;
@@ -155,8 +154,24 @@ function normalizeTopicPinConfig(raw = {}) {
 }
 
 async function getTopicPinConfig() {
-  const { topicPinConfig } = await chrome.storage.local.get(["topicPinConfig"]);
-  return normalizeTopicPinConfig(topicPinConfig || {});
+  const { topicPinConfig, topicPinRemoveNewsSkipMigrated } = await chrome.storage.local.get([
+    "topicPinConfig",
+    "topicPinRemoveNewsSkipMigrated",
+  ]);
+  const normalized = normalizeTopicPinConfig(topicPinConfig || {});
+  if (!topicPinRemoveNewsSkipMigrated) {
+    const filtered = normalized.skipKeywords.filter((kw) => kw !== "新浪新闻" && kw !== "头条新闻");
+    if (filtered.length !== normalized.skipKeywords.length) {
+      normalized.skipKeywords = filtered;
+      await chrome.storage.local.set({
+        topicPinConfig: normalized,
+        topicPinRemoveNewsSkipMigrated: true,
+      }).catch(() => {});
+    } else {
+      await chrome.storage.local.set({ topicPinRemoveNewsSkipMigrated: true }).catch(() => {});
+    }
+  }
+  return normalized;
 }
 
 async function saveTopicPinConfig(raw) {
@@ -181,7 +196,10 @@ function parseWeiboPostUrl(url) {
     throw new Error(`无效的微博链接: ${raw}`);
   }
   const host = parsed.hostname.toLowerCase();
-  if (!host.includes("weibo.com") && !host.includes("weibo.cn")) {
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw new Error(`不支持的微博链接协议: ${raw}`);
+  }
+  if (!["weibo.com", "weibo.cn"].some((domain) => host === domain || host.endsWith(`.${domain}`))) {
     throw new Error(`不是有效的微博域名: ${raw}`);
   }
   const parts = parsed.pathname.split("/").filter(Boolean);
@@ -507,9 +525,12 @@ async function getTopicPinTasks() {
   return Array.isArray(topicPinTasks) ? topicPinTasks : [];
 }
 
-async function saveTopicPinTasks(tasks) {
+async function saveTopicPinTasks(tasks, monitorPostId = "") {
   const trimmed = tasks.slice(0, 100);
-  await chrome.storage.local.set({ topicPinTasks: trimmed });
+  await chrome.storage.local.set({
+    topicPinTasks: trimmed,
+    ...(monitorPostId ? { topicPinLastPostId: monitorPostId } : {}),
+  });
   chrome.runtime.sendMessage({ action: "TOPIC_PIN_UPDATED" }).catch(() => {});
   return trimmed;
 }
@@ -535,13 +556,46 @@ async function updateTopicPinTask(taskId, patch) {
   });
 }
 
+const TOPIC_PIN_DONE_TTL_MS = 24 * 60 * 60 * 1000;
+
+function pruneExpiredTopicPinTasks(tasks, now = Date.now()) {
+  if (!Array.isArray(tasks) || tasks.length === 0) return { tasks: [], removed: 0 };
+  let removed = 0;
+  const kept = tasks.filter((t) => {
+    if (!t || t.status !== "done") return true;
+    const doneAt = Number(t.completedAt || t.updatedAt || t.createdAt || 0);
+    if (doneAt > 0 && now - doneAt >= TOPIC_PIN_DONE_TTL_MS) {
+      removed += 1;
+      return false;
+    }
+    return true;
+  });
+  return { tasks: kept, removed };
+}
+
+async function cleanupExpiredTopicPinTasks(now = Date.now()) {
+  return withTopicPinMutation(async () => {
+    const tasks = await getTopicPinTasks();
+    const res = pruneExpiredTopicPinTasks(tasks, now);
+    if (res.removed > 0) {
+      await saveTopicPinTasks(res.tasks);
+    }
+    return res.removed;
+  });
+}
+
 async function sleepMs(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function waitForTabComplete(tabId, timeoutMs = 20000, expectNav = false) {
   if (typeof waitForTabLoaded === "function") {
-    return waitForTabLoaded(tabId, timeoutMs, expectNav);
+    await waitForTabLoaded(tabId, timeoutMs, expectNav);
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.status !== "complete" || !tab.url || tab.url.startsWith("about:blank")) {
+      throw new Error(`标签页加载未完成或仍为 about:blank: ${tabId}`);
+    }
+    return tab;
   }
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -551,7 +605,7 @@ async function waitForTabComplete(tabId, timeoutMs = 20000, expectNav = false) {
     }
     await sleepMs(350);
   }
-  return chrome.tabs.get(tabId);
+  throw new Error(`标签页加载超时: ${tabId}`);
 }
 
 async function ensureTopicPinWorkerTab(initialUrl = "https://weibo.com/") {
@@ -575,7 +629,7 @@ async function ensureTopicPinWorkerTab(initialUrl = "https://weibo.com/") {
         topicPinWorkerTabId = tab.id;
         topicPinWorkerWindowId = null;
         await waitForTabComplete(tab.id, 20000);
-        return chrome.tabs.get(tab.id);
+        return await chrome.tabs.get(tab.id);
       }
       if (chrome.windows?.create) {
         const win = await chrome.windows.create({ url: initialUrl, state: "minimized" });
@@ -584,19 +638,25 @@ async function ensureTopicPinWorkerTab(initialUrl = "https://weibo.com/") {
           topicPinWorkerWindowId = win.id;
           topicPinWorkerTabId = tab.id;
           await waitForTabComplete(tab.id, 20000);
-          return chrome.tabs.get(tab.id);
+          return await chrome.tabs.get(tab.id);
         }
       }
-    } catch (_) {
-      // fallback to tabs.create below
+    } catch (err) {
+      topicPinLog(`工作标签初始化失败，清理后回退: ${err?.message || err}`, "warn");
+      await closeTopicPinWorkerWindow();
     }
   }
 
   const tab = await chrome.tabs.create({ url: initialUrl, active: false });
   topicPinWorkerTabId = tab.id;
   topicPinWorkerWindowId = null;
-  await waitForTabComplete(tab.id, 20000);
-  return chrome.tabs.get(tab.id);
+  try {
+    await waitForTabComplete(tab.id, 20000);
+    return await chrome.tabs.get(tab.id);
+  } catch (err) {
+    await closeTopicPinWorkerWindow();
+    throw err;
+  }
 }
 
 async function closeTopicPinWorkerWindow() {
@@ -929,7 +989,7 @@ async function getWeiboXsrfToken(url) {
   return "";
 }
 
-async function weiboFetch(url, { method = "GET", formParams = null, accept = "application/json, text/plain, */*", xRequestedWith = true } = {}) {
+async function weiboFetch(url, { method = "GET", formParams = null, accept = "application/json, text/plain, */*", xRequestedWith = true, timeoutMs = 20000 } = {}) {
   if (typeof fetch !== "function") {
     return { httpOk: false, status: 0, url, text: "", json: null, needTabFallback: true, error: "fetch unavailable" };
   }
@@ -943,6 +1003,10 @@ async function weiboFetch(url, { method = "GET", formParams = null, accept = "ap
     headers["Content-Type"] = "application/x-www-form-urlencoded;charset=UTF-8";
     init.body = typeof formParams === "string" ? formParams : new URLSearchParams(formParams).toString();
   }
+
+  const controller = typeof AbortController === "function" && timeoutMs > 0 ? new AbortController() : null;
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  if (controller) init.signal = controller.signal;
 
   try {
     const resp = await fetch(url, init);
@@ -964,6 +1028,7 @@ async function weiboFetch(url, { method = "GET", formParams = null, accept = "ap
       needTabFallback: visitor,
     };
   } catch (err) {
+    const isAbort = err?.name === "AbortError";
     return {
       httpOk: false,
       status: 0,
@@ -974,8 +1039,10 @@ async function weiboFetch(url, { method = "GET", formParams = null, accept = "ap
       visitorChallenge: false,
       networkError: true,
       needTabFallback: false,
-      error: err?.message || String(err),
+      error: isAbort ? `请求超时 (${timeoutMs}ms)` : (err?.message || String(err)),
     };
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -1463,7 +1530,7 @@ async function applyForHostViaHttp(hashtag, cfg, _fastMode = false, preInspected
   });
   if (submitRes.loginRequired) return { status: "login_required" };
   if (submitRes.needTabFallback || !submitRes.json) {
-    return { status: "fallback_needed", reason: "提交申请接口返回非 JSON" };
+    return { status: "unknown", reason: `申请已发送但结果未知，请核对审核状态: ${submitRes.error || "提交接口返回非 JSON"}` };
   }
 
   topicPinLog(`已静默提交 #${hashtag}# 主持人申请（0标签页），正在核验接口结果...`);
@@ -1474,7 +1541,7 @@ async function applyForHostViaHttp(hashtag, cfg, _fastMode = false, preInspected
   if (outcome.done) {
     return { status: outcome.status, ...(outcome.reason ? { reason: outcome.reason } : {}) };
   }
-  return { status: "fallback_needed", reason: "提交响应未明确，回退页面模式确认" };
+  return { status: "unknown", reason: "申请已发送但响应未明确，请核对审核状态" };
 }
 
 async function pinPostToTopicViaHttp(postUrl, objectId, query = "") {
@@ -1541,7 +1608,7 @@ async function pinPostToTopicViaHttp(postUrl, objectId, query = "") {
 
     await sleepMs(1800);
     const verifyRes = await weiboFetch(cardUrl);
-    if (verifyRes.json?.code === "100000") {
+    if (String(verifyRes.json?.code ?? "") === "100000") {
       const afterTop = verifyRes.json?.data?.top_info || {};
       const confirmed = Number(afterTop.replace_tip || 0) === 1
         || (beforeMidtopNum >= 0 && Number(afterTop.midtop_num || 0) > beforeMidtopNum)
@@ -2055,18 +2122,49 @@ async function selectHostFormFieldsInTab(tabId, { category, region }) {
   }, [{ category, region }]);
 }
 
+function isTopicPinClaimUrl(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    return ["http:", "https:"].includes(url.protocol)
+      && ["m.s.weibo.com", "s.weibo.com"].includes(url.hostname)
+      && /^\/claim\/(?:apply|info)\/?$/.test(url.pathname);
+  } catch {
+    return false;
+  }
+}
+
 async function applyForHostInTab(tabId, hashtag, cfg, fastMode = false) {
   const searchUrl = `https://s.weibo.com/weibo?q=%23${encodeURIComponent(hashtag)}%23`;
   await navigateTabAndWait(tabId, searchUrl, fastMode ? 18000 : 25000);
   await sleepMs(fastMode ? 400 : 700);
 
+  const candidateTabs = [];
   const createdTabs = [];
-  const onCreated = (tab) => { if (tab?.id) createdTabs.push(tab.id); };
+  const onCreated = (tab) => {
+    if (tab?.id && tab.openerTabId === tabId) candidateTabs.push(tab.id);
+  };
   chrome.tabs.onCreated.addListener(onCreated);
 
   let targetTabId = tabId;
   let popupTabId = null;
   let debuggerAttached = false;
+  const closeClaimPopup = async (id) => {
+    try {
+      const tab = await chrome.tabs.get(id);
+      if (isTopicPinClaimUrl(tab.url)) await chrome.tabs.remove(id);
+    } catch (err) {
+      topicPinLog(`关闭申请弹窗失败: ${err?.message || err}`, "warn");
+    }
+  };
+  const cleanupPopup = async () => {
+    if (debuggerAttached && typeof releaseBackgroundTab === "function") {
+      await releaseBackgroundTab(targetTabId).catch(() => {});
+      debuggerAttached = false;
+    }
+    for (const id of createdTabs.splice(0)) {
+      await closeClaimPopup(id);
+    }
+  };
   try {
     const preCheck = await runInMainWorld(tabId, (hostName) => {
       const cur = location.href;
@@ -2141,38 +2239,54 @@ async function applyForHostInTab(tabId, hashtag, cfg, fastMode = false) {
       const fullUrl = preCheck.url.startsWith("http")
         ? preCheck.url
         : new URL(preCheck.url, "https://s.weibo.com").href;
+      if (!isTopicPinClaimUrl(fullUrl)) return { status: "failed", reason: "申请入口 URL 不可信" };
       topicPinLog(`进入申请条件页: ${fullUrl.slice(0, 80)}...`);
       await navigateTabAndWait(tabId, fullUrl, 20000);
     } else {
+      let reachedClaimPage = false;
       for (let i = 0; i < 20; i++) {
         await sleepMs(250);
-        if (createdTabs.length > 0) {
-          popupTabId = createdTabs[createdTabs.length - 1];
-          targetTabId = popupTabId;
-          await chrome.tabs.update(popupTabId, { active: false }).catch(() => {});
-          await waitForTabComplete(targetTabId, 15000);
+        for (const id of candidateTabs) {
+          const candidate = await chrome.tabs.get(id).catch(() => null);
+          // about:blank 只轮询 URL，真实申请地址出现前不操作、不认领、不清理。
+          if (!isTopicPinClaimUrl(candidate?.url)) continue;
+          createdTabs.push(id);
+          popupTabId = id;
+          targetTabId = id;
+          await waitForTabComplete(id, 15000);
+          const loaded = await chrome.tabs.get(id);
+          if (!isTopicPinClaimUrl(loaded.url)) {
+            popupTabId = null;
+            targetTabId = tabId;
+            continue;
+          }
+          await chrome.tabs.update(id, { active: false }).catch(() => {});
+          reachedClaimPage = true;
           break;
         }
+        if (reachedClaimPage) break;
         const t = await chrome.tabs.get(tabId);
-        if (t.url && t.url !== searchUrl && !t.url.startsWith("about:blank")) {
+        if (isTopicPinClaimUrl(t.url)) {
           await waitForTabComplete(tabId, 15000);
+          reachedClaimPage = true;
           break;
         }
       }
+      if (!reachedClaimPage) return { status: "failed", reason: "未等到可信的主持人申请页面" };
     }
+    const target = await chrome.tabs.get(targetTabId);
+    if (!isTopicPinClaimUrl(target.url)) return { status: "failed", reason: "申请页面已跳转到非申请地址" };
+  } catch (err) {
+    await cleanupPopup();
+    throw err;
   } finally {
     chrome.tabs.onCreated.removeListener(onCreated);
+    // 未选中的同源弹窗也必须回收；选中的表单页留给后续流程。
+    for (const id of createdTabs.filter((id) => id !== popupTabId)) {
+      await closeClaimPopup(id);
+      createdTabs.splice(createdTabs.indexOf(id), 1);
+    }
   }
-
-  const cleanupPopup = async () => {
-    if (debuggerAttached && typeof releaseBackgroundTab === "function") {
-      await releaseBackgroundTab(targetTabId).catch(() => {});
-      debuggerAttached = false;
-    }
-    if (popupTabId) {
-      try { await chrome.tabs.remove(popupTabId); } catch {}
-    }
-  };
 
   try {
     await sleepMs(fastMode ? 400 : 700);
@@ -2625,6 +2739,18 @@ async function processSingleTopicPinTask(task, cfg, tabOrGetter) {
   }
 
   const updatedTopics = [];
+  const recordUnknownSubmission = async (topicItem, reason) => {
+    updatedTopics.push({
+      ...topicItem,
+      status: task.autoPin ? "applied" : "error",
+      submissionUnknown: true,
+      note: reason || "申请结果未知，请人工核对",
+    });
+    // 每个已发送申请的未知结果立即落盘，避免后续话题异常丢失防重标记。
+    await updateTopicPinTask(task.id, {
+      topics: [...updatedTopics, ...(task.topics || []).slice(updatedTopics.length)],
+    });
+  };
   for (const topicItem of task.topics || []) {
     if (!["pending", "applied"].includes(topicItem.status)) {
       updatedTopics.push(topicItem);
@@ -2643,12 +2769,17 @@ async function processSingleTopicPinTask(task, cfg, tabOrGetter) {
     let cachedInspected = null;
 
     // 手动申请主持人模式（pending 阶段）：优先后台静默 HTTP 申请，仅必要时兜底开标签
-    if (task.mode === "manual_apply" && topicItem.status === "pending") {
+    if (task.mode === "manual_apply" && topicItem.status === "pending" && !topicItem.submissionUnknown) {
       attemptedApplyThisRound = true;
       topicPinLog(`#${hashtag}# 直接进入主持人申请流程...`);
       const applyRes = await applyForHostSmart(resolveTabId, hashtag, cfg, Boolean(task.fastMode));
       if (applyRes.status === "login_required") {
         throw new Error("微博登录态失效，请先登录 weibo.com");
+      }
+      if (applyRes.status === "unknown") {
+        topicPinLog(`#${hashtag}# ${applyRes.reason}，停止重复申请`, "warn");
+        await recordUnknownSubmission(topicItem, applyRes.reason);
+        continue;
       }
       if (applyRes.status === "other_host") {
         topicPinLog(`#${hashtag}# 申请页检测到竞争/其他主持人，跳过`, "info");
@@ -2742,6 +2873,15 @@ async function processSingleTopicPinTask(task, cfg, tabOrGetter) {
       continue;
     }
 
+    if (topicItem.submissionUnknown) {
+      updatedTopics.push({
+        ...topicItem,
+        status: task.autoPin ? "applied" : "error",
+        note: "此前申请结果未知，仅复核权限，禁止重复提交",
+      });
+      continue;
+    }
+
     if (attemptedApplyThisRound && lastApplyFailure) {
       if (inspected?.canApply) {
         if (!task.autoPin) {
@@ -2774,6 +2914,11 @@ async function processSingleTopicPinTask(task, cfg, tabOrGetter) {
       const applyRes = await applyForHostSmart(resolveTabId, hashtag, cfg, Boolean(task.fastMode), inspected);
       if (applyRes.status === "login_required") {
         throw new Error("微博登录态失效，请先登录 weibo.com");
+      }
+      if (applyRes.status === "unknown") {
+        topicPinLog(`#${hashtag}# ${applyRes.reason}，停止重复申请`, "warn");
+        await recordUnknownSubmission(topicItem, applyRes.reason);
+        continue;
       }
       if (applyRes.status === "other_host") {
         updatedTopics.push({ ...topicItem, status: "skipped_other_host", note: "申请页检测到竞争/其他主持人" });
@@ -2822,9 +2967,12 @@ async function processSingleTopicPinTask(task, cfg, tabOrGetter) {
 }
 
 async function processTopicPinQueue() {
-  if (topicPinRunningPromise) return topicPinRunningPromise;
+  if (topicPinRunningPromise) {
+    topicPinRerunRequested = true;
+    return topicPinRunningPromise;
+  }
   topicPinRunningPromise = (async () => {
-    try {
+    const runBatch = async () => {
       const cfg = await getTopicPinConfig();
       const tasks = await getTopicPinTasks();
       const now = Date.now();
@@ -2843,27 +2991,61 @@ async function processTopicPinQueue() {
       }
 
       let earliestNextCheck = null;
-      await withTopicPinBrowserLock(async () => {
-        let lazyTab = null;
-        const getLazyWorkerTabId = async (initialUrl = "https://weibo.com/") => {
-          if (!lazyTab?.id) {
-            lazyTab = await ensureTopicPinWorkerTab(initialUrl);
-          }
-          return lazyTab.id;
-        };
-        for (const task of runnable) {
-          await updateTopicPinTask(task.id, { status: "running", error: "" });
-          try {
-            const nextAt = await processSingleTopicPinTask(task, cfg, getLazyWorkerTabId);
-            if (nextAt && (!earliestNextCheck || nextAt < earliestNextCheck)) {
-              earliestNextCheck = nextAt;
-            }
-          } catch (err) {
-            topicPinLog(`任务失败: ${err.message || err}`, "error");
-            await updateTopicPinTask(task.id, { status: "error", error: err.message || String(err) });
-          }
+      let hasBatchError = false;
+      const reportTopicPin = (stage, percentage, isRunning, status) => {
+        if (typeof reportGlobalJobProgress === "function") {
+          reportGlobalJobProgress("topic_pin", {
+            label: "话题置顶",
+            stage,
+            percentage,
+            isRunning,
+            status,
+          });
         }
-      });
+      };
+      reportTopicPin(`准备处理 ${runnable.length} 条话题置顶`, 5, true, "running");
+      try {
+        await withTopicPinBrowserLock(async () => {
+          let lazyTab = null;
+          const getLazyWorkerTabId = async (initialUrl = "https://weibo.com/") => {
+            if (!lazyTab?.id) {
+              lazyTab = await ensureTopicPinWorkerTab(initialUrl);
+            }
+            return lazyTab.id;
+          };
+          for (let idx = 0; idx < runnable.length; idx++) {
+            const task = runnable[idx];
+            const firstTag = task?.topics?.[0]?.hashtag ? `#${task.topics[0].hashtag}#` : `任务 ${idx + 1}`;
+            reportTopicPin(
+              `置顶 ${idx + 1}/${runnable.length} · ${firstTag}`,
+              Math.round(((idx + 0.5) / runnable.length) * 90) + 5,
+              true,
+              "running"
+            );
+            await updateTopicPinTask(task.id, { status: "running", error: "" });
+            try {
+              const nextAt = await processSingleTopicPinTask(task, cfg, getLazyWorkerTabId);
+              if (nextAt && (!earliestNextCheck || nextAt < earliestNextCheck)) {
+                earliestNextCheck = nextAt;
+              }
+            } catch (err) {
+              hasBatchError = true;
+              topicPinLog(`任务失败: ${err.message || err}`, "error");
+              await updateTopicPinTask(task.id, { status: "error", error: err.message || String(err) });
+            }
+          }
+        });
+      } catch (err) {
+        hasBatchError = true;
+        throw err;
+      } finally {
+        reportTopicPin(
+          hasBatchError ? `置顶完成（部分异常）` : `置顶队列完成 (${runnable.length} 条)`,
+          100,
+          false,
+          hasBatchError ? "error" : "done"
+        );
+      }
 
       // Check if any other waiting_review tasks need an alarm
       const afterTasks = await getTopicPinTasks();
@@ -2875,6 +3057,12 @@ async function processTopicPinQueue() {
         const soonest = Math.min(...futureChecks);
         await chrome.alarms.create(TOPIC_PIN_ALARM_TICK, { when: Math.max(Date.now() + 5000, soonest) });
       }
+    };
+    try {
+      do {
+        topicPinRerunRequested = false;
+        await runBatch();
+      } while (topicPinRerunRequested);
     } finally {
       topicPinRunningPromise = null;
     }
@@ -2882,7 +3070,7 @@ async function processTopicPinQueue() {
   return topicPinRunningPromise;
 }
 
-async function enqueueTopicPinTask({ mode, postUrl, text = "", hashtags = [], isVote = false, fastMode = false, autoPin = true }) {
+async function enqueueTopicPinTask({ mode, postUrl, text = "", hashtags = [], isVote = false, fastMode = false, autoPin = true, monitorPostId = "" }) {
   const cfg = await getTopicPinConfig();
   const filtered = filterPostForTopicPin({ text, hashtags, isVote }, cfg);
   if (!filtered.shouldProcess && mode !== "manual_apply") {
@@ -2899,7 +3087,7 @@ async function enqueueTopicPinTask({ mode, postUrl, text = "", hashtags = [], is
     };
     await withTopicPinMutation(async () => {
       const tasks = await getTopicPinTasks();
-      await saveTopicPinTasks([skippedTask, ...tasks]);
+      await saveTopicPinTasks([skippedTask, ...tasks], monitorPostId);
     });
     topicPinLog(`跳过微博 (${filtered.reason}): ${postUrl}`, "info");
     return skippedTask;
@@ -2924,7 +3112,7 @@ async function enqueueTopicPinTask({ mode, postUrl, text = "", hashtags = [], is
 
   await withTopicPinMutation(async () => {
     const tasks = await getTopicPinTasks();
-    await saveTopicPinTasks([newTask, ...tasks]);
+    await saveTopicPinTasks([newTask, ...tasks], monitorPostId);
   });
 
   processTopicPinQueue().catch((err) => topicPinLog(`队列调度异常: ${err.message}`, "error"));
@@ -3175,7 +3363,6 @@ async function checkWeiboMonitorOnce({ manual = false } = {}) {
         return { ok: true, newPost: false, postId: res.post.id };
       }
 
-      await chrome.storage.local.set({ topicPinLastPostId: res.post.id });
       const hashtags = extractHashtagsFromText(res.post.text);
       topicPinLog(`主页巡检发现新微博 (${res.post.url})，话题: ${hashtags.length ? hashtags.map((h) => `#${h}#`).join(" ") : "无"}`, "info");
       await saveTopicMonitorStatus({
@@ -3193,6 +3380,7 @@ async function checkWeiboMonitorOnce({ manual = false } = {}) {
         hashtags,
         isVote: resolvedIsVote,
         autoPin: true,
+        monitorPostId: res.post.id,
       });
       return { ok: true, newPost: true, postId: res.post.id };
     } catch (err) {

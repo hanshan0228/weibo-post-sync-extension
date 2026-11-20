@@ -6,7 +6,7 @@
  */
 
 if (typeof importScripts === "function") {
-  importScripts("topic_pinner.js");
+  importScripts("topic_pinner.js", "hotsearch_writer.js");
 }
 
 let state = {
@@ -46,7 +46,7 @@ async function updateScheduledTask(taskId, updates) {
   });
 }
 
-// 初始化防盗链请求头修改规则 (docs.qq.com 防盗链 & 扩展后台直连微博 API Referer/Origin 对齐)
+// 初始化防盗链请求头修改规则 (docs.qq.com / alidocs.dingtalk.com 防盗链 & 扩展后台直连微博 API Referer/Origin 对齐)
 function initRefererRules() {
   if (!chrome.declarativeNetRequest || !chrome.declarativeNetRequest.updateDynamicRules) return;
   const rules = [
@@ -61,6 +61,20 @@ function initRefererRules() {
       },
       condition: {
         urlFilter: "docs.qq.com",
+        resourceTypes: ["xmlhttprequest", "image", "other", "sub_frame"]
+      }
+    },
+    {
+      id: 1008,
+      priority: 1,
+      action: {
+        type: "modifyHeaders",
+        requestHeaders: [
+          { header: "Referer", operation: "set", value: "https://alidocs.dingtalk.com/" }
+        ]
+      },
+      condition: {
+        urlFilter: "||alidocs.dingtalk.com/",
         resourceTypes: ["xmlhttprequest", "image", "other", "sub_frame"]
       }
     }
@@ -96,7 +110,7 @@ function initRefererRules() {
   }
 
   chrome.declarativeNetRequest.updateDynamicRules({
-    removeRuleIds: [1001, 1002, 1003, 1004, 1005, 1006, 1007],
+    removeRuleIds: [1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008],
     addRules: rules
   }).catch((e) => console.warn("DeclarativeNetRequest init:", e));
 }
@@ -121,14 +135,58 @@ function appendLog(detail, level = "info") {
   }).catch(() => {});
 }
 
+const activeJobsMap = {};
+
+function reportGlobalJobProgress(jobId, info = {}) {
+  const id = String(jobId || "").trim();
+  if (!id) return;
+  const pct = Math.max(0, Math.min(100, Number(info.percentage ?? 0) || 0));
+  const isRunning = Boolean(info.isRunning);
+  const status = info.status || (isRunning ? "running" : (pct >= 100 ? "done" : "idle"));
+  activeJobsMap[id] = {
+    id,
+    label: String(info.label || id),
+    stage: String(info.stage || "准备就绪"),
+    percentage: pct,
+    isRunning,
+    status,
+    updatedAt: Date.now(),
+  };
+  chrome.runtime.sendMessage({
+    action: "PIPELINE_PROGRESS",
+    payload: {
+      stage: state.stage,
+      percentage: state.percentage,
+      isRunning: state.isRunning,
+      activeJobs: Object.values(activeJobsMap),
+    },
+  }).catch(() => {});
+}
+globalThis.reportGlobalJobProgress = reportGlobalJobProgress;
+
 function updateProgress(stage, percentage) {
   state.stage = stage;
   state.percentage = percentage;
   syncState();
+  const isError = /^中断[:：]|失败/.test(String(stage || ""));
+  activeJobsMap.pipeline = {
+    id: "pipeline",
+    label: "主发博流水线",
+    stage: String(stage || "准备就绪"),
+    percentage: Math.max(0, Math.min(100, Number(percentage) || 0)),
+    isRunning: !!state.isRunning,
+    status: state.isRunning ? "running" : (isError ? "error" : (Number(percentage) >= 100 ? "done" : "idle")),
+    updatedAt: Date.now(),
+  };
 
   chrome.runtime.sendMessage({
     action: "PIPELINE_PROGRESS",
-    payload: { stage, percentage, isRunning: state.isRunning },
+    payload: {
+      stage,
+      percentage,
+      isRunning: state.isRunning,
+      activeJobs: Object.values(activeJobsMap),
+    },
   }).catch(() => {});
 }
 
@@ -364,7 +422,7 @@ async function executeInTabDirect(tabId, func, args = [], world = "MAIN", reload
 // ─────────────────────────────────────────────────────────────
 // 直通函数 1：云文档待发内容提取 (直接注入到腾讯文档/钉钉页面运行)
 // ─────────────────────────────────────────────────────────────
-function directExtractDocTasks(targetSheetId, linkColLetter, filterAccount, strictRead = false) {
+function directExtractDocTasks(targetSheetId, linkColLetter, filterAccount, strictRead = false, forceLinkCol = false) {
   try {
     const app = window.SpreadsheetApp;
     const wb = app && app.workbook;
@@ -390,6 +448,7 @@ function directExtractDocTasks(targetSheetId, linkColLetter, filterAccount, stri
         let accountCol = -1;
         let contentCol = -1;
         let linkCol = -1;
+        let bestHeaderLinkScore = -10000;
         let timeCol = -1;
         let materialCol = -1;
 
@@ -461,15 +520,16 @@ function directExtractDocTasks(targetSheetId, linkColLetter, filterAccount, stri
             }
           }
 
-          // 评估链接/回写列。素材链接、参考链接不能压过真正的回写列。
+          // 评估链接/回写列。素材链接、参考链接、原文/视频链接不能压过真正的回写列。
           const scoreLinkHeader = (raw) => {
             const n = normHeader(raw);
             if (!n) return -10000;
-            if (["素材", "配图", "物料", "图片", "参考"].some((word) => n.includes(word))) return -10000;
-            if (["微博链接", "博文链接", "回写", "回执"].some((word) => n.includes(word))) return 100;
-            if (["链接", "网址", "url"].some((word) => n === word || n.endsWith(word))) return 70;
-            if (["原文链接", "跳转链接"].includes(n)) return 50;
-            if (n.includes("链接") || n.includes("url")) return 40;
+            if (["素材", "配图", "物料", "图片", "参考", "账号链接", "账号主页"].some((word) => n.includes(word))) return -10000;
+            if (["微博链接", "博文链接", "回写", "回执", "反馈链接", "发布链接", "上线链接", "已发链接"].some((word) => n.includes(word))) return 100;
+            if (["原文链接", "跳转链接", "视频链接", "来源链接", "原链接", "首评链接", "评论链接", "分享链接"].some((word) => n.includes(word))) return 20;
+            if (["link", "链接", "网址", "url", "反馈", "微博地址", "博文地址", "发布地址"].includes(n)) return 90;
+            if (["链接", "网址", "url", "反馈", "微博地址", "博文地址", "发布地址"].some((word) => n.endsWith(word))) return 70;
+            if (n.includes("链接") || n.includes("url") || n.includes("反馈")) return 40;
             return -10000;
           };
           let lCol;
@@ -508,15 +568,97 @@ function directExtractDocTasks(targetSheetId, linkColLetter, filterAccount, stri
             contentCol = cCol !== undefined ? parseInt(cCol, 10) : -1;
             accountCol = bestAcctCol !== -1 && maxAcctScore > 0 ? bestAcctCol : -1;
             linkCol = lCol !== undefined ? parseInt(lCol, 10) : -1;
+            bestHeaderLinkScore = bestLinkScore;
             materialCol = mCol !== undefined ? parseInt(mCol, 10) : -1;
             timeCol = tCol !== undefined ? parseInt(tCol, 10) : -1;
           }
         }
 
-        if (linkCol === -1) {
-          const letter = String(linkColLetter || "E").trim().toUpperCase();
+        const headerLinkCol = linkCol;
+        const explicitColIdx = (() => {
+          const letter = String(linkColLetter || "").trim().toUpperCase();
+          if (!/^[A-Z]+$/.test(letter)) return -1;
+          return Array.from(letter).reduce((n, ch) => n * 26 + ch.charCodeAt(0) - 64, 0) - 1;
+        })();
+
+        const inferExistingLinkCol = () => {
+          const takenCols = new Set([contentCol, accountCol, materialCol, timeCol].filter((c) => c >= 0));
+          let inferredCol = -1;
+          let bestUrlScore = 0;
+          let bestWeiboHits = 0;
+          const sampleEndRow = Math.min(rowCount, headerRow + 150);
+          for (let c = 0; c < Math.min(40, colCount); c++) {
+            if (takenCols.has(c)) continue;
+            let headerRaw = "";
+            try {
+              const hCell = target.getCellDataAtPosition(headerRow - 1, c);
+              headerRaw = normHeader(hCell ? tools.getCellEditValue(wb, headerRow - 1, c, sid, hCell) : "");
+            } catch (_) {}
+            if (["素材", "配图", "物料", "图片", "参考"].some((w) => headerRaw.includes(w))) continue;
+            let weiboHits = 0;
+            let httpHits = 0;
+            for (let r = headerRow; r < sampleEndRow; r++) {
+              const cell = target.getCellDataAtPosition(r, c);
+              if (!cell) continue;
+              let val = "";
+              try {
+                val = String(tools.getCellEditValue(wb, r, c, sid, cell) || "").trim().toLowerCase();
+              } catch (_) {}
+              if (!val && cell.getCellHyperlinksInfo) {
+                try {
+                  const href = cell.getCellHyperlinksInfo()?.hyperlinksInfo?.[0]?.hyperlink?.url || "";
+                  val = String(href).trim().toLowerCase();
+                } catch (_) {}
+              }
+              if (!val) continue;
+              if (val.includes("weibo.com/") || val.includes("weibo.cn/") || val.includes("m.weibo.cn/")) weiboHits++;
+              else if (val.startsWith("http://") || val.startsWith("https://")) httpHits++;
+            }
+            const score = weiboHits * 10 + (httpHits >= 2 ? httpHits : 0);
+            if (score > bestUrlScore) {
+              bestUrlScore = score;
+              inferredCol = c;
+              bestWeiboHits = weiboHits;
+            }
+          }
+          return { inferredCol, bestUrlScore, bestWeiboHits };
+        };
+
+        const inferredLinkInfo = inferExistingLinkCol();
+        let linkColSource = "";
+        linkCol = -1;
+
+        // 优先级：1. 实际扫描到的微博链接列 -> 2. 明确回写表头列 -> 3. 其他 HTTP 链接推断列 -> 4. 手动指定列兜底 -> 5. 弱表头/默认 H 列
+        if (inferredLinkInfo.inferredCol !== -1 && inferredLinkInfo.bestWeiboHits >= 1) {
+          linkCol = inferredLinkInfo.inferredCol;
+          linkColSource = "已有链接推断";
+        } else if (headerLinkCol >= 0 && bestHeaderLinkScore >= 40) {
+          linkCol = headerLinkCol;
+          let matchedHeader = "";
+          try {
+            const hCell = target.getCellDataAtPosition(headerRow - 1, linkCol);
+            matchedHeader = String(hCell ? tools.getCellEditValue(wb, headerRow - 1, linkCol, sid, hCell) : "").trim();
+          } catch (_) {}
+          linkColSource = matchedHeader ? `表头: ${matchedHeader}` : "表头匹配";
+        } else if (inferredLinkInfo.inferredCol !== -1) {
+          linkCol = inferredLinkInfo.inferredCol;
+          linkColSource = "已有链接推断";
+        } else if (forceLinkCol && explicitColIdx >= 0 && explicitColIdx !== contentCol && explicitColIdx !== accountCol) {
+          linkCol = explicitColIdx;
+          linkColSource = "手动指定列";
+        } else if (headerLinkCol >= 0) {
+          linkCol = headerLinkCol;
+          let matchedHeader = "";
+          try {
+            const hCell = target.getCellDataAtPosition(headerRow - 1, linkCol);
+            matchedHeader = String(hCell ? tools.getCellEditValue(wb, headerRow - 1, linkCol, sid, hCell) : "").trim();
+          } catch (_) {}
+          linkColSource = matchedHeader ? `表头: ${matchedHeader}` : "表头匹配";
+        } else {
+          const letter = String(linkColLetter || "H").trim().toUpperCase();
           if (!/^[A-Z]+$/.test(letter)) return { ok: false, error: "回写列必须为有效列字母" };
           linkCol = Array.from(letter).reduce((n, ch) => n * 26 + ch.charCodeAt(0) - 64, 0) - 1;
+          linkColSource = "空白表头兜底";
         }
         if (contentCol === -1) {
           return { ok: false, error: "未识别到正文/文案列，已阻断扫描，避免把其他列当成博文发布" };
@@ -533,6 +675,8 @@ function directExtractDocTasks(targetSheetId, linkColLetter, filterAccount, stri
         };
         const tasks = [];
         let carriedAccount = "";
+        let skippedByLink = 0;
+        let skippedByEmptyContent = 0;
 
         // 提取单元格中的图片/物料 URL 辅助函数 (全面覆盖 docimg、=IMAGE公式、多层属性与附件)
         const extractImagesFromCell = (cData, cVal) => {
@@ -616,7 +760,10 @@ function directExtractDocTasks(targetSheetId, linkColLetter, filterAccount, stri
           try {
             contentVal = (tools.getCellEditValue(wb, r, contentCol, sid, contentCell) || "").toString().trim();
           } catch (error) { if (strictRead) throw error; }
-          if (!contentVal) continue;
+          if (!contentVal) {
+            skippedByEmptyContent++;
+            continue;
+          }
 
           const linkCell = target.getCellDataAtPosition(r, linkCol);
           let linkVal = "";
@@ -631,7 +778,15 @@ function directExtractDocTasks(targetSheetId, linkColLetter, filterAccount, stri
               }
             } catch (error) { if (strictRead) throw error; }
           }
-          if (linkVal) continue;
+          if (!linkVal && linkCell && typeof linkCell === "object") {
+            const rawFallback = [linkCell.v, linkCell.val, linkCell.text, linkCell.displayValue, linkCell.formula, linkCell.f]
+              .find((x) => typeof x === "string" && x.trim());
+            if (rawFallback) linkVal = rawFallback.trim();
+          }
+          if (linkVal) {
+            skippedByLink++;
+            continue;
+          }
 
           let timeVal = "";
           if (timeCol !== -1) {
@@ -689,10 +844,32 @@ function directExtractDocTasks(targetSheetId, linkColLetter, filterAccount, stri
           });
         }
 
+        const titleEl = typeof document !== "undefined"
+          ? document.querySelector('input[class*="title"], [class*="doc-title"] input, [data-testid*="title"] input, .title-input, .header-title-text, [class*="title-text"]')
+          : null;
+        const rawDocTitle = String(
+          (titleEl && ("value" in titleEl ? titleEl.value : titleEl.textContent)) ||
+          (typeof document !== "undefined" ? document.title : "") ||
+          ""
+        ).replace(/\s*[-–—|]\s*(?:腾讯在线文档|腾讯文档|钉钉文档|钉钉).*$/i, "").trim();
+
+        const totalScannedRows = Math.max(0, rowCount - headerRow);
+        const sheetLabel = target.getSheetName ? target.getSheetName() : sid;
+        const scanSummary = `${sheetLabel}(总${totalScannedRows}行/已填链接跳过${skippedByLink}/空正文跳过${skippedByEmptyContent}/命中${tasks.length})`;
+        let linkColWarning = "";
+        if (forceLinkCol && skippedByLink === 0 && inferredLinkInfo.inferredCol !== -1 && inferredLinkInfo.inferredCol !== linkCol) {
+          linkColWarning = `当前手动指定回写列 ${colLetter(linkCol)} 为空，但检测到列 ${colLetter(inferredLinkInfo.inferredCol)} 存在已有链接，请确认是否误设了回写列`;
+        }
+
         return {
           ok: true,
           provider: "SpreadsheetApp",
-          sheetName: target.getSheetName ? target.getSheetName() : sid,
+          sheetName: sheetLabel,
+          docTitle: rawDocTitle,
+          linkColLetterUsed: colLetter(linkCol),
+          linkColSource,
+          linkColWarning,
+          scanSummary,
           tasks,
         };
       }
@@ -777,6 +954,20 @@ async function directPostToWeiboPlatform(task, isDryRun) {
       };
     }
 
+    const isVisible = (node) => {
+      if (!node) return false;
+      try {
+        const style = window.getComputedStyle(node);
+        if (style && (style.display === "none" || style.visibility === "hidden" || style.opacity === "0")) {
+          return false;
+        }
+        const rect = node.getBoundingClientRect();
+        return (rect.width > 0 && rect.height > 0) || node.getClientRects().length > 0 || !!(node.offsetWidth || node.offsetHeight);
+      } catch (_) {
+        return true;
+      }
+    };
+
     // 0.4 前置清理：若页面停留着上一次发布成功的“复制链接”弹窗或二次确认弹窗，温和关闭但不破坏 Vue Teleport 容器
     try {
       const activeModals = Array.from(document.querySelectorAll('.n-dialog, .n-modal, [role="dialog"]')).filter(isVisible);
@@ -846,25 +1037,11 @@ async function directPostToWeiboPlatform(task, isDryRun) {
       if (s.baseNorm) targetNormSet.add(s.baseNorm);
     }
 
-    const isVisible = (node) => {
-      if (!node) return false;
-      try {
-        const style = window.getComputedStyle(node);
-        if (style && (style.display === "none" || style.visibility === "hidden" || style.opacity === "0")) {
-          return false;
-        }
-        const rect = node.getBoundingClientRect();
-        return (rect.width > 0 && rect.height > 0) || node.getClientRects().length > 0 || !!(node.offsetWidth || node.offsetHeight);
-      } catch (_) {
-        return true;
-      }
-    };
-
     const isBoxChecked = (el) => {
       const root = el.closest?.('.n-checkbox, [role="checkbox"], label') || el;
       const input = root.querySelector?.('input[type="checkbox"]');
-      if (input) return !!input.checked;
-      return (
+      return Boolean(
+        input?.checked ||
         root.classList?.contains("n-checkbox--checked") ||
         root.classList?.contains("is-checked") ||
         root.getAttribute?.("aria-checked") === "true"
@@ -898,7 +1075,7 @@ async function directPostToWeiboPlatform(task, isDryRun) {
     // 2. 账号定位与安全勾选系统 (支持单号及多号群发、跨分类Tab勾选与异步渲染等待)
     let accountMatched = targetSpecs.length === 0;
 
-    function findAccountInCurrentDom(spec) {
+    function findAccountInCurrentDom(spec, includeHidden = false) {
       if (!spec) return null;
       const candidateNodes = Array.from(
         document.querySelectorAll(
@@ -906,14 +1083,18 @@ async function directPostToWeiboPlatform(task, isDryRun) {
         )
       );
 
-      const matches = (expected) => {
+      const matches = (expected, allowStripDomParens = false) => {
         if (!expected) return [];
         const roots = new Set();
         for (const node of candidateNodes) {
-          if (!isVisible(node)) continue;
+          if (!includeHidden && !isVisible(node)) continue;
           const rawTxt = String(node.innerText || node.textContent || "").trim();
           const firstLine = rawTxt.split(/\r?\n/).map((l) => l.trim()).find(Boolean) || "";
-          if (norm(rawTxt) !== expected && norm(firstLine) !== expected) continue;
+          const matched =
+            norm(rawTxt) === expected ||
+            norm(firstLine) === expected ||
+            (allowStripDomParens && norm(stripParens(firstLine)) === expected);
+          if (!matched) continue;
           const canonical = node.closest('.n-checkbox, [role="checkbox"], .account_selector_checkbox') || node.closest('label') || node;
           roots.add(canonical);
         }
@@ -922,7 +1103,9 @@ async function directPostToWeiboPlatform(task, isDryRun) {
       const exact = matches(spec.norm);
       if (exact.length) return exact.find((el) => !isBoxChecked(el)) || exact[0];
       const base = spec.baseNorm && spec.baseNorm !== spec.norm ? matches(spec.baseNorm) : [];
-      return base.length ? (base.find((el) => !isBoxChecked(el)) || base[0]) : null;
+      if (base.length) return base.find((el) => !isBoxChecked(el)) || base[0];
+      const domStripped = matches(spec.baseNorm || spec.norm, true);
+      return domStripped.length ? (domStripped.find((el) => !isBoxChecked(el)) || domStripped[0]) : null;
     }
 
     async function ensureChecked(el) {
@@ -930,13 +1113,22 @@ async function directPostToWeiboPlatform(task, isDryRun) {
       el.scrollIntoView?.({ block: "center", behavior: "instant" });
       await new Promise((r) => setTimeout(r, 80));
 
+      const triggerClick = (target) => {
+        if (!target) return;
+        try {
+          target.dispatchEvent?.(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window }));
+          target.dispatchEvent?.(new MouseEvent("mouseup", { bubbles: true, cancelable: true, view: window }));
+        } catch (_) {}
+        target.click?.();
+      };
+
       if (!isBoxChecked(el)) {
-        el.click();
+        triggerClick(el);
         await new Promise((r) => setTimeout(r, 120));
       }
       if (!isBoxChecked(el)) {
-        const inner = el.querySelector?.('input[type="checkbox"], .n-checkbox-box, .n-checkbox__label') || el;
-        inner.click?.();
+        const inner = el.querySelector?.('.n-checkbox-box, .n-checkbox__label, input[type="checkbox"]') || el;
+        if (inner !== el) triggerClick(inner);
         await new Promise((r) => setTimeout(r, 120));
       }
       return isBoxChecked(el);
@@ -950,14 +1142,35 @@ async function directPostToWeiboPlatform(task, isDryRun) {
       }
 
       const checkedSet = new Set();
+      const foundUncheckedDiag = new Map();
+      const recordUncheckable = (spec, el) => {
+        if (!el) return;
+        const root = el.closest?.('.n-checkbox, [role="checkbox"], label') || el;
+        const inp = root.querySelector?.('input[type="checkbox"]');
+        const disReasons = [];
+        if (root.classList?.contains("n-checkbox--disabled")) disReasons.push("clsDisabled");
+        if (root.getAttribute?.("aria-disabled") === "true") disReasons.push("ariaDisabled");
+        if (inp?.disabled) disReasons.push("inpDisabled");
+        foundUncheckedDiag.set(
+          spec.raw,
+          disReasons.length
+            ? `禁用(${disReasons.join("+")},checked=${isBoxChecked(el)})`
+            : `点击未生效(hasInput=${!!inp},cls=${String(root.className || "").slice(0, 40)})`
+        );
+      };
       const tryCheckPendingInCurrentDom = async () => {
         let hitAny = false;
         for (const spec of targetSpecs) {
           if (checkedSet.has(spec.raw)) continue;
           const found = findAccountInCurrentDom(spec);
-          if (found && await ensureChecked(found)) {
-            checkedSet.add(spec.raw);
-            hitAny = true;
+          if (found) {
+            if (await ensureChecked(found)) {
+              checkedSet.add(spec.raw);
+              foundUncheckedDiag.delete(spec.raw);
+              hitAny = true;
+            } else {
+              recordUncheckable(spec, found);
+            }
           }
         }
         return hitAny;
@@ -1006,10 +1219,8 @@ async function directPostToWeiboPlatform(task, isDryRun) {
           }
 
           collectVisibleLabels();
-          const checkedHere = await tryCheckPendingInCurrentDom();
-          if (checkedHere) {
-            await clearOtherCheckedAccounts();
-          }
+          await tryCheckPendingInCurrentDom();
+          await clearOtherCheckedAccounts();
         }
       }
 
@@ -1033,10 +1244,8 @@ async function directPostToWeiboPlatform(task, isDryRun) {
               if (anyPending) break;
             }
             collectVisibleLabels();
-            const checkedHere = await tryCheckPendingInCurrentDom();
-            if (checkedHere) {
-              await clearOtherCheckedAccounts();
-            }
+            await tryCheckPendingInCurrentDom();
+            await clearOtherCheckedAccounts();
           }
         }
       }
@@ -1071,6 +1280,17 @@ async function directPostToWeiboPlatform(task, isDryRun) {
         }
       }
 
+      // 第五阶段：若所有可见 Tab 与搜索均未命中，兜底匹配 DOM 中已挂载但处于隐藏/折叠分类面板的账号节点
+      if (checkedSet.size < targetSpecs.length) {
+        for (const spec of targetSpecs) {
+          if (checkedSet.has(spec.raw)) continue;
+          const hiddenMatch = findAccountInCurrentDom(spec, true);
+          if (hiddenMatch && await ensureChecked(hiddenMatch)) {
+            checkedSet.add(spec.raw);
+          }
+        }
+      }
+
       const missingSpecs = targetSpecs.filter((s) => !checkedSet.has(s.raw));
       accountMatched = missingSpecs.length === 0;
 
@@ -1081,12 +1301,15 @@ async function directPostToWeiboPlatform(task, isDryRun) {
           .slice(0, 20)
           .join("、");
         const tabDiag = scannedTabNames.length ? `；已扫描分类Tab(${scannedTabNames.length}): ${scannedTabNames.slice(0, 12).join("、")}` : "";
+        const uncheckDiag = foundUncheckedDiag.size
+          ? `；已定位但未能勾选(${Array.from(foundUncheckedDiag.entries()).map(([k, v]) => `${k}:${v}`).join("、")})`
+          : "";
         const missingLabel = missingSpecs.map((s) => s.raw).join("、");
 
         return {
           ok: false,
           submitted: false,
-          error: `未在发稿中台各分类下找到目标账号 [${missingLabel}]（当前可见账号共${allVisibleLabels.length}个，示例: ${availableAccounts || "未加载"}${tabDiag}），已阻断发送以防发错账号`,
+          error: `未在发稿中台各分类下找到目标账号 [${missingLabel}]（当前可见账号共${allVisibleLabels.length}个，示例: ${availableAccounts || "未加载"}${tabDiag}${uncheckDiag}），已阻断发送以防发错账号`,
         };
       }
 
@@ -1340,6 +1563,35 @@ async function directPostToWeiboPlatform(task, isDryRun) {
       }
     }
 
+    // 3.8 选择发布类型模式（“散列发布”或默认“立即发布”）
+    const wantScatter = Boolean(task.scatterPublish);
+    const selectPublishMode = async () => {
+      const targetMode = wantScatter ? "散列发布" : "立即发布";
+      const modeCandidates = Array.from(
+        document.querySelectorAll('.n-radio, [role="radio"], [role="tab"], .n-tabs-tab, label')
+      ).filter((el) => !el.closest?.(".post_footer, footer, .weibo-editor-footer"));
+      for (const mb of modeCandidates) {
+        const t = (mb.innerText || mb.textContent || "").trim();
+        const matched = wantScatter ? (t === "散列发布" || t === "散列" || t.includes("散列发布")) : (t === "立即发布");
+        if (!matched) continue;
+        const isSelected =
+          mb.classList.contains("n-radio--checked") ||
+          mb.classList.contains("is-active") ||
+          mb.getAttribute("aria-checked") === "true" ||
+          Boolean(mb.querySelector?.('input[type="radio"]:checked'));
+        if (!isSelected) {
+          mb.click();
+          await new Promise((r) => setTimeout(r, 200));
+        }
+        return true;
+      }
+      return false;
+    };
+    const modeSelected = await selectPublishMode();
+    if (wantScatter && !modeSelected) {
+      return { ok: false, submitted: false, error: "未在发稿页找到【散列发布】模式选项，已阻断以免按立即发布发出" };
+    }
+
     // 4. 安全演练判断 (Dry-Run Gate)
     if (isDryRun) {
       let banner = document.getElementById("__dryrun_banner__");
@@ -1353,7 +1605,7 @@ async function directPostToWeiboPlatform(task, isDryRun) {
       const acctLabel = targetAccounts.length > 1
         ? `${targetAccounts[0]} 等 ${targetAccounts.length} 个账号`
         : (targetAccount || "当前选中");
-      banner.innerText = `🛡️【安全演练】账号 [${acctLabel}] 已勾选，正文已填入${repostUrl ? "，转发链接已填入" : ""}${uploadedImageCount > 0 ? `，配图 (${uploadedImageCount}张) 已装配预览` : ""}${pollAttached ? "，投票已挂载" : ""}，安全阻断未实际点击发布！`;
+      banner.innerText = `🛡️【安全演练】账号 [${acctLabel}] 已勾选，${wantScatter ? "已选【散列发布】，" : ""}正文已填入${repostUrl ? "，转发链接已填入" : ""}${uploadedImageCount > 0 ? `，配图 (${uploadedImageCount}张) 已装配预览` : ""}${pollAttached ? "，投票已挂载" : ""}，安全阻断未实际点击发布！`;
       setTimeout(() => banner.remove(), 5000);
 
       const nowTs = Date.now();
@@ -1432,27 +1684,8 @@ async function directPostToWeiboPlatform(task, isDryRun) {
     document.addEventListener("copy", onCopyCapture, true);
 
     try {
-      // 5.1 确保发布类型模式处于“立即发布”（严格仅检索顶部的单选框/标签页，绝不误检索底部的提交按钮与常规 button！）
-      try {
-        const modeCandidates = Array.from(
-          document.querySelectorAll('.n-radio, [role="radio"], [role="tab"], .n-tabs-tab')
-        ).filter((el) => !el.closest(".post_footer, footer, .weibo-editor-footer"));
-
-        for (const mb of modeCandidates) {
-          const t = (mb.innerText || mb.textContent || "").trim();
-          if (t === "立即发布") {
-            const isSelected =
-              mb.classList.contains("n-radio--checked") ||
-              mb.classList.contains("is-active") ||
-              mb.getAttribute("aria-checked") === "true";
-            if (!isSelected) {
-              mb.click();
-              await new Promise((r) => setTimeout(r, 150));
-            }
-            break;
-          }
-        }
-      } catch (_) {}
+      // 5.1 再次确认发布类型模式（实时模式下确保未在演练后被切回）
+      await selectPublishMode();
 
       // 5.2 精确查找主提交按钮：优先定位底部的【保存并发布】提交按钮（对齐 server.py，绝不误点模式选择或保存草稿！）
       let publishBtn = null;
@@ -1493,12 +1726,25 @@ async function directPostToWeiboPlatform(task, isDryRun) {
         return { ok: false, submitted: false, error: "未在发稿页定位到【保存并发布】提交按钮" };
       }
 
-      // 页内指纹级防重复发布锁：60秒内同一页面绝不二次点击发布相同正文！
+      // 页内指纹级防重复发布锁：同时写入 window 与 sessionStorage（120秒内即使页面跳转/刷新也不二次点击发布相同正文）
       // 只在真正点击前写入。按钮不可用或用户已停止时不能占锁，否则合法重试会被误拦。
       const postFingerprint = `${targetAccounts.join(",") || targetAccount}::${content}`;
+      const fpNow = Date.now();
       window.__weiboPostedFingerprints = window.__weiboPostedFingerprints || {};
-      if (window.__weiboPostedFingerprints[postFingerprint] && Date.now() - window.__weiboPostedFingerprints[postFingerprint] < 60000) {
-        return { ok: false, submitted: false, error: "已拦截重复提交：60秒内该页面已对该博文执行过发布动作，已自动阻断二次点击" };
+      try {
+        if (typeof sessionStorage !== "undefined") {
+          const savedFp = JSON.parse(sessionStorage.getItem("__weiboPostedFingerprints") || "{}");
+          for (const [k, ts] of Object.entries(savedFp)) {
+            if (typeof ts === "number" && fpNow - ts < 120000) {
+              if (!window.__weiboPostedFingerprints[k] || ts > window.__weiboPostedFingerprints[k]) {
+                window.__weiboPostedFingerprints[k] = ts;
+              }
+            }
+          }
+        }
+      } catch (_) {}
+      if (!task.allowDuplicateBypass && window.__weiboPostedFingerprints[postFingerprint] && fpNow - window.__weiboPostedFingerprints[postFingerprint] < 120000) {
+        return { ok: false, submitted: false, error: "已拦截重复提交：120秒内该页面已对该博文执行过发布动作，已自动阻断二次点击" };
       }
 
       publishBtn.scrollIntoView?.({ block: "center" });
@@ -1514,6 +1760,11 @@ async function directPostToWeiboPlatform(task, isDryRun) {
       window.__weiboPostedFingerprints[postFingerprint] = Date.now();
       try {
         if (typeof sessionStorage !== "undefined") {
+          const prunedFp = {};
+          for (const [k, ts] of Object.entries(window.__weiboPostedFingerprints)) {
+            if (typeof ts === "number" && Date.now() - ts < 120000) prunedFp[k] = ts;
+          }
+          sessionStorage.setItem("__weiboPostedFingerprints", JSON.stringify(prunedFp));
           sessionStorage.setItem("__weiboSyncSubmission", JSON.stringify(window.__weiboSyncSubmission));
         }
         const submitPayload = JSON.stringify({
@@ -1628,6 +1879,8 @@ async function directPostToWeiboPlatform(task, isDryRun) {
       let multiSettlePolls = 0;
       let lastEntriesCount = 0;
       const isMultiTarget = targetSpecs.length > 1;
+      const clickedConfirmBtns = new WeakSet();
+      const clickedConfirmSignatures = new Set();
 
       for (let poll = 0; poll < maxPostPolls; poll++) {
         await new Promise((r) => setTimeout(r, 500));
@@ -1715,11 +1968,22 @@ async function directPostToWeiboPlatform(task, isDryRun) {
             const modalBtns = Array.from(modal.querySelectorAll('button, .n-button, [role="button"]')).filter(isVisible);
             for (const btn of modalBtns) {
               const bTxt = (btn.innerText || btn.textContent || "").trim();
-              if (intermediateConfirmKeywords.some((kw) => bTxt === kw)) {
-                btn.click();
-                await new Promise((r) => setTimeout(r, 400));
-                break;
+              if (!intermediateConfirmKeywords.some((kw) => bTxt === kw)) continue;
+              if (
+                btn.disabled ||
+                btn.getAttribute?.("aria-disabled") === "true" ||
+                btn.classList?.contains("n-button--loading") ||
+                clickedConfirmBtns.has(btn)
+              ) {
+                continue;
               }
+              const sig = `${modalText.replace(/\s+/g, " ").trim().slice(0, 80)}::${bTxt}`;
+              if (clickedConfirmSignatures.has(sig)) continue;
+              clickedConfirmBtns.add(btn);
+              clickedConfirmSignatures.add(sig);
+              btn.click();
+              await new Promise((r) => setTimeout(r, 400));
+              break;
             }
           }
         }
@@ -2271,6 +2535,16 @@ async function directWriteCellToDoc(cellAddr, linkValue, targetSheetId, snapshot
       }
 
       if (targetSheet && app.behaviorApi && app.behaviorApi.cellApi) {
+        const isReadOnly = Boolean(
+          (typeof wb.isReadOnly === "function" && wb.isReadOnly()) ||
+          (typeof wb.getIsReadOnly === "function" && wb.getIsReadOnly()) ||
+          (typeof targetSheet.isReadOnly === "function" && targetSheet.isReadOnly()) ||
+          wb.readOnly === true ||
+          app.readOnly === true
+        );
+        if (isReadOnly) {
+          return { ok: false, error: "当前文档处于只读/无编辑权限状态，已阻断写回" };
+        }
         const sid = targetSheet.getSheetId();
         // 快照必须来自扫描时的同一子表和行；旧回执缺少列信息时只能人工核对补写。
         if (!snapshot || !snapshot.sheetId || snapshot.sheetId !== sid ||
@@ -2380,10 +2654,14 @@ async function directWriteCellToDoc(cellAddr, linkValue, targetSheetId, snapshot
           payload.isRichStringChanged = true;
         }
 
+        let writeApiRes;
         try {
-          await app.behaviorApi.cellApi.setSingleValue(payload);
+          writeApiRes = await app.behaviorApi.cellApi.setSingleValue(payload);
         } catch (writeErr) {
           return { ok: false, error: `原生单元格写回失败: ${writeErr.message || writeErr}` };
+        }
+        if (writeApiRes === false || (writeApiRes && typeof writeApiRes === "object" && (writeApiRes.ok === false || writeApiRes.success === false))) {
+          return { ok: false, error: `原生单元格写回被拒绝: ${writeApiRes?.error || writeApiRes?.message || "请检查编辑权限"}` };
         }
 
         // 协同表格经常先落盘、后刷新内存。只读一次会把已经写上的链接判失败。
@@ -2410,6 +2688,33 @@ async function directWriteCellToDoc(cellAddr, linkValue, targetSheetId, snapshot
           }
 
           if (verifiedVal === linkValue) {
+            // 等待文档头部保存状态完成（若页面存在“正在保存”提示），再做一次落盘复读以防只读/断连被服务端回滚
+            if (typeof document !== "undefined" && document.querySelector) {
+              const saveWaitStart = Date.now();
+              while (Date.now() - saveWaitStart < 2500) {
+                const statusEl = document.querySelector('[class*="save-status"], [class*="sync-status"], [data-testid*="save-status"]');
+                const statusText = String(statusEl?.textContent || "").trim();
+                if (!statusText || !/正在保存|保存中|同步中/.test(statusText)) break;
+                await new Promise((r) => setTimeout(r, 250));
+              }
+              const recheckCell = targetSheet.getCellDataAtPosition(targetRow0, targetCol0);
+              let recheckVal = "";
+              try {
+                recheckVal = (tools.getCellEditValue(wb, targetRow0, targetCol0, sid, recheckCell) || "").toString().trim();
+              } catch (_) {}
+              if (!recheckVal && recheckCell) {
+                recheckVal = String(recheckCell.formattedValue || recheckCell.text || recheckCell.m || "").trim();
+              }
+              if (recheckVal !== linkValue && recheckCell?.getCellHyperlinksInfo) {
+                try {
+                  const href = recheckCell.getCellHyperlinksInfo()?.hyperlinksInfo?.[0]?.hyperlink?.url || "";
+                  if (String(href).trim() === linkValue) recheckVal = linkValue;
+                } catch (_) {}
+              }
+              if (recheckVal !== linkValue) {
+                return { ok: false, error: "写回后未能确认云端落盘（单元格被回滚或未保存），请核对权限后手动补写" };
+              }
+            }
             return {
               ok: true,
               provider: "SpreadsheetApp.behaviorApi",
@@ -2445,6 +2750,56 @@ async function directCopyPublishPageResult() {
       .replace(/&quot;/g, "\"");
     const matched = decoded.match(/https?:\/\/(?:www\.)?(?:weibo\.com|m\.weibo\.cn|weibo\.cn|t\.cn)\/[^\s"<]+/i);
     return matched ? matched[0].replace(/[.,;)]+$/g, "") : "";
+  };
+  const normNickKey = (s) => String(s || "").replace(/\s+/g, "").trim().toLowerCase().replace(/[^0-9a-z一-鿿]/g, "");
+  const parseEntriesFromText = (rawText) => {
+    const entries = [];
+    if (!rawText) return entries;
+    const text = String(rawText);
+    const urlRe = /https?:\/\/[^\s"'<>]+/g;
+    let match;
+    let cursor = 0;
+    while ((match = urlRe.exec(text)) !== null) {
+      const url = extractFirstPublishResultUrl(match[0]);
+      const prefix = text.slice(cursor, match.index);
+      cursor = match.index + match[0].length;
+      if (!url) continue;
+      const segments = prefix.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+      let nick = segments.length ? segments[segments.length - 1] : "";
+      if (!nick) {
+        const prevLineIdx = text.slice(0, match.index).trimEnd().split(/\r?\n/);
+        const prevLine = prevLineIdx.length > 1 ? prevLineIdx[prevLineIdx.length - 2] : "";
+        nick = /^https?:\/\//i.test(prevLine.trim()) ? "" : prevLine.trim();
+      }
+      nick = nick.replace(/[:：\s、,，]+$/g, "").trim();
+      entries.push({ nick, normNick: normNickKey(nick), url });
+    }
+    return entries;
+  };
+  const entriesFromPublishModel = () => {
+    const entries = [];
+    const seen = new Set();
+    const pushEntry = (nick, url) => {
+      if (!url) return;
+      const cleanNick = String(nick || "").replace(/[:：\s]+$/g, "").trim();
+      const key = `${normNickKey(cleanNick)}::${url}`;
+      if (seen.has(key) || (!cleanNick && entries.some((entry) => entry.url === url))) return;
+      seen.add(key);
+      entries.push({ nick: cleanNick, normNick: normNickKey(cleanNick), url });
+    };
+    for (const item of document.querySelectorAll(".publish_model_item, .weibo-link-item")) {
+      const nickEl = item.querySelector(".publish_model_nickname, .nickname");
+      const rawNick = nickEl ? (nickEl.innerText || nickEl.textContent || "") : "";
+      const linkEl = item.querySelector(".publish_model_link, a.link, .link-wrapper a, a[href], input, .link");
+      const rawLink = linkEl ? (linkEl.getAttribute?.("href") || linkEl.href || linkEl.value || linkEl.innerText || linkEl.textContent || "") : (item.innerText || item.textContent || "");
+      pushEntry(rawNick, extractFirstPublishResultUrl(rawLink));
+    }
+    if (window.__clipCaptured) {
+      for (const e of parseEntriesFromText(window.__clipCaptured)) {
+        pushEntry(e.nick, e.url);
+      }
+    }
+    return entries;
   };
   const urlsFromPublishModel = () => {
     const htmlText = document.documentElement ? document.documentElement.outerHTML : "";
@@ -2512,14 +2867,21 @@ async function directCopyPublishPageResult() {
     return false;
   };
   for (let attempt = 0; attempt < 40; attempt++) {
+    const modelEntries = entriesFromPublishModel();
     const modelUrls = urlsFromPublishModel();
-    if (modelUrls.length) return { ok: true, postUrl: modelUrls[0], source: "publish_model" };
+    if (modelUrls.length) {
+      return { ok: true, postUrl: modelUrls[0], postEntries: modelEntries, source: "publish_model" };
+    }
     const copiedAlready = extractFirstPublishResultUrl(window.__clipCaptured);
-    if (copiedAlready) return { ok: true, postUrl: copiedAlready, source: "剪贴板" };
+    if (copiedAlready) {
+      return { ok: true, postUrl: copiedAlready, postEntries: parseEntriesFromText(window.__clipCaptured), source: "剪贴板" };
+    }
     clickByText(copyKeywords, false);
     await new Promise((resolve) => setTimeout(resolve, 150));
     const copied = extractFirstPublishResultUrl(window.__clipCaptured);
-    if (copied) return { ok: true, postUrl: copied, source: "复制按钮" };
+    if (copied) {
+      return { ok: true, postUrl: copied, postEntries: parseEntriesFromText(window.__clipCaptured), source: "复制按钮" };
+    }
     await new Promise((resolve) => setTimeout(resolve, 300));
   }
   const html = (document.body && document.body.innerHTML) || "";
@@ -2885,13 +3247,80 @@ async function createSilentRunnerWindow(platformUrl) {
   return { window: win, tab };
 }
 
+let managedVisibleWeiboTabId = null;
+let managedSilentWeiboTabId = null;
+
+async function getOrCreateManagedWeiboTab(targetUrl, { silent = false } = {}) {
+  let targetHost = "";
+  try {
+    targetHost = new URL(targetUrl).hostname.toLowerCase();
+  } catch (_) {}
+
+  const storageKey = silent ? "__managedSilentWeiboTabId__" : "__managedVisibleWeiboTabId__";
+  let candidateId = silent ? managedSilentWeiboTabId : managedVisibleWeiboTabId;
+  if (!candidateId) {
+    try {
+      const stored = await chrome.storage.local.get([storageKey]);
+      if (stored?.[storageKey]) {
+        candidateId = stored[storageKey];
+        if (silent) managedSilentWeiboTabId = candidateId;
+        else managedVisibleWeiboTabId = candidateId;
+      }
+    } catch (_) {}
+  }
+
+  if (candidateId) {
+    try {
+      const existing = await chrome.tabs.get(candidateId);
+      if (existing && existing.id && !isProtectedBrowserUrl(existing.url)) {
+        let existingHost = "";
+        try { existingHost = new URL(existing.url).hostname.toLowerCase(); } catch (_) {}
+        const sameDomain = targetHost && existingHost === targetHost;
+        if (sameDomain) {
+          const sameUrl = String(existing.url || "") === String(targetUrl || "");
+          await chrome.tabs.update(existing.id, silent ? { url: targetUrl } : { url: targetUrl, active: true }).catch(() => {});
+          if (sameUrl) {
+            await chrome.tabs.reload(existing.id).catch(() => {});
+          }
+          if (!silent && existing.windowId) {
+            await chrome.windows.update(existing.windowId, { focused: true }).catch(() => {});
+          }
+          return existing;
+        }
+      }
+    } catch (_) {
+      if (silent) managedSilentWeiboTabId = null;
+      else managedVisibleWeiboTabId = null;
+    }
+  }
+
+  const created = await chrome.tabs.create({ url: targetUrl, active: !silent });
+  if (!silent && created?.windowId) {
+    await chrome.windows.update(created.windowId, { focused: true }).catch(() => {});
+  }
+  if (created?.id) {
+    if (silent) managedSilentWeiboTabId = created.id;
+    else managedVisibleWeiboTabId = created.id;
+    chrome.storage.local.set({ [storageKey]: created.id }).catch(() => {});
+  }
+  return created;
+}
+
+async function getOrCreateManagedVisibleWeiboTab(targetUrl) {
+  return getOrCreateManagedWeiboTab(targetUrl, { silent: false });
+}
+
+async function getOrCreateManagedSilentWeiboTab(targetUrl) {
+  return getOrCreateManagedWeiboTab(targetUrl, { silent: true });
+}
+
 // ─────────────────────────────────────────────────────────────
 // 辅助定位与加载 (按真实域名 Hostname 精确匹配，防止误命中 CAS 登录 query 参数或休眠页)
 // ─────────────────────────────────────────────────────────────
 function parseTabSheetId(docUrl) {
   try {
     const url = new URL(docUrl);
-    return url.searchParams.get("tab") || null;
+    return url.searchParams.get("tab") || url.searchParams.get("sheetId") || url.searchParams.get("sheet") || null;
   } catch (_) {
     return null;
   }
@@ -3082,6 +3511,7 @@ function parseDingTalkDocumentPayload(payload, options = {}) {
   const targetSheetId = String(options.targetSheetId || "").trim();
   const explicitLinkCol = String(options.linkColLetter || "").trim().toUpperCase();
   const filterAccount = String(options.filterAccount || "").trim();
+  const teamFilter = options.teamFilter !== undefined ? String(options.teamFilter).trim() : "新浪热点";
   const maxRows = Number(options.maxRows || 500);
 
   function buildMatrix(rawRows) {
@@ -3173,6 +3603,69 @@ function parseDingTalkDocumentPayload(payload, options = {}) {
     return bestHits >= 2 ? bestIdx : -1;
   }
 
+  function scoreDingTalkAccountCol(headers) {
+    const norms = headers.map(normalizeDingTalkHeader);
+    let bestIdx = -1;
+    let bestScore = -10000;
+    for (let i = 0; i < norms.length; i++) {
+      const n = norms[i];
+      if (!n) continue;
+      if (["账号类型", "账号类别", "账号属性", "账号id", "账号uid", "账号链接", "账号主页", "类型", "类别"].includes(n)) continue;
+      let score = -10000;
+      if (["account", "账号", "账号名", "账号名称", "发布账号", "媒体账号", "账户名", "账户名称"].includes(n)) score = 100;
+      else if (["账号名称", "账号名", "发布账号", "媒体账号", "账户名"].some((k) => n.startsWith(k) || n.endsWith(k))) score = 60;
+      else if (n.includes("账号") || n.includes("账户")) score = 40;
+      else if (["名称", "作者", "用户", "博主"].includes(n)) score = 30;
+      if (score > bestScore) {
+        bestScore = score;
+        bestIdx = i;
+      }
+    }
+    return bestScore > 0 ? bestIdx : -1;
+  }
+
+  function scoreDingTalkContentCol(headers) {
+    const norms = headers.map(normalizeDingTalkHeader);
+    const briefExcl = ["brief", "bf", "方向", "要求", "说明", "分类", "标签", "类型", "分组", "大纲", "指南", "提示", "建议", "备注"];
+    let bestIdx = -1;
+    let bestScore = -10000;
+    for (let i = 0; i < norms.length; i++) {
+      const n = norms[i];
+      if (!n) continue;
+      let score = -10000;
+      if (["content", "copy", "text", "文案", "正文", "微博正文", "微博文案", "文本文案", "博文文案", "博文正文", "博文内容", "发布内容"].includes(n)) score = 100;
+      else if ((n.includes("文案") || n.includes("正文")) && !briefExcl.some((b) => n.includes(b))) score = 60;
+      else if ((n.includes("内容") || n.includes("文本")) && !briefExcl.some((b) => n.includes(b))) score = 40;
+      if (score > bestScore) {
+        bestScore = score;
+        bestIdx = i;
+      }
+    }
+    return bestScore > 0 ? bestIdx : -1;
+  }
+
+  function scoreDingTalkLinkCol(headers) {
+    const norms = headers.map(normalizeDingTalkHeader);
+    let bestIdx = -1;
+    let bestScore = -10000;
+    for (let i = 0; i < norms.length; i++) {
+      const n = norms[i];
+      if (!n) continue;
+      if (["素材", "配图", "物料", "图片", "参考", "账号链接", "账号主页"].some((w) => n.includes(w))) continue;
+      let score = -10000;
+      if (["微博链接", "博文链接", "回写", "回执", "反馈链接", "发布链接", "上线链接", "已发链接"].some((w) => n.includes(w))) score = 100;
+      else if (["原文链接", "跳转链接", "视频链接", "来源链接", "原链接", "首评链接", "评论链接", "分享链接"].some((w) => n.includes(w))) score = 20;
+      else if (["link", "链接", "网址", "url", "反馈", "微博地址", "博文地址", "发布地址"].includes(n)) score = 90;
+      else if (["link", "链接", "网址", "url", "反馈", "微博地址", "博文地址", "发布地址"].some((w) => n.endsWith(w))) score = 70;
+      else if (n.includes("链接") || n.includes("url") || n.includes("反馈")) score = 40;
+      if (score > bestScore) {
+        bestScore = score;
+        bestIdx = i;
+      }
+    }
+    return bestScore > 0 ? bestIdx : -1;
+  }
+
   function buildCandidate(sheetId, meta) {
     const sheetContent = workbookContent[sheetId] || {};
     const rawRows = sheetContent.rows || [];
@@ -3181,40 +3674,53 @@ function parseDingTalkDocumentPayload(payload, options = {}) {
 
     const headerIdx = findHeaderRow(matrix);
     const headers = matrix[headerIdx] || [];
-    const accountCol = matchColumn(headers, ["account", "账号", "账号名", "账号名称", "发布账号", "媒体账号"], ["账号类型", "账号类别", "账号属性"]);
-    const contentCol = matchColumn(headers, ["content", "正文", "内容", "文案", "copy", "text"], ["brief", "bf", "方向", "要求", "说明", "备注", "分类"]);
-    let linkCol = matchColumn(headers, ["link", "链接", "url", "网址", "回写", "回执", "微博链接", "博文链接"], ["素材", "配图", "物料", "图片", "参考"]);
+    const accountCol = scoreDingTalkAccountCol(headers);
+    const contentCol = scoreDingTalkContentCol(headers);
+    let linkCol = scoreDingTalkLinkCol(headers);
+    let linkColSource = linkCol !== -1 ? "表头匹配" : "";
     const timeCol = matchColumn(headers, ["time", "时间", "日期", "发布时间", "排期"]);
     const materialCol = matchColumn(headers, ["素材", "物料", "图片", "配图", "image", "photo", "media"]);
+    const teamCol = teamFilter ? matchColumn(headers, ["团队"]) : -1;
 
     if (linkCol === -1 && accountCol === 2 && contentCol === 4 && headers.length >= 7) {
       linkCol = 6;
+      linkColSource = "位置推断";
     }
     if (linkCol === -1) {
       const taken = new Set([accountCol, contentCol, timeCol, materialCol].filter((x) => x !== -1));
       linkCol = inferLinkColumn(matrix, headerIdx, headers, taken);
+      if (linkCol !== -1) linkColSource = "已有链接推断";
     }
     if (linkCol === -1 && /^[A-Z]+$/.test(explicitLinkCol)) {
       linkCol = Array.from(explicitLinkCol).reduce((n, ch) => n * 26 + ch.charCodeAt(0) - 64, 0) - 1;
+      linkColSource = "手动指定列";
     }
     if (accountCol === -1 || contentCol === -1 || linkCol === -1) return null;
 
     const tasks = [];
+    let totalDataRows = 0;
+    let skippedByTeam = 0;
+    let skippedByLink = 0;
+    let skippedByEmptyContent = 0;
     let currentAccount = "";
+    let currentTeam = "";
     for (let i = headerIdx + 1; i < matrix.length; i++) {
       const rowNum = rowNumbers[i] || i + 1;
       const row = matrix[i] || [];
+      if (teamCol !== -1 && teamFilter) {
+        const teamVal = String(row[teamCol] || "").trim();
+        if (teamVal) currentTeam = teamVal;
+        if (currentTeam !== teamFilter) {
+          skippedByTeam++;
+          continue;
+        }
+      }
       const acctVal = String(row[accountCol] || "").trim();
       if (acctVal) currentAccount = acctVal;
       if (!currentAccount) continue;
 
       const contentVal = String(row[contentCol] || "").trim();
       const linkVal = String(row[linkCol] || "").trim();
-      if (!contentVal || linkVal) continue;
-      if (filterAccount && !currentAccount.includes(filterAccount) && !filterAccount.includes(currentAccount)) {
-        continue;
-      }
-
       const timeVal = timeCol !== -1 ? normalizeDingTalkTime(row[timeCol]) : "";
       const rowImages = [];
       if (materialCol !== -1) {
@@ -3230,6 +3736,31 @@ function parseDingTalkDocumentPayload(payload, options = {}) {
         }
       }
 
+      if (contentVal) totalDataRows++;
+
+      // 兼容纯配图续行（同账号紧邻下一行无正文/时间/链接但有配图）合并到上一条任务
+      if (!contentVal && !linkVal && !timeVal && rowImages.length > 0 && tasks.length > 0) {
+        const prev = tasks[tasks.length - 1];
+        if (prev.row + 1 === rowNum && prev.account === currentAccount) {
+          for (const img of rowImages) {
+            if (!prev.imgUrls.includes(img)) prev.imgUrls.push(img);
+          }
+          continue;
+        }
+      }
+
+      if (!contentVal) {
+        skippedByEmptyContent++;
+        continue;
+      }
+      if (linkVal) {
+        skippedByLink++;
+        continue;
+      }
+      if (filterAccount && !currentAccount.includes(filterAccount) && !filterAccount.includes(currentAccount)) {
+        continue;
+      }
+
       tasks.push({
         row: rowNum,
         account: currentAccount,
@@ -3237,6 +3768,7 @@ function parseDingTalkDocumentPayload(payload, options = {}) {
         time: timeVal,
         targetCell: `${colNumToLetters(linkCol + 1)}${rowNum}`,
         targetSheetId: sheetId,
+        sheetName: (meta && (meta.title || meta.name)) || sheetId,
         link: "",
         imgUrls: rowImages,
         materialCol: materialCol !== -1 ? colNumToLetters(materialCol + 1) : "",
@@ -3247,7 +3779,7 @@ function parseDingTalkDocumentPayload(payload, options = {}) {
 
     const titleNorm = normalizeDingTalkHeader((meta && (meta.title || meta.name)) || "");
     const headerNorms = headers.map(normalizeDingTalkHeader);
-    let score = tasks.length;
+    let score = totalDataRows || tasks.length;
     if (titleNorm.includes("运营文案")) score += 220;
     if (titleNorm.includes("资源包")) score += 40;
     if (titleNorm.includes("媒介")) score -= 220;
@@ -3262,8 +3794,18 @@ function parseDingTalkDocumentPayload(payload, options = {}) {
     return {
       sheetId,
       sheetName: (meta && (meta.title || meta.name)) || sheetId,
+      isMediaSheet: titleNorm.includes("媒介"),
+      linkColLetterUsed: colNumToLetters(linkCol + 1),
+      linkColSource,
       tasks,
       score,
+      stats: {
+        rows: Math.max(0, matrix.length - headerIdx - 1),
+        skippedByTeam,
+        skippedByLink,
+        skippedByEmptyContent,
+        matched: tasks.length,
+      },
     };
   }
 
@@ -3296,26 +3838,42 @@ function parseDingTalkDocumentPayload(payload, options = {}) {
       provider: "DingTalk",
       sheetName: picked.sheetName,
       sheetId: picked.sheetId,
+      linkColLetterUsed: picked.linkColLetterUsed,
+      linkColSource: picked.linkColSource,
       tasks: picked.tasks,
     };
   }
 
-  let best = null;
+  const candidates = [];
   for (const sid of candidateIds) {
     const cand = buildCandidate(sid, metaById.get(sid));
-    if (!cand) continue;
-    if (!best || cand.score > best.score) best = cand;
+    if (cand) candidates.push(cand);
   }
 
-  if (!best) {
+  if (!candidates.length) {
     return { ok: false, error: "钉钉表格未检测到包含「账号/文案/链接」的有效工作表" };
   }
+
+  candidates.sort((a, b) => b.score - a.score);
+  const best = candidates[0];
+  const nonMediaWithTasks = candidates.filter((c) => !c.isMediaSheet && c.tasks.length > 0);
+  const mergedTasks = nonMediaWithTasks.length > 0
+    ? nonMediaWithTasks.flatMap((c) => c.tasks).slice(0, maxRows)
+    : best.tasks;
+
+  const scanSummary = (nonMediaWithTasks.length > 0 ? nonMediaWithTasks : [best])
+    .map((c) => `${c.sheetName}(总${c.stats.rows}行/非${teamFilter || "目标"}团队跳过${c.stats.skippedByTeam}/已填链接跳过${c.stats.skippedByLink}/空正文跳过${c.stats.skippedByEmptyContent}/命中${c.stats.matched})`)
+    .join("；");
+
   return {
     ok: true,
     provider: "DingTalk",
     sheetName: best.sheetName,
     sheetId: best.sheetId,
-    tasks: best.tasks,
+    linkColLetterUsed: best.linkColLetterUsed,
+    linkColSource: best.linkColSource,
+    tasks: mergedTasks,
+    scanSummary,
   };
 }
 
@@ -3407,13 +3965,14 @@ async function fetchDingTalkDocumentPayloadInTab(tabId, timeoutMs = 15000, optio
 
           const candidateRequests = [];
           for (const pu of perfUrls) {
-            candidateRequests.push({ url: pu, extraHeaders: true, includeKeysInBody: false });
+            candidateRequests.push({ url: pu, extraHeaders: true, includeKeysInBody: false, disableSlice: true });
+            candidateRequests.push({ url: pu, extraHeaders: true, includeKeysInBody: false, disableSlice: false });
           }
           if (docKey) {
-            candidateRequests.push({ url: `${url}?docKey=${encodeURIComponent(docKey)}`, extraHeaders: true, includeKeysInBody: false });
+            candidateRequests.push({ url: `${url}?docKey=${encodeURIComponent(docKey)}`, extraHeaders: true, includeKeysInBody: false, disableSlice: false });
           }
-          candidateRequests.push({ url, extraHeaders: true, includeKeysInBody: false });
-          candidateRequests.push({ url, extraHeaders: true, includeKeysInBody: true });
+          candidateRequests.push({ url, extraHeaders: true, includeKeysInBody: false, disableSlice: false });
+          candidateRequests.push({ url, extraHeaders: true, includeKeysInBody: true, disableSlice: true });
 
           let lastStatus = 0;
           let lastText = "";
@@ -3426,12 +3985,16 @@ async function fetchDingTalkDocumentPayloadInTab(tabId, timeoutMs = 15000, optio
               if (docKey) headers["a-doc-key"] = docKey;
               if (dentryKey) headers["a-dentry-key"] = dentryKey;
             }
-            const payloadObj = cand.includeKeysInBody
-              ? { ...reqBody, ...(docKey ? { docKey } : {}), ...(dentryKey ? { dentryKey } : {}) }
+            const baseBody = cand.disableSlice
+              ? { ...reqBody, enableSlice: false }
               : reqBody;
+            const payloadObj = cand.includeKeysInBody
+              ? { ...baseBody, ...(docKey ? { docKey } : {}), ...(dentryKey ? { dentryKey } : {}) }
+              : baseBody;
             const resp = await fetch(cand.url, {
               method: "POST",
               credentials: "include",
+              cache: "no-store",
               headers,
               body: JSON.stringify(payloadObj),
             });
@@ -3573,6 +4136,25 @@ async function sendCdpCtrlC(tabId) {
   });
 }
 
+async function sendCdpCtrlV(tabId) {
+  await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", {
+    type: "keyDown",
+    modifiers: 2,
+    key: "v",
+    code: "KeyV",
+    windowsVirtualKeyCode: 86,
+    nativeVirtualKeyCode: 86,
+  });
+  await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", {
+    type: "keyUp",
+    modifiers: 2,
+    key: "v",
+    code: "KeyV",
+    windowsVirtualKeyCode: 86,
+    nativeVirtualKeyCode: 86,
+  });
+}
+
 async function armDingTalkCopyCapture(tabId) {
   await chrome.scripting.executeScript({
     target: { tabId, allFrames: true },
@@ -3658,15 +4240,21 @@ async function ensureDingTalkNameBoxInput(tabId, targetAddr) {
   const frameResults = await chrome.scripting.executeScript({
     target: { tabId, allFrames: true },
     world: "MAIN",
-    func: (addr) => {
+    func: async (addr) => {
       const href = String(window.location.href || "");
       if (!href.includes("/spreadsheetv2/") && !href.includes("/sheet")) return null;
-      const inp = document.querySelector('input[data-testid="SelectionEditContainer"]');
+      let inp = document.querySelector('input[data-testid="SelectionEditContainer"]');
+      if (!inp) {
+        const divBox = document.querySelector('div.sc-dcJsrY, [data-role="namebox"], [class*="namebox" i]');
+        if (divBox) {
+          divBox.click();
+          await new Promise((r) => setTimeout(r, 150));
+          inp = document.querySelector('input[data-testid="SelectionEditContainer"]');
+        }
+      }
       const active = document.activeElement;
       const activeTag = active ? `${active.tagName}.${String(active.getAttribute?.("data-testid") || active.className || "").slice(0, 24)}` : "none";
       if (!inp) {
-        const divBox = document.querySelector('div.sc-dcJsrY, [data-role="namebox"], [class*="namebox" i]');
-        if (divBox) divBox.click();
         return { foundInp: false, activeTag, val: "", focused: false };
       }
       inp.focus();
@@ -3937,6 +4525,49 @@ function validateDingTalkWriteSnapshot(payload, targetSheetId, coords, snapshot,
   }
 }
 
+async function ensureDingTalkActiveSheet(tabId, targetSheetId, payload, currentTitle) {
+  if (!targetSheetId || !payload) return false;
+  try {
+    const root = typeof payload?.text === "string" && !payload?.data?.documentContent ? JSON.parse(payload.text) : payload;
+    const raw = root?.data?.documentContent?.checkpoint?.content || root?.data?.documentContent?.deltas?.snapshot;
+    const workbook = typeof raw === "string" ? JSON.parse(raw) : raw;
+    const meta = (workbook?.sheetsMeta || []).find((m) => String(m?.id || "") === String(targetSheetId));
+    const targetTitle = String(meta?.title || meta?.name || "").trim();
+    if (!targetTitle || String(currentTitle || "").trim() === targetTitle) return false;
+
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      world: "MAIN",
+      func: (expectedTitle) => {
+        const href = String(window.location.href || "");
+        if (!href.includes("/spreadsheetv2/") && !href.includes("/sheet")) return false;
+        const selectors = [
+          '[role="tab"]',
+          '[class*="sheet-tab"]',
+          '[class*="SheetTab"]',
+          '[class*="tab-item"]',
+        ];
+        for (const sel of selectors) {
+          const tabs = Array.from(document.querySelectorAll(sel));
+          const hit = tabs.find((el) => String(el.innerText || el.textContent || "").trim() === expectedTitle);
+          if (hit) {
+            hit.click();
+            return true;
+          }
+        }
+        return false;
+      },
+      args: [targetTitle],
+    }).catch(() => []);
+    for (let i = 0; i < 10; i++) {
+      await new Promise((r) => setTimeout(r, 200));
+      const st = await inspectDingTalkSheetState(tabId);
+      if (st && String(st.activeSheetTitle || "").trim() === targetTitle) return true;
+    }
+  } catch (_) {}
+  return false;
+}
+
 async function writeDingTalkCellInTab(tabId, cellAddr, linkValue, targetSheetId, options = {}) {
   const coords = parseCellAddrCoords(cellAddr);
   if (!coords) return { ok: false, error: "无效的钉钉单元格地址" };
@@ -4018,8 +4649,15 @@ async function writeDingTalkCellInTab(tabId, cellAddr, linkValue, targetSheetId,
       }
 
       const payload = await fetchDingTalkDocumentPayloadInTab(tabId, 8000, { signal: options?.signal, maxAttempts: 2 });
-      const cellBeforeState = await inspectDingTalkSheetState(tabId);
+      let cellBeforeState = await inspectDingTalkSheetState(tabId);
       if (isAborted()) return { ok: false, error: "钉钉写回已超时中止" };
+      if (targetSheetId && cellBeforeState?.activeSheetTitle) {
+        const switched = await ensureDingTalkActiveSheet(tabId, targetSheetId, payload, cellBeforeState.activeSheetTitle);
+        if (switched) {
+          await navigateToTarget();
+          cellBeforeState = await inspectDingTalkSheetState(tabId);
+        }
+      }
       if (cellBeforeState?.currentAddr !== coords.normAddr || !cellBeforeState.formulaReadable) {
         return { ok: false, error: "无法确认目标单元格或读取公式栏，已阻断写回" };
       }
@@ -4051,8 +4689,29 @@ async function writeDingTalkCellInTab(tabId, cellAddr, linkValue, targetSheetId,
         },
       }).catch(() => {});
       if (isAborted()) return { ok: false, error: "钉钉写回已超时中止" };
-      await chrome.debugger.sendCommand({ tabId }, "Input.insertText", { text: cleanValue });
-      await new Promise((r) => setTimeout(r, 250));
+      const clipWriteResults = await chrome.scripting.executeScript({
+        target: { tabId, allFrames: true },
+        world: "MAIN",
+        func: async (v) => {
+          const href = String(window.location.href || "");
+          if (!href.includes("/spreadsheetv2/") && !href.includes("/sheet")) return false;
+          try {
+            if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+              await navigator.clipboard.writeText(v);
+              return true;
+            }
+          } catch (_) {}
+          return false;
+        },
+        args: [cleanValue],
+      }).catch(() => []);
+      const pastedReady = (clipWriteResults || []).some((r) => r?.result === true);
+      if (pastedReady) {
+        await sendCdpCtrlV(tabId);
+      } else {
+        await chrome.debugger.sendCommand({ tabId }, "Input.insertText", { text: cleanValue });
+      }
+      await new Promise((r) => setTimeout(r, 350));
       await sendCdpKeyEnter(tabId);
       await new Promise((r) => setTimeout(r, 600));
 
@@ -4256,15 +4915,19 @@ async function findOrCreateTab(urlMatch, createUrl, shouldActivate = false, onCr
   let targetHost = "";
   let targetPathPrefix = "";
   let targetHash = "";
+  let targetSearchParams = null;
   try {
     const parsedCreate = new URL(cleanCreate);
     targetHost = parsedCreate.hostname.toLowerCase();
     targetPathPrefix = parsedCreate.pathname;
     targetHash = parsedCreate.hash || "";
+    targetSearchParams = parsedCreate.searchParams;
   } catch (_) {}
 
+  const queryIdentityKeys = ["tab", "sheet", "sheetId", "docId", "id", "nodeId"];
   const tabs = await chrome.tabs.query({});
   if (cleanMatch) {
+    let fallbackTab = null;
     for (const t of tabs) {
       if (!t.url || isProtectedBrowserUrl(t.url)) continue;
       try {
@@ -4273,6 +4936,28 @@ async function findOrCreateTab(urlMatch, createUrl, shouldActivate = false, onCr
         // 必须真实域名匹配，绝不因为 ?service=xxx 参数误匹配到 cas.erp.sina.com.cn 登录页
         if (targetHost && host !== targetHost) continue;
         if (targetHost && host === targetHost && u.pathname === targetPathPrefix) {
+          let hasConflict = false;
+          let exactQueryMatch = true;
+          if (targetSearchParams) {
+            for (const key of queryIdentityKeys) {
+              const wantedVal = targetSearchParams.get(key);
+              if (!wantedVal) continue;
+              const actualVal = u.searchParams.get(key);
+              if (actualVal && actualVal !== wantedVal) {
+                hasConflict = true;
+                exactQueryMatch = false;
+                break;
+              }
+              if (actualVal !== wantedVal) {
+                exactQueryMatch = false;
+              }
+            }
+          }
+          if (hasConflict) continue;
+          if (!exactQueryMatch) {
+            if (!fallbackTab) fallbackTab = t;
+            continue;
+          }
           // 如果目标要求 #/post 发博页，但当前标签页停留在 #/wb-list（微博列表）等其他 hash 路由，主动切回 #/post
           const needHashRedirect = targetHash === "#/post" && (!u.hash.startsWith("#/post") || u.hash.includes("taskId="));
           if (needHashRedirect) {
@@ -4289,6 +4974,14 @@ async function findOrCreateTab(urlMatch, createUrl, shouldActivate = false, onCr
       } catch (_) {
         continue;
       }
+    }
+    if (fallbackTab) {
+      if (fallbackTab.discarded || fallbackTab.status === "unloaded") {
+        await chrome.tabs.reload(fallbackTab.id).catch(() => {});
+      } else if (shouldActivate && !fallbackTab.active) {
+        await chrome.tabs.update(fallbackTab.id, { active: true }).catch(() => {});
+      }
+      return fallbackTab;
     }
   }
 
@@ -4317,15 +5010,19 @@ function sniffImageMime(bytes) {
   return "";
 }
 
-async function fetchImageAsBase64(imageUrl) {
+async function fetchImageAsBase64(imageUrl, timeoutMs = 20000) {
+  const controller = typeof AbortController === "function" && timeoutMs > 0 ? new AbortController() : null;
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
   try {
     const cleanUrl = String(imageUrl || "").trim().replace(/&amp;/g, "&");
     if (!cleanUrl || !cleanUrl.startsWith("http")) return null;
 
-    const resp = await fetch(cleanUrl, {
+    const fetchInit = {
       method: "GET",
       credentials: "include",
-    });
+    };
+    if (controller) fetchInit.signal = controller.signal;
+    const resp = await fetch(cleanUrl, fetchInit);
 
     if (!resp.ok) {
       console.warn(`[ImageFetch] HTTP ${resp.status} for ${cleanUrl}`);
@@ -4359,6 +5056,8 @@ async function fetchImageAsBase64(imageUrl) {
   } catch (err) {
     console.warn(`[ImageFetch] Failed to fetch image ${imageUrl}:`, err);
     return null;
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -4383,7 +5082,7 @@ async function downloadImagesViaDocTab(tabId, docUrl, imageUrls) {
             const resp = await fetch(u, { credentials: "include" });
             if (resp.ok) {
               const rawCt = String(resp.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
-              if (!rawCt || /^image\/[a-z0-9.+-]+$/i.test(rawCt)) {
+              if (!rawCt || /^image\/[a-z0-9.+-]+$/i.test(rawCt) || rawCt === "application/octet-stream") {
                 mime = rawCt || "image/png";
                 const buf = await resp.arrayBuffer();
                 if (buf && buf.byteLength > 0) {
@@ -4464,39 +5163,94 @@ async function verifyCurrentDocumentTasks(docTab, batchItems, resolveAccountName
   const pending = batchItems.filter((item) => item.taskDocUrl && item.task.targetCell && item.task.targetCell !== "-");
   if (!pending.length) return;
   if (!docTab?.id) throw new Error("无法打开云文档复核任务，未提交发布");
-  await waitForTabLoaded(docTab.id, 15000);
-  for (const item of pending) {
-    const match = /^([A-Z]+)([1-9]\d*)$/i.exec(String(item.task.targetCell));
-    if (!match || Number(match[2]) !== Number(item.task.row)) throw new Error("文档任务坐标无效，未提交发布");
-    const options = { targetSheetId: item.taskSheetId, linkColLetter: match[1].toUpperCase(), filterAccount: "" };
-    const result = isDingTalkDocUrl(item.taskDocUrl)
-      ? await scanDingTalkDocTab(docTab.id, options)
-      : await executeInTabDirect(docTab.id, directExtractDocTasks,
-          [item.taskSheetId, options.linkColLetter, "", true], "MAIN", item.taskDocUrl);
-    if (!result?.ok || !Array.isArray(result.tasks)) throw new Error("无法读取云文档当前内容，未提交发布");
-    const current = result.tasks.find((row) => Number(row.row) === Number(item.task.row) &&
-      String(row.targetCell).toUpperCase() === String(item.task.targetCell).toUpperCase() &&
-      String(row.targetSheetId || "") === String(item.taskSheetId || ""));
-    const currentImages = Array.isArray(current?.imgUrls) ? current.imgUrls.slice(0, 9) : [];
-    const taskImages = Array.isArray(item.task.imgUrls) ? item.task.imgUrls.slice(0, 9) : [];
-    if (!current || current.content !== item.task.content || resolveAccountName(current.account) !== item.resolvedAccount ||
-        currentImages.length !== taskImages.length || currentImages.some((url, index) => url !== taskImages[index])) {
-      throw new Error(`文档第 ${item.task.row} 行的正文、账号或链接状态已变化，请重新扫描；未提交发布`);
+
+  const firstDocUrl = pending[0].taskDocUrl;
+  const isFirstDingTalk = isDingTalkDocUrl(firstDocUrl);
+  let verifyTabId = docTab.id;
+  let tempVerifyTabId = null;
+
+  try {
+    const liveTab = typeof chrome?.tabs?.get === "function"
+      ? await chrome.tabs.get(docTab.id).catch(() => docTab)
+      : docTab;
+    if (!isFirstDingTalk) {
+      if (liveTab?.active && typeof chrome?.tabs?.create === "function") {
+        const tempTab = await chrome.tabs.create({ url: firstDocUrl, active: false });
+        if (tempTab?.id) {
+          tempVerifyTabId = tempTab.id;
+          verifyTabId = tempTab.id;
+        }
+        await waitForTabLoaded(verifyTabId, 15000, true);
+      } else if (typeof chrome?.tabs?.reload === "function") {
+        await chrome.tabs.reload(verifyTabId, { bypassCache: true }).catch(() => {});
+        await waitForTabLoaded(verifyTabId, 15000, true);
+      } else {
+        await waitForTabLoaded(verifyTabId, 15000);
+      }
+      await new Promise((r) => setTimeout(r, 400));
+    } else {
+      await waitForTabLoaded(verifyTabId, 15000);
     }
-    if (!isDingTalkDocUrl(item.taskDocUrl) && (!current.writeSnapshot || !String(current.writeSnapshot.account || "").trim() ||
-        !Number.isInteger(current.writeSnapshot.accountCol) || current.writeSnapshot.accountCol < 0)) {
-      throw new Error("无法获取文档写回快照，未提交发布");
+
+    for (const item of pending) {
+      const match = /^([A-Z]+)([1-9]\d*)$/i.exec(String(item.task.targetCell));
+      if (!match || Number(match[2]) !== Number(item.task.row)) throw new Error("文档任务坐标无效，未提交发布");
+      const options = { targetSheetId: item.taskSheetId, linkColLetter: match[1].toUpperCase(), filterAccount: "", forceLinkCol: true };
+      let result;
+      if (isDingTalkDocUrl(item.taskDocUrl)) {
+        result = await scanDingTalkDocTab(verifyTabId, options);
+      } else {
+        for (let attempt = 0; attempt < 15; attempt++) {
+          result = await executeInTabDirect(verifyTabId, directExtractDocTasks,
+            [item.taskSheetId, options.linkColLetter, "", true, true], "MAIN", item.taskDocUrl);
+          const errText = String(result?.error || "");
+          if (result?.ok || (!errText.includes("运行时尚未就绪") && !errText.includes("无法验证指定子表"))) {
+            break;
+          }
+          if (attempt < 14) {
+            await new Promise((r) => setTimeout(r, 600));
+          }
+        }
+      }
+      if (!result?.ok || !Array.isArray(result.tasks)) throw new Error("无法读取云文档当前内容，未提交发布");
+      const current = result.tasks.find((row) => Number(row.row) === Number(item.task.row) &&
+        String(row.targetCell).toUpperCase() === String(item.task.targetCell).toUpperCase() &&
+        String(row.targetSheetId || "") === String(item.taskSheetId || ""));
+      const currentImages = Array.isArray(current?.imgUrls) ? current.imgUrls.slice(0, 9) : [];
+      const taskImages = Array.isArray(item.task.imgUrls) ? item.task.imgUrls.slice(0, 9) : [];
+      if (!current || current.content !== item.task.content || resolveAccountName(current.account) !== item.resolvedAccount ||
+          currentImages.length !== taskImages.length || currentImages.some((url, index) => url !== taskImages[index])) {
+        throw new Error(`文档第 ${item.task.row} 行的正文、账号或链接状态已变化，请重新扫描；未提交发布`);
+      }
+      if (!isDingTalkDocUrl(item.taskDocUrl) && (!current.writeSnapshot || !String(current.writeSnapshot.account || "").trim() ||
+          !Number.isInteger(current.writeSnapshot.accountCol) || current.writeSnapshot.accountCol < 0)) {
+        throw new Error("无法获取文档写回快照，未提交发布");
+      }
+      if (current.writeSnapshot) item.task.writeSnapshot = current.writeSnapshot;
     }
-    if (current.writeSnapshot) item.task.writeSnapshot = current.writeSnapshot;
+  } finally {
+    if (tempVerifyTabId && typeof chrome.tabs?.remove === "function") {
+      await chrome.tabs.remove(tempVerifyTabId).catch(() => {});
+    }
   }
 }
 
-async function scanDocTasks(config) {
+function cleanCloudDocTitle(rawTitle) {
+  const cleaned = String(rawTitle || "")
+    .replace(/\s*[-–—|]\s*(?:腾讯在线文档|腾讯文档|钉钉文档|钉钉).*$/i, "")
+    .trim();
+  if (!cleaned || /^(?:腾讯在线文档|腾讯文档|钉钉文档|加载中\.{0,3}|无标题)$/i.test(cleaned)) {
+    return "";
+  }
+  return cleaned;
+}
+
+async function scanDocTasks(config, docTitlesOut = null, docLinkColsOut = null) {
   // 支持多文档数组 (config.docs) 或单文档 (config.docUrl)
   const docList = Array.isArray(config.docs) && config.docs.length > 0
     ? config.docs.filter((d) => d && d.url && d.url.trim().startsWith("http"))
     : (config.docUrl && config.docUrl.trim().startsWith("http")
-        ? [{ id: "doc_1", name: "文档 1", url: config.docUrl.trim(), linkCol: config.linkCol || "E" }]
+        ? [{ id: "doc_1", name: "文档 1", url: config.docUrl.trim(), linkCol: config.linkCol || "H" }]
         : []);
 
   if (docList.length === 0) {
@@ -4511,49 +5265,128 @@ async function scanDocTasks(config) {
     const docItem = docList[idx];
     const dUrl = docItem.url.trim();
     const dName = docItem.name || `文档 ${idx + 1}`;
-    const dLinkCol = (docItem.linkCol || config.linkCol || "E").toUpperCase();
+    const dLinkCol = (docItem.linkCol || config.linkCol || "H").toUpperCase();
     const targetSheetId = parseTabSheetId(dUrl);
 
     appendLog(`[${idx + 1}/${docList.length}] 正在连接并扫描 ${dName}...`, "info");
 
+    let tempTabId = null;
     try {
-      let docTab = await findOrCreateTab(dUrl.split("?")[0], dUrl, false);
+      const isDingTalk = isDingTalkDocUrl(dUrl);
+      let wasCreated = false;
+      let docTab = await findOrCreateTab(dUrl.split("?")[0], dUrl, false, () => {
+        wasCreated = true;
+      });
       try {
-        await waitForTabLoaded(docTab.id, 10000);
+        if (!isDingTalk && !wasCreated && docTab?.active) {
+          // 前台激活的腾讯文档标签页不原地刷新，改用临时后台页抓取后关闭，避免打断用户浏览或编辑
+          const tempTab = await chrome.tabs.create({ url: dUrl, active: false });
+          if (tempTab?.id) {
+            tempTabId = tempTab.id;
+            docTab = tempTab;
+          }
+          await waitForTabLoaded(docTab.id, 15000, true);
+        } else if (!isDingTalk && !wasCreated && docTab?.id) {
+          await chrome.tabs.reload(docTab.id, { bypassCache: true }).catch(() => {});
+          await waitForTabLoaded(docTab.id, 15000, true);
+        } else {
+          await waitForTabLoaded(docTab.id, 10000);
+        }
       } catch (loadError) {
         if (!/加载超时|已关闭或不存在/.test(String(loadError?.message || loadError))) throw loadError;
         appendLog(`${dName} 的文档标签页未能就绪，正在新开页面重试`, "warn");
         docTab = await chrome.tabs.create({ url: dUrl, active: false });
+        if (docTab?.id && !wasCreated) tempTabId = docTab.id;
         await waitForTabLoaded(docTab.id, 15000, true);
       }
-      await new Promise((r) => setTimeout(r, 600));
+      await new Promise((r) => setTimeout(r, isDingTalk && !wasCreated ? 200 : 600));
 
-      const res = isDingTalkDocUrl(dUrl)
-        ? await scanDingTalkDocTab(docTab.id, {
-            targetSheetId,
-            linkColLetter: dLinkCol,
-            filterAccount: config.filterAccount || "",
-          })
-        : await executeInTabDirect(
+      let res;
+      if (isDingTalk) {
+        const dtOpts = {
+          targetSheetId,
+          linkColLetter: dLinkCol,
+          filterAccount: config.filterAccount || "",
+        };
+        try {
+          res = await scanDingTalkDocTab(docTab.id, dtOpts);
+        } catch (firstDtErr) {
+          if (wasCreated || !docTab?.id) throw firstDtErr;
+          res = { ok: false, error: firstDtErr?.message || String(firstDtErr) };
+        }
+        if (!res?.ok && !wasCreated && docTab?.id) {
+          appendLog(`${dName} 钉钉接口直拉未命中最新数据，正在刷新标签页重试...`, "info");
+          await chrome.tabs.reload(docTab.id, { bypassCache: true }).catch(() => {});
+          await waitForTabLoaded(docTab.id, 15000, true);
+          await new Promise((r) => setTimeout(r, 600));
+          res = await scanDingTalkDocTab(docTab.id, dtOpts);
+        }
+      } else {
+        for (let attempt = 0; attempt < 15; attempt++) {
+          res = await executeInTabDirect(
             docTab.id,
             directExtractDocTasks,
-            [targetSheetId, dLinkCol, config.filterAccount || ""],
+            [targetSheetId, dLinkCol, config.filterAccount || "", false, Boolean(docItem.manualLinkCol)],
             "MAIN",
             dUrl
           );
+          const errText = String(res?.error || "");
+          if (res?.ok || (!errText.includes("运行时尚未就绪") && !errText.includes("无法验证指定子表"))) {
+            break;
+          }
+          if (attempt < 14) {
+            await new Promise((r) => setTimeout(r, 600));
+          }
+        }
+      }
 
       if (res && res.ok && Array.isArray(res.tasks)) {
-        const taggedTasks = res.tasks.map((t) =>
+        const liveTab = await chrome.tabs.get(docTab.id).catch(() => docTab);
+        const resolvedDocTitle = cleanCloudDocTitle(res.docTitle || liveTab?.title || "");
+        if (resolvedDocTitle && docTitlesOut && docItem.id) {
+          docTitlesOut[docItem.id] = resolvedDocTitle;
+        }
+        const effectiveDocName = (!docItem.manualName && resolvedDocTitle) ? resolvedDocTitle : dName;
+        const skippedDeprecated = [];
+        const activeResTasks = res.tasks.filter((t) => {
+          const acct = String(t?.account || "").trim();
+          if (acct === "新浪运动") {
+            skippedDeprecated.push(t.row || acct);
+            return false;
+          }
+          return true;
+        });
+        if (skippedDeprecated.length) {
+          appendLog(`ℹ ${effectiveDocName} 已默认跳过已下线账号 [新浪运动] (${skippedDeprecated.length} 条)`, "info");
+        }
+        const taggedTasks = activeResTasks.map((t) =>
           Object.assign({}, t, {
             docId: docItem.id || `doc_${idx + 1}`,
-            docName: dName,
+            docName: effectiveDocName,
+            docTitle: resolvedDocTitle || "",
             docUrl: dUrl,
             docIndex: idx + 1,
             targetSheetId: t.targetSheetId || targetSheetId,
           })
         );
         allTasks.push(...taggedTasks);
-        appendLog(`✓ ${dName} 扫描完成：发现 ${taggedTasks.length} 条待发任务`, taggedTasks.length ? "success" : "info");
+        if (docLinkColsOut && res.linkColLetterUsed) {
+          const slotKey = docItem.id || `doc_${idx + 1}`;
+          docLinkColsOut[slotKey] = {
+            docName: effectiveDocName,
+            col: res.linkColLetterUsed,
+            source: res.linkColSource || "",
+            warning: res.linkColWarning || "",
+          };
+        }
+        const colNote = res.linkColLetterUsed
+          ? ` [回写列: ${res.linkColLetterUsed}${res.linkColSource ? `（${res.linkColSource}）` : ""}]`
+          : "";
+        const summaryNote = res.scanSummary ? `（${res.scanSummary}）` : "";
+        appendLog(`✓ ${effectiveDocName} 扫描完成${colNote}：发现 ${taggedTasks.length} 条待发任务${summaryNote}`, taggedTasks.length ? "success" : "info");
+        if (res.linkColWarning) {
+          appendLog(`⚠ ${effectiveDocName}：${res.linkColWarning}`, "warn");
+        }
       } else {
         scanErrors.push(`${dName}: ${res?.error || "解析未成功"}`);
         appendLog(`⚠ ${dName} 扫描结果: ${res?.error || "未发现待发任务"}`, "warn");
@@ -4561,6 +5394,10 @@ async function scanDocTasks(config) {
     } catch (err) {
       scanErrors.push(`${dName}: ${err.message}`);
       appendLog(`✗ ${dName} 连接或解析失败: ${err.message}`, "error");
+    } finally {
+      if (tempTabId && typeof chrome.tabs?.remove === "function") {
+        await chrome.tabs.remove(tempTabId).catch(() => {});
+      }
     }
   }
   if (scanErrors.length === docList.length) throw new Error(`所有文档扫描失败：${scanErrors.join("；")}`);
@@ -4570,22 +5407,14 @@ async function scanDocTasks(config) {
 }
 
 async function startPipeline(config, reservation = null) {
-  await stateReady;
   if (state.isRunning || (pipelineReservation && pipelineReservation !== reservation)) {
     throw new Error("已有流水线正在执行中，请勿重复启动");
   }
-  if (config.selectedTasks && !Array.isArray(config.selectedTasks)) throw new Error("待发任务格式无效");
-
-  const job = { aborted: false, id: `job_${Date.now()}_${Math.random().toString(36).slice(2)}`, tabId: null };
-  activeJob = job;
-  state.isRunning = true;
-  state.logs = [];
-
-  const dryRun = config.dryRun !== false;
-  const isSilent = config.silentMode !== false; // 默认开启静默无感发博引擎
-  appendLog(`🚀 开始执行流水线 [模式: ${dryRun ? "安全演练" : "真实发布"} | ${isSilent ? "静默免打扰" : "前台可见"}]`, "info");
-  updateProgress("准备文档环境...", 10);
-
+  const ownReservation = reservation ? null : {};
+  if (ownReservation) {
+    pipelineReservation = ownReservation;
+  }
+  let job = null;
   let runnerWin = null;
   let weiboTab = null;
   let heldAwakeTabId = null;
@@ -4594,23 +5423,41 @@ async function startPipeline(config, reservation = null) {
   let contentLockKeys = [];
   let contentLockOwned = false;
   let contentSubmitted = false;
-  const keepAliveTimer = setInterval(() => {
-    chrome.runtime.getPlatformInfo().catch((error) => console.warn("流水线保活失败:", error));
-  }, 20000);
-
-  async function syncAwakeTab(tabId) {
-    if (!tabId) return;
-    if (heldAwakeTabId && heldAwakeTabId !== tabId) {
-      await releaseBackgroundTab(heldAwakeTabId).catch(() => {});
-      heldAwakeTabId = null;
-    }
-    if (heldAwakeTabId === tabId) return;
-    if (await holdBackgroundTabAwake(tabId)) {
-      heldAwakeTabId = tabId;
-    }
-  }
+  let keepAliveTimer = null;
 
   try {
+    await stateReady;
+    if (state.isRunning || (pipelineReservation && pipelineReservation !== (reservation || ownReservation))) {
+      throw new Error("已有流水线正在执行中，请勿重复启动");
+    }
+    if (config.selectedTasks && !Array.isArray(config.selectedTasks)) throw new Error("待发任务格式无效");
+
+    job = { aborted: false, id: `job_${Date.now()}_${Math.random().toString(36).slice(2)}`, tabId: null };
+    activeJob = job;
+    state.isRunning = true;
+    state.logs = [];
+
+    const dryRun = config.dryRun !== false;
+    const isSilent = config.silentMode !== false; // 默认开启静默无感发博引擎
+    appendLog(`🚀 开始执行流水线 [模式: ${dryRun ? "安全演练" : "真实发布"} | ${isSilent ? "静默免打扰" : "前台可见"}]`, "info");
+    updateProgress("准备文档环境...", 10);
+
+    keepAliveTimer = setInterval(() => {
+      chrome.runtime.getPlatformInfo().catch((error) => console.warn("流水线保活失败:", error));
+    }, 20000);
+
+    async function syncAwakeTab(tabId) {
+      if (!tabId) return;
+      if (heldAwakeTabId && heldAwakeTabId !== tabId) {
+        await releaseBackgroundTab(heldAwakeTabId).catch(() => {});
+        heldAwakeTabId = null;
+      }
+      if (heldAwakeTabId === tabId) return;
+      if (await holdBackgroundTabAwake(tabId)) {
+        heldAwakeTabId = tabId;
+      }
+    }
+
     let tasks = config.selectedTasks || [];
     if (!tasks || tasks.length === 0) {
       tasks = await scanDocTasks(config);
@@ -4637,20 +5484,23 @@ async function startPipeline(config, reservation = null) {
 
     updateProgress(effectiveSilent ? "连接后台发稿标签页..." : (firstIsPoll ? "拉起微博首页 (可见自动化)..." : "连接微博发稿中台..."), 30);
 
-    if (effectiveSilent) {
-      weiboTab = await findOrCreateTab(
-        firstIsPoll ? "weibo.com" : "ai-publish-platform.weibo.com",
-        initialUrl,
-        false,
-        (tab) => { if (tab?.id) createdSilentWeiboTabIds.add(tab.id); }
-      );
-      appendLog("已使用当前浏览器里的后台标签页发博，不另开窗口", "info");
-    } else {
-      weiboTab = await findOrCreateTab(firstIsPoll ? "weibo.com" : "ai-publish-platform.weibo.com", initialUrl, true);
-      await chrome.tabs.update(weiboTab.id, { url: initialUrl, active: true }).catch(() => {});
-      if (weiboTab.windowId) {
-        await chrome.windows.update(weiboTab.windowId, { focused: true }).catch(() => {});
+    async function openWeiboExecutionTarget(targetUrl) {
+      if (effectiveSilent) {
+        weiboTab = await getOrCreateManagedSilentWeiboTab(targetUrl);
+        if (weiboTab?.id) {
+          job.tabId = weiboTab.id;
+        }
+        return weiboTab;
       }
+      weiboTab = await getOrCreateManagedVisibleWeiboTab(targetUrl);
+      if (weiboTab?.id) job.tabId = weiboTab.id;
+      return weiboTab;
+    }
+
+    // 静默模式复用插件专属后台托管标签页（不反复弹新标签也不闪窗，绝不碰用户手动打开的发稿台）；前台模式复用专属托管前台标签页
+    await openWeiboExecutionTarget(initialUrl);
+    if (effectiveSilent) {
+      appendLog("已连接插件专属后台发博标签页（静默复用，不干扰现有发稿台）", "info");
     }
 
     if (weiboTab) {
@@ -4662,15 +5512,16 @@ async function startPipeline(config, reservation = null) {
       if (runnerWin?.id) {
         await chrome.windows.remove(runnerWin.id).catch(() => {});
         runnerWin = null;
+      } else if (weiboTab?.id && (createdSilentWeiboTabIds.has(weiboTab.id) || weiboTab.id === managedSilentWeiboTabId)) {
+        createdSilentWeiboTabIds.delete(weiboTab.id);
+        if (weiboTab.id === managedSilentWeiboTabId) {
+          managedSilentWeiboTabId = null;
+          chrome.storage.local.remove?.(["__managedSilentWeiboTabId__"])?.catch?.(() => {});
+        }
+        await chrome.tabs.remove(weiboTab.id).catch(() => {});
       }
-      if (effectiveSilent) {
-        weiboTab = await chrome.tabs.create({ url: initialUrl, active: false });
-        if (weiboTab?.id) createdSilentWeiboTabIds.add(weiboTab.id);
-      } else {
-        weiboTab = await chrome.tabs.create({ url: initialUrl, active: true });
-      }
-      job.tabId = weiboTab.id;
-      if (effectiveSilent) await syncAwakeTab(weiboTab.id);
+      await openWeiboExecutionTarget(initialUrl);
+      if (effectiveSilent && weiboTab?.id) await syncAwakeTab(weiboTab.id);
       await waitForTabLoaded(weiboTab.id, 15000, true);
     }
     if (effectiveSilent && weiboTab?.id) await syncAwakeTab(weiboTab.id);
@@ -4692,7 +5543,13 @@ async function startPipeline(config, reservation = null) {
           }).catch(() => {});
           runnerWin = null;
         } else {
-          if (weiboTab?.id) createdSilentWeiboTabIds.delete(weiboTab.id);
+          if (weiboTab?.id) {
+            createdSilentWeiboTabIds.delete(weiboTab.id);
+            if (weiboTab.id === managedSilentWeiboTabId) {
+              managedSilentWeiboTabId = null;
+              chrome.storage.local.remove?.(["__managedSilentWeiboTabId__"])?.catch?.(() => {});
+            }
+          }
           await chrome.tabs.update(weiboTab.id, { active: true }).catch(() => {});
         }
         throw new Error(
@@ -4726,18 +5583,18 @@ async function startPipeline(config, reservation = null) {
         await chrome.windows.remove(runnerWin.id).catch(() => {});
         runnerWin = null;
       }
-      if (effectiveSilent) {
-        weiboTab = await chrome.tabs.create({ url: targetUrl, active: false });
-        if (weiboTab?.id) createdSilentWeiboTabIds.add(weiboTab.id);
+      await openWeiboExecutionTarget(targetUrl);
+      if (effectiveSilent && weiboTab?.id) {
         await syncAwakeTab(weiboTab.id);
-      } else {
-        weiboTab = await chrome.tabs.create({ url: targetUrl, active: true });
       }
-      job.tabId = weiboTab.id;
       return await waitForTabLoaded(weiboTab.id, 15000, true);
     }
 
-    const { accountAliases = {}, disabledAccounts = [] } = await chrome.storage.local.get(["accountAliases", "disabledAccounts"]);
+    const { accountAliases = {}, disabledAccounts = [], allowDuplicateBypass: storedAllowBypass = false } = await chrome.storage.local.get(["accountAliases", "disabledAccounts", "allowDuplicateBypass"]);
+    const allowDuplicateBypass = Boolean(config.allowDuplicateBypass ?? storedAllowBypass);
+    if (allowDuplicateBypass) {
+      appendLog("⚠️ 已开启【临时放行同文案重发】：本次将跳过 15 分钟防重锁与 12 小时同文案拦截", "warn");
+    }
     const { publishLedger: initialLedger = [], __unwrittenReceipts__: initialUnwritten = [] } = await chrome.storage.local.get(["publishLedger", "__unwrittenReceipts__"]);
 
     const stripAcctSuffix = (val) => String(val || "").replace(/[（(].*?[）)]/g, "").replace(/-(?:投票|直发|转评|转发)$/u, "").trim();
@@ -4811,9 +5668,27 @@ async function startPipeline(config, reservation = null) {
 
       const hasPendingSubmission = (account, content) => allReceipts.some((item) => item.submittedWithoutReceipt &&
         item.resolvedAccount === account && String(item.fullContent || "").trim() === String(content || "").trim());
+      const findRecentLedgerDuplicate = (t, rAcct) => {
+        if (taskDryRun || (t.poll && Array.isArray(t.poll.options) && t.poll.options.length >= 2)) return null;
+        const normBody = String(t.content || "").trim();
+        if (!normBody) return null;
+        const nowTs = Date.now();
+        return allReceipts.find((item) =>
+          item && item.mode === "真实发布" && item.postUrl &&
+          item.resolvedAccount === rAcct &&
+          String(item.fullContent || "").trim() === normBody &&
+          (!item.timestamp || (nowTs - item.timestamp < 12 * 60 * 60 * 1000))
+        ) || null;
+      };
       const pendingSubmission = !taskDryRun && hasPendingSubmission(resolvedAccount, task.content);
       if (pendingSubmission) throw new Error(`账号 [${resolvedAccount}] 已提交但缺少回执，请人工核对，禁止自动重发`);
       const previousReceipt = findReceipt(task, taskDocUrl, taskSheetId, resolvedAccount);
+      if (!previousReceipt && !allowDuplicateBypass) {
+        const recentDup = findRecentLedgerDuplicate(task, resolvedAccount);
+        if (recentDup) {
+          throw new Error(`已拦截重复发博：账号 [${resolvedAccount || "默认"}] 12小时内已发布过相同文案 (${recentDup.postUrl})`);
+        }
+      }
       if (!task.writeSnapshot && previousReceipt?.writeSnapshot) task.writeSnapshot = previousReceipt.writeSnapshot;
 
       // 合并连续的同文案、同配图、同类型非投票多账号任务，一次勾选群发，彻底对齐原系统速度
@@ -4837,6 +5712,7 @@ async function startPipeline(config, reservation = null) {
           if (typeof nextTask.content !== "string" || nextTask.content.trim() !== task.content.trim()) break;
           if (String(nextTask.repostUrl || "").trim() !== String(task.repostUrl || "").trim()) break;
           if (!!nextTask.commentOriginal !== !!task.commentOriginal) break;
+          if (!!nextTask.scatterPublish !== !!task.scatterPublish) break;
           if (!sameImgUrls(nextTask.imgUrls, task.imgUrls)) break;
           const nextDocUrl = (nextTask.docUrl || config.docUrl || "").trim();
           const nextSheetId = nextTask.targetSheetId || parseTabSheetId(nextDocUrl);
@@ -4845,7 +5721,8 @@ async function startPipeline(config, reservation = null) {
           if (!nextResolved || isAccountDisabled(nextResolved) || isAccountDisabled(nextTask.account) || batchAccounts.has(nextResolved)) break;
           const nextReceipt = findReceipt(nextTask, nextDocUrl, nextSheetId, nextResolved);
           const nextPending = !nextDryRun && hasPendingSubmission(nextResolved, nextTask.content);
-          if (nextReceipt || nextPending) break;
+          const nextDup = !nextReceipt && !allowDuplicateBypass && findRecentLedgerDuplicate(nextTask, nextResolved);
+          if (nextReceipt || nextPending || nextDup) break;
           batchAccounts.add(nextResolved);
           batchItems.push({
             index: j,
@@ -4881,6 +5758,9 @@ async function startPipeline(config, reservation = null) {
       if (taskDocUrl) {
         try {
           currentDocTab = await findOrCreateTab(taskDocUrl.split("?")[0], taskDocUrl, false);
+          if (currentDocTab?.id) {
+            await waitForTabLoaded(currentDocTab.id, 15000, false).catch(() => {});
+          }
         } catch (_) {}
       }
 
@@ -4923,6 +5803,7 @@ async function startPipeline(config, reservation = null) {
       const taskForPost = Object.assign({}, task, {
         account: resolvedAccount,
         accounts: isBatchMulti ? batchItems.map((b) => b.resolvedAccount) : undefined,
+        allowDuplicateBypass,
         __syncJobId: job.id,
         __submitToken: submitToken,
       });
@@ -4937,10 +5818,10 @@ async function startPipeline(config, reservation = null) {
         const { schedulePaused = false } = await chrome.storage.local.get(["schedulePaused"]);
         if (schedulePaused) throw new Error("定时队列已暂停，未提交后续任务");
       }
-      if (!taskDryRun && !isPoll && !previousReceipt) {
+      if (!taskDryRun && !isPoll && !previousReceipt && !allowDuplicateBypass) {
         for (const bItem of batchItems) {
           const lockKey = `post::${bItem.resolvedAccount}::${String(bItem.task.content || "").trim()}`;
-          const claimed = await claimPublishTaskLock(lockKey, 3 * 60 * 1000);
+          const claimed = await claimPublishTaskLock(lockKey, 15 * 60 * 1000);
           if (!claimed) {
             for (const prevKey of contentLockKeys) {
               await releasePublishTaskLock(prevKey).catch(() => {});
@@ -4948,7 +5829,7 @@ async function startPipeline(config, reservation = null) {
             contentLockKeys = [];
             contentLockKey = "";
             contentLockOwned = false;
-            throw new Error(`已拦截重复发博：账号 [${bItem.resolvedAccount || "默认"}] 在3分钟内已发送过相同文案，台账锁已物理阻断二次发射！`);
+            throw new Error(`已拦截重复发博：账号 [${bItem.resolvedAccount || "默认"}] 在15分钟内已发送过相同文案，台账锁已物理阻断二次发射！`);
           }
           contentLockKeys.push(lockKey);
           contentLockKey = lockKey;
@@ -5123,36 +6004,43 @@ async function startPipeline(config, reservation = null) {
             if (checkSubmitRes && checkSubmitRes.submitted) {
               appendLog("检测到发稿中台在点击发布后发生页面跳转/刷新，留在当前页复制结果链接...", "warn");
               postRes = { ok: false, submitted: true, error: errMsg };
-            } else if (taskDryRun && (errMsg.includes("Frame") || errMsg.includes("未关闭的弹窗")) && (!checkSubmitRes || checkSubmitRes.submitted === false)) {
-              appendLog(`检测到发稿中台${errMsg.includes("未关闭的弹窗") ? "残留弹窗" : "页面帧重建"}（确认尚未提交），正在刷新就绪并重试一次...`, "warn");
-              await chrome.tabs.update(weiboTab.id, { url: platformUrl }).catch(() => {});
-              await waitForTabLoaded(weiboTab.id, 12000, false).catch(() => {});
-              await new Promise((r) => setTimeout(r, 1000));
-              const retryReady = await executeInTabDirect(
+            } else if (checkSubmitRes && checkSubmitRes.submitted === false) {
+              // 后台超时或帧异常不会取消页内脚本；未发现标记不能证明没有提交。
+              // 保留待核对证据，只有页面函数明确返回 submitted:false 才允许解除防重。
+              postRes = { ok: false, error: errMsg };
+            }
+          } catch (retryErr) {
+            postErr = retryErr;
+          }
+        } else if (!postRes && taskDryRun && !isPoll && (errMsg.includes("空结果") || errMsg.includes("Frame") || errMsg.includes("未关闭的弹窗"))) {
+          try {
+            appendLog(`检测到发稿中台${errMsg.includes("未关闭的弹窗") ? "残留弹窗" : "页面刷新跳转"}（安全演练未提交），正在等待就绪并重试一次...`, "warn");
+            await waitForTabLoaded(weiboTab.id, 12000, false).catch(() => {});
+            await chrome.tabs.update(weiboTab.id, { url: platformUrl }).catch(() => {});
+            await waitForTabLoaded(weiboTab.id, 12000, false).catch(() => {});
+            await new Promise((r) => setTimeout(r, 1000));
+            const retryReady = await executeInTabDirect(
+              weiboTab.id,
+              directCheckWeiboPlatformReady,
+              [],
+              "MAIN",
+              platformUrl,
+              true,
+              () => job.aborted
+            ).catch(() => null);
+            if (retryReady?.needLogin) {
+              postRes = { ok: false, needLogin: true, error: retryReady.error };
+            } else {
+              postRes = await executeInTabDirect(
                 weiboTab.id,
-                directCheckWeiboPlatformReady,
-                [],
+                directPostToWeiboPlatform,
+                [taskForPost, taskDryRun],
                 "MAIN",
                 platformUrl,
-                true,
+                false,
                 () => job.aborted
-              ).catch(() => null);
-              if (retryReady?.needLogin) {
-                postRes = { ok: false, needLogin: true, error: retryReady.error };
-              } else {
-                postRes = await executeInTabDirect(
-                  weiboTab.id,
-                  directPostToWeiboPlatform,
-                  [taskForPost, taskDryRun],
-                  "MAIN",
-                  platformUrl,
-                  false,
-                  () => job.aborted
-                );
-                postErr = null;
-              }
-            } else if (checkSubmitRes && checkSubmitRes.submitted === false) {
-              postRes = { ok: false, submitted: false, error: errMsg };
+              );
+              postErr = null;
             }
           } catch (retryErr) {
             postErr = retryErr;
@@ -5160,11 +6048,21 @@ async function startPipeline(config, reservation = null) {
         }
       }
 
-      // 取消连续重载后，上一批可能残留结果弹窗；命中该保护时刷新一次发博页再重试，避免整批中断
+      // 取消连续重载后，上一批或复用的旧后台标签页可能残留结果弹窗或账号禁用态；命中时强刷发博页再重试一次，避免整批中断
       if (!isPoll && !previousReceipt && postRes && postRes.ok === false && postRes.submitted === false
-          && /未关闭的弹窗/.test(String(postRes.error || "")) && weiboTab?.id) {
-        appendLog("发稿中台残留上一次结果弹窗，正在刷新发博页后重试一次...", "warn");
-        await chrome.tabs.update(weiboTab.id, { url: platformUrl }).catch(() => {});
+          && /未关闭的弹窗|已定位但未能勾选|未在发稿中台各分类下找到目标账号/.test(String(postRes.error || "")) && weiboTab?.id) {
+        const isPopupRemain = /未关闭的弹窗/.test(String(postRes.error || ""));
+        appendLog(
+          isPopupRemain
+            ? "发稿中台残留上一次结果弹窗，正在刷新发博页后重试一次..."
+            : "检测到复用发稿页状态异常（账号禁用或未就绪），正在重载发博页后重试一次...",
+          "warn"
+        );
+        if (typeof chrome.tabs?.reload === "function") {
+          await chrome.tabs.reload(weiboTab.id).catch(() => {});
+        } else {
+          await chrome.tabs.update(weiboTab.id, { url: platformUrl }).catch(() => {});
+        }
         await waitForTabLoaded(weiboTab.id, 12000, true).catch(() => {});
         await new Promise((r) => setTimeout(r, 1200));
         postRes = await executeInTabDirect(
@@ -5280,6 +6178,7 @@ async function startPipeline(config, reservation = null) {
             postRes = {
               ok: true,
               postUrl: recovered.postUrl,
+              postEntries: Array.isArray(recovered.postEntries) ? recovered.postEntries : [],
               dryRun: false,
               accountMatched: true,
               fromRecovery: true,
@@ -5319,9 +6218,10 @@ async function startPipeline(config, reservation = null) {
       const resolveUrlForBatchItem = async (bItem) => {
         const directMapped = postRes.postUrlsByAccount && postRes.postUrlsByAccount[bItem.resolvedAccount];
         if (directMapped) return String(directMapped);
-        if (!isBatchMulti) return String(postRes.postUrl || "");
-        // 注入异常后后台已为「本批首账号」单独找回回执时，直接复用，避免重复走微博列表兜底
-        if (postRes.fromRecovery && postRes.postUrl && bItem.resolvedAccount === resolvedAccount) {
+        const hasNamedEntries = postEntriesList.some((e) => e.normNick);
+        if (!isBatchMulti && !hasNamedEntries) return String(postRes.postUrl || "");
+        // 注入异常后后台已为「本批首账号」单独找回回执时，仅在无命名条目可区分时才复用首条链接
+        if (postRes.fromRecovery && postRes.postUrl && bItem.resolvedAccount === resolvedAccount && postEntriesList.length === 0) {
           return String(postRes.postUrl);
         }
 
@@ -5330,6 +6230,9 @@ async function startPipeline(config, reservation = null) {
         const entryMatches = postEntriesList.filter((e) => e.normNick && (e.normNick === targetN || (baseN && e.normNick === baseN)));
         if (entryMatches.length === 1 && entryMatches[0].url &&
             new Set(postEntriesList.filter((entry) => entry.url === entryMatches[0].url && entry.normNick).map((entry) => entry.normNick)).size === 1) return String(entryMatches[0].url);
+        if (!isBatchMulti && hasNamedEntries) {
+          // 单账号场景下结果页已有命名条目但均不匹配目标账号，继续走微博列表兜底核对，不误用他人链接
+        }
 
         if (!bItem.taskDryRun && weiboTab?.id) {
           const wbListUrl = "https://ai-publish-platform.weibo.com/#/wb-list";
@@ -5399,7 +6302,10 @@ async function startPipeline(config, reservation = null) {
         if (scheduled) await updateScheduledTask(bTask.id, receipt);
 
         const ledgerItem = {
-          id: `led_${Date.now()}_${bIdx}_${Math.random().toString(36).substring(2, 6)}`,
+          ...(previousReceipt || {}),
+          id: previousReceipt?.id || `led_${Date.now()}_${bIdx}_${Math.random().toString(36).substring(2, 6)}`,
+          scheduleId: scheduled ? bTask.id : (previousReceipt?.scheduleId || ""),
+          submittedWithoutReceipt: false,
           time: new Date().toLocaleString("zh-CN", { hour12: false }),
           timestamp: Date.now(),
           docName: bDocName,
@@ -5425,9 +6331,13 @@ async function startPipeline(config, reservation = null) {
           const { publishLedger = [], __unwrittenReceipts__ = [] } = await chrome.storage.local.get(["publishLedger", "__unwrittenReceipts__"]);
           const pendingId = pendingIds[bIdx];
           if (pendingId) activePendingSubmissionIds.delete(pendingId);
-          const nextLedger = [ledgerItem, ...publishLedger.filter((item) => item.id !== pendingId)];
+          const replacesReceipt = (item) => item.id === ledgerItem.id || (previousReceipt && !previousReceipt.id &&
+            item.mode === "真实发布" && item.postUrl === previousReceipt.postUrl && item.docUrl === bDocUrl &&
+            item.targetCell === bTask.targetCell && item.targetSheetId === bSheetId &&
+            item.resolvedAccount === bResolvedAccount && item.fullContent === bTask.content);
+          const nextLedger = [ledgerItem, ...publishLedger.filter((item) => (!pendingId || item.id !== pendingId) && !replacesReceipt(item))];
           const evictedUnwritten = nextLedger.slice(500).filter((item) => item.mode === "真实发布" && (item.submittedWithoutReceipt || (item.postUrl && !item.writeBackOk)));
-          const unwritten = [...evictedUnwritten, ...__unwrittenReceipts__.filter((item) => item.id !== pendingId)];
+          const unwritten = [...evictedUnwritten, ...__unwrittenReceipts__.filter((item) => !pendingId || item.id !== pendingId)];
           const nextUnwritten = unwritten;
           await chrome.storage.local.set({
             publishLedger: nextLedger.slice(0, 500),
@@ -5442,7 +6352,22 @@ async function startPipeline(config, reservation = null) {
             if (currentDocTab?.id) {
               const aliveDocTab = await chrome.tabs.get(currentDocTab.id).catch(() => null);
               const targetDocBase = bDocUrl ? bDocUrl.split("?")[0].split("#")[0] : "";
-              if (!aliveDocTab || (targetDocBase && aliveDocTab.url && !String(aliveDocTab.url).includes(targetDocBase))) {
+              let tabQueryConflict = false;
+              if (aliveDocTab?.url && bDocUrl) {
+                try {
+                  const actualU = new URL(aliveDocTab.url);
+                  const wantedU = new URL(bDocUrl);
+                  for (const key of ["tab", "sheet", "sheetId", "docId", "id", "nodeId"]) {
+                    const w = wantedU.searchParams.get(key);
+                    const a = actualU.searchParams.get(key);
+                    if (w && a && w !== a) {
+                      tabQueryConflict = true;
+                      break;
+                    }
+                  }
+                } catch (_) {}
+              }
+              if (!aliveDocTab || tabQueryConflict || (targetDocBase && aliveDocTab.url && !String(aliveDocTab.url).includes(targetDocBase))) {
                 currentDocTab = null;
               }
             }
@@ -5470,6 +6395,10 @@ async function startPipeline(config, reservation = null) {
               try {
                 writeRes = await executeInTabDirect(currentDocTab.id, directWriteCellToDoc,
                   [bTask.targetCell, postUrl, bSheetId, bTask.writeSnapshot], "MAIN", bDocUrl, false);
+                if (writeRes?.ok) {
+                  // 留出协同文档异步 WebSocket/XHR 提交窗口，避免立即释放后台唤醒锁导致云端未落盘
+                  await new Promise((r) => setTimeout(r, 800));
+                }
               } finally {
                 if (docAwake) await releaseBackgroundTab(currentDocTab.id);
               }
@@ -5566,7 +6495,7 @@ async function startPipeline(config, reservation = null) {
     updateProgress(`中断: ${err.message}`, state.percentage);
     throw err;
   } finally {
-    clearInterval(keepAliveTimer);
+    if (keepAliveTimer) clearInterval(keepAliveTimer);
     if (heldAwakeTabId) {
       await releaseBackgroundTab(heldAwakeTabId).catch(() => {});
       heldAwakeTabId = null;
@@ -5588,6 +6517,9 @@ async function startPipeline(config, reservation = null) {
     activePendingSubmissionIds.clear();
     state.isRunning = false;
     activeJob = null;
+    if (ownReservation && pipelineReservation === ownReservation) {
+      pipelineReservation = null;
+    }
     updateProgress(state.stage, state.percentage);
   }
 }
@@ -5615,6 +6547,86 @@ function ensureScheduleHeartbeat() {
 }
 
 const SCHEDULE_DONE_TTL_MS = 12 * 60 * 60 * 1000;
+const LEDGER_RETENTION_MS = 3 * 24 * 60 * 60 * 1000;
+const SCANNED_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const MAINTENANCE_ALARM_NAME = "wb_maintenance_cleanup";
+
+function ensureMaintenanceAlarm() {
+  try {
+    chrome.alarms.get(MAINTENANCE_ALARM_NAME, (existing) => {
+      if (chrome.runtime.lastError) return;
+      if (!existing) {
+        chrome.alarms.create(MAINTENANCE_ALARM_NAME, { periodInMinutes: 360 });
+      }
+    });
+  } catch (e) {
+    console.warn("ensureMaintenanceAlarm error:", e);
+  }
+}
+
+function pruneExpiredLedgerItems(ledger, now = Date.now()) {
+  if (!Array.isArray(ledger) || ledger.length === 0) return { ledger: [], removed: 0 };
+  let removed = 0;
+  const kept = ledger.filter((item) => {
+    if (!item) return false;
+    const isPendingReceipt = item.mode === "真实发布" && (item.submittedWithoutReceipt || (item.postUrl && !item.writeBackOk));
+    if (isPendingReceipt) return true;
+    const ts = Number(item.timestamp || 0);
+    if (ts > 0 && now - ts >= LEDGER_RETENTION_MS) {
+      removed += 1;
+      return false;
+    }
+    return true;
+  });
+  return { ledger: kept, removed };
+}
+
+async function cleanupMaintenanceStorage(now = Date.now()) {
+  const ledgerRemoved = await withScheduleMutation(async () => {
+    const { publishLedger = [] } = await chrome.storage.local.get(["publishLedger"]);
+    const res = pruneExpiredLedgerItems(publishLedger, now);
+    if (res.removed > 0) {
+      await chrome.storage.local.set({ publishLedger: res.ledger });
+    }
+    return res.removed;
+  });
+
+  let cacheCleared = 0;
+  const { cachedScannedTasks = [], cachedScannedAt = 0 } = await chrome.storage.local.get(["cachedScannedTasks", "cachedScannedAt"]);
+  if (Number(cachedScannedAt) > 0 && now - Number(cachedScannedAt) >= SCANNED_CACHE_TTL_MS && Array.isArray(cachedScannedTasks) && cachedScannedTasks.length > 0) {
+    cacheCleared = cachedScannedTasks.length;
+    await chrome.storage.local.set({ cachedScannedTasks: [], cachedScannedAt: 0 });
+  }
+
+  await withPublishClaim(async () => {
+    const { __publishClaims__ = {} } = await chrome.storage.local.get(["__publishClaims__"]);
+    const nextClaims = { ...__publishClaims__ };
+    let changed = false;
+    for (const k of Object.keys(nextClaims)) {
+      if (now - nextClaims[k] > 15 * 60 * 1000) {
+        delete nextClaims[k];
+        changed = true;
+      }
+    }
+    if (changed) {
+      await chrome.storage.local.set({ __publishClaims__: nextClaims });
+    }
+  });
+
+  let topicPinRemoved = 0;
+  if (typeof cleanupExpiredTopicPinTasks === "function") {
+    topicPinRemoved = await cleanupExpiredTopicPinTasks(now).catch(() => 0);
+  }
+
+  const parts = [];
+  if (ledgerRemoved > 0) parts.push(`发博记录 ${ledgerRemoved} 条（超3天）`);
+  if (topicPinRemoved > 0) parts.push(`话题置顶 ${topicPinRemoved} 条（超1天）`);
+  if (cacheCleared > 0) parts.push(`扫描缓存 ${cacheCleared} 条（超24小时）`);
+  if (parts.length > 0) {
+    appendLog(`定时维护清理：已自动清除 ${parts.join("、")}`, "info");
+  }
+  return { ledgerRemoved, topicPinRemoved, cacheCleared };
+}
 
 function pruneExpiredDoneSchedules(tasks, now = Date.now()) {
   if (!Array.isArray(tasks) || tasks.length === 0) return { tasks: [], removed: 0 };
@@ -5690,16 +6702,21 @@ async function rearmPendingSchedules() {
 }
 
 ensureScheduleHeartbeat();
+ensureMaintenanceAlarm();
 chrome.runtime.onInstalled.addListener(() => {
   ensureScheduleHeartbeat();
+  ensureMaintenanceAlarm();
   rearmPendingSchedules();
+  cleanupMaintenanceStorage().catch(() => {});
   if (typeof ensureTopicPinAlarms === "function") {
     ensureTopicPinAlarms({ recoverRunningTasks: true }).catch(() => {});
   }
 });
 chrome.runtime.onStartup.addListener(() => {
   ensureScheduleHeartbeat();
+  ensureMaintenanceAlarm();
   rearmPendingSchedules();
+  cleanupMaintenanceStorage().catch(() => {});
   if (typeof ensureTopicPinAlarms === "function") {
     ensureTopicPinAlarms({ recoverRunningTasks: true }).catch(() => {});
   }
@@ -5824,7 +6841,12 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
       .catch((err) => appendLog(`[话题置顶] 巡检异常: ${err.message}`, "error"));
     return;
   }
+  if (alarm?.name === MAINTENANCE_ALARM_NAME) {
+    await cleanupMaintenanceStorage().catch(() => {});
+    return;
+  }
   ensureScheduleHeartbeat();
+  ensureMaintenanceAlarm();
   if (alarm?.name === HEARTBEAT_ALARM_NAME && typeof ensureTopicPinAlarms === "function") {
     await ensureTopicPinAlarms({ recoverRunningTasks: true }).catch(() => {});
   }
@@ -6328,7 +7350,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.action === "GET_PIPELINE_STATUS") {
-    stateReady.then(() => sendResponse({ ok: true, state }));
+    stateReady.then(() => sendResponse({ ok: true, state, activeJobs: Object.values(activeJobsMap) }));
     return true;
   }
 
@@ -6340,8 +7362,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.action === "SCAN_DOC_TASKS") {
-    scanDocTasks(request.config || {})
-      .then((tasks) => sendResponse({ ok: true, tasks }))
+    const docTitles = {};
+    const docLinkCols = {};
+    scanDocTasks(request.config || {}, docTitles, docLinkCols)
+      .then((tasks) => sendResponse({ ok: true, tasks, docTitles, docLinkCols }))
       .catch((err) => sendResponse({ ok: false, error: err.message || String(err) }));
     return true;
   }
@@ -6454,6 +7478,17 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === "FETCH_PREVIEW_IMAGE") {
     handleFetchPreviewImage(request.url, request.docUrl)
       .then((res) => sendResponse({ ok: !!res?.dataUrl, dataUrl: res?.dataUrl || "" }))
+      .catch((err) => sendResponse({ ok: false, error: err.message || String(err) }));
+    return true;
+  }
+
+  if (request.action === "CLEAR_PUBLISH_CLAIMS") {
+    withPublishClaim(async () => {
+      const { __publishClaims__ = {} } = await chrome.storage.local.get(["__publishClaims__"]);
+      const count = Object.keys(__publishClaims__).length;
+      await chrome.storage.local.set({ __publishClaims__: {} });
+      return count;
+    }).then((cleared) => sendResponse({ ok: true, cleared }))
       .catch((err) => sendResponse({ ok: false, error: err.message || String(err) }));
     return true;
   }
@@ -6616,6 +7651,80 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       .catch((err) => sendResponse({ ok: false, error: err.message || String(err) }));
     return true;
   }
+
+  if (request.action === "GET_HOTSEARCH_STATE") {
+    Promise.all([
+      typeof getHotsearchConfig === "function" ? getHotsearchConfig() : {},
+      typeof getHotsearchHistory === "function" ? getHotsearchHistory() : [],
+      typeof getHotsearchBatchState === "function" ? getHotsearchBatchState() : null,
+    ])
+      .then(([config, history, batchState]) => sendResponse({ ok: true, config, history, batchState }))
+      .catch((err) => sendResponse({ ok: false, error: err.message || String(err) }));
+    return true;
+  }
+
+  if (request.action === "TEST_HOTSEARCH_ENDPOINT") {
+    testHotsearchEndpoint(request.endpoint || {})
+      .then((res) => sendResponse(res))
+      .catch((err) => sendResponse({ ok: false, error: err.message || String(err) }));
+    return true;
+  }
+
+  if (request.action === "PROCESS_HOTSEARCH_BATCH") {
+    processHotsearchBatchTask(request.payload || {})
+      .then((res) => sendResponse(res))
+      .catch((err) => sendResponse({ ok: false, error: err.message || String(err) }));
+    return true;
+  }
+
+  if (request.action === "WRITE_HOTSEARCH_PREPARED_ROW") {
+    writeHotsearchPreparedRowTask(request.payload || {})
+      .then((res) => sendResponse(res))
+      .catch((err) => sendResponse({ ok: false, error: err.message || String(err) }));
+    return true;
+  }
+
+  if (request.action === "SAVE_HOTSEARCH_CONFIG") {
+    saveHotsearchConfig(request.config || {})
+      .then((config) => sendResponse({ ok: true, config }))
+      .catch((err) => sendResponse({ ok: false, error: err.message || String(err) }));
+    return true;
+  }
+
+  if (request.action === "RESET_HOTSEARCH_CONFIG") {
+    resetHotsearchConfig()
+      .then((config) => sendResponse({ ok: true, config }))
+      .catch((err) => sendResponse({ ok: false, error: err.message || String(err) }));
+    return true;
+  }
+
+  if (request.action === "FETCH_HOTSEARCH_MODELS") {
+    fetchHotsearchModels(request.endpoint || {})
+      .then((models) => sendResponse({ ok: true, models }))
+      .catch((err) => sendResponse({ ok: false, error: err.message || String(err) }));
+    return true;
+  }
+
+  if (request.action === "PROCESS_HOTSEARCH_IMAGE") {
+    processHotsearchImageTask(request.payload || {})
+      .then((res) => sendResponse(res))
+      .catch((err) => sendResponse({ ok: false, error: err.message || String(err) }));
+    return true;
+  }
+
+  if (request.action === "PROCESS_HOTSEARCH_TEXT") {
+    processHotsearchTextTask(request.payload || {})
+      .then((res) => sendResponse(res))
+      .catch((err) => sendResponse({ ok: false, error: err.message || String(err) }));
+    return true;
+  }
+
+  if (request.action === "CLEAR_HOTSEARCH_HISTORY") {
+    clearHotsearchHistory()
+      .then((history) => sendResponse({ ok: true, history }))
+      .catch((err) => sendResponse({ ok: false, error: err.message || String(err) }));
+    return true;
+  }
 });
 
 async function handleResolvePendingSubmission(payload = {}) {
@@ -6641,11 +7750,31 @@ async function handleResolvePendingSubmission(payload = {}) {
       ? { ...item, status: "error", submittedWithoutReceipt: false, postUrl: "", writeBackOk: false,
           writeBackError: "", error: "已人工核实未发布，阻断已解除，可重新排程", resolvedAt: Date.now() }
       : item);
+    const nextPublishLedger = publishLedger.filter((item) => !item || item.id !== ledgerId);
+    const nextUnwritten = __unwrittenReceipts__.filter((item) => !item || item.id !== ledgerId);
     await chrome.storage.local.set({
-      publishLedger: publishLedger.filter((item) => !item || item.id !== ledgerId),
-      __unwrittenReceipts__: __unwrittenReceipts__.filter((item) => !item || item.id !== ledgerId),
+      publishLedger: nextPublishLedger,
+      __unwrittenReceipts__: nextUnwritten,
       scheduledTasks: nextScheduled,
     });
+    const remainingReceipts = [...nextPublishLedger, ...nextUnwritten];
+    const lockKeysToRelease = new Set();
+    for (const entry of entries) {
+      const acct = String(entry.resolvedAccount || entry.account || "").trim();
+      const body = String(entry.fullContent || "").trim();
+      if (!body) continue;
+      const stillReferenced = remainingReceipts.some((item) =>
+        item && item.mode === "真实发布" &&
+        String(item.resolvedAccount || item.account || "").trim() === acct &&
+        String(item.fullContent || "").trim() === body
+      );
+      if (!stillReferenced) {
+        lockKeysToRelease.add(`post::${acct}::${body}`);
+      }
+    }
+    for (const lockKey of lockKeysToRelease) {
+      await releasePublishTaskLock(lockKey).catch(() => {});
+    }
     return { ok: true };
   });
 }
@@ -6717,7 +7846,9 @@ async function handleManualReceiptWriteBack(payload = {}) {
 
 async function handleRetryWriteBack(payload = {}) {
   const docUrl = String(payload.docUrl || "").trim();
-  const targetCell = String(payload.targetCell || "").trim();
+  const origTargetCell = String(payload.targetCell || "").trim();
+  const overrideCell = String(payload.overrideTargetCell || "").trim().toUpperCase();
+  const targetCell = /^[A-Z]+[1-9]\d*$/.test(overrideCell) ? overrideCell : origTargetCell;
   const targetSheetId = String(payload.targetSheetId || "").trim();
   const postUrl = String(payload.postUrl || "").trim();
   const scheduleId = String(payload.scheduleId || "").trim();
@@ -6746,7 +7877,7 @@ async function handleRetryWriteBack(payload = {}) {
       const stored = await chrome.storage.local.get(["scheduledTasks", "publishLedger", "__unwrittenReceipts__"]);
       const entry = [...(stored.scheduledTasks || []), ...(stored.publishLedger || []), ...(stored.__unwrittenReceipts__ || [])]
         .find((item) => item && ((scheduleId && item.id === scheduleId) || (ledgerId && item.id === ledgerId)) &&
-          item.docUrl === docUrl && item.targetCell === targetCell && String(item.targetSheetId || "") === targetSheetId && item.postUrl === postUrl);
+          item.docUrl === docUrl && item.targetCell === origTargetCell && String(item.targetSheetId || "") === targetSheetId && item.postUrl === postUrl);
       const snapshot = entry?.writeSnapshot || (entry && { account: entry.account, content: entry.fullContent || entry.content });
       const dingTalkSignal = { aborted: false };
       writeRes = await Promise.race([
@@ -6761,12 +7892,20 @@ async function handleRetryWriteBack(payload = {}) {
       const entries = [...scheduledTasks, ...publishLedger, ...__unwrittenReceipts__];
       const saved = entries.find((entry) => entry &&
         ((scheduleId && entry.id === scheduleId) || (ledgerId && entry.id === ledgerId)) &&
-        entry.docUrl === docUrl && entry.targetCell === targetCell &&
+        entry.docUrl === docUrl && entry.targetCell === origTargetCell &&
         String(entry.targetSheetId || "") === targetSheetId && entry.postUrl === postUrl);
+      let effectiveSnapshot = saved?.writeSnapshot;
+      if (effectiveSnapshot && overrideCell && overrideCell !== origTargetCell) {
+        const colMatch = overrideCell.match(/^[A-Z]+/);
+        if (colMatch) {
+          const overrideCol0 = Array.from(colMatch[0]).reduce((n, ch) => n * 26 + ch.charCodeAt(0) - 64, 0) - 1;
+          effectiveSnapshot = { ...effectiveSnapshot, linkCol: overrideCol0 };
+        }
+      }
       const docAwake = await holdBackgroundTabAwake(docTab.id);
       try {
         writeRes = await executeInTabDirect(docTab.id, directWriteCellToDoc,
-          [targetCell, postUrl, targetSheetId, saved?.writeSnapshot], "MAIN", docUrl, false);
+          [targetCell, postUrl, targetSheetId, effectiveSnapshot], "MAIN", docUrl, false);
       } finally {
         if (docAwake) await releaseBackgroundTab(docTab.id);
       }
@@ -6786,30 +7925,37 @@ async function handleRetryWriteBack(payload = {}) {
       __unwrittenReceipts__ = [],
     } = await chrome.storage.local.get(["scheduledTasks", "publishLedger", "__unwrittenReceipts__"]);
 
+    const linkedScheduleId = scheduleId || [...publishLedger, ...__unwrittenReceipts__]
+      .find((entry) => entry && ledgerId && entry.id === ledgerId)?.scheduleId || "";
     const matchesEntry = (entry) => {
       if (!entry) return false;
       const idHit = Boolean((scheduleId && entry.id === scheduleId) || (ledgerId && entry.id === ledgerId));
-      const sameTarget = entry.postUrl === postUrl && entry.targetCell === targetCell && entry.docUrl === docUrl &&
+      const sameTarget = entry.postUrl === postUrl && entry.targetCell === origTargetCell && entry.docUrl === docUrl &&
         String(entry.targetSheetId || "") === targetSheetId;
-      if (sameTarget) return (scheduleId || ledgerId) ? idHit : true;
-      // 明确的记录/排程编号命中时，兼容旧记录缺少子表标识的情况。
-      return idHit && entry.docUrl === docUrl && entry.targetCell === targetCell;
+      const linked = linkedScheduleId && (entry.id === linkedScheduleId || entry.scheduleId === linkedScheduleId);
+      // 旧账本没有 scheduleId，按同一回执链接及完整目标关联，不能仅凭单元格关联。
+      const legacyReceipt = scheduleId && !entry.scheduleId && sameTarget;
+      if (sameTarget) return (scheduleId || ledgerId) ? Boolean(idHit || linked || legacyReceipt) : true;
+      // 只兼容旧记录缺少子表标识；编号相同也不能修改其他回执或子表。
+      return idHit && entry.docUrl === docUrl && entry.targetCell === origTargetCell &&
+        entry.postUrl === postUrl && !entry.targetSheetId;
     };
 
+    const nextTargetCell = writeBackOk ? targetCell : origTargetCell;
     const nextScheduled = scheduledTasks.map((t) => (
-      matchesEntry(t) ? { ...t, writeBackOk, writeBackError } : t
+      matchesEntry(t) ? { ...t, targetCell: nextTargetCell, writeBackOk, writeBackError } : t
     ));
     const nextLedger = publishLedger.map((item) => (
-      matchesEntry(item) ? { ...item, writeBackOk, writeBackError } : item
+      matchesEntry(item) ? { ...item, targetCell: nextTargetCell, writeBackOk, writeBackError } : item
     ));
     const retainedEntry = __unwrittenReceipts__.find(matchesEntry);
     if (ledgerId && retainedEntry && !nextLedger.some((item) => item?.id === ledgerId)) {
-      nextLedger.unshift({ ...retainedEntry, writeBackOk, writeBackError });
+      nextLedger.unshift({ ...retainedEntry, targetCell: nextTargetCell, writeBackOk, writeBackError });
     }
     const nextUnwritten = writeBackOk
       ? __unwrittenReceipts__.filter((u) => payload.strictLedgerId
           ? !matchesEntry(u)
-          : !(u && u.postUrl === postUrl && u.targetCell === targetCell &&
+          : !(u && u.postUrl === postUrl && u.targetCell === origTargetCell &&
               u.docUrl === docUrl && String(u.targetSheetId || "") === targetSheetId))
       : __unwrittenReceipts__.map((item) => matchesEntry(item) ? { ...item, writeBackOk, writeBackError } : item);
 
@@ -6832,36 +7978,58 @@ async function handleFetchPreviewImage(imageUrl, docUrl) {
     return { dataUrl: cleanUrl };
   }
 
-  const direct = await fetchImageAsBase64(cleanUrl);
-  if (direct && direct.dataUrl) {
-    return { dataUrl: direct.dataUrl };
-  }
-
   const cleanDocUrl = String(docUrl || "").trim();
-  if (cleanDocUrl.startsWith("http")) {
+  const isDingTalkImg = isDingTalkDocUrl(cleanUrl);
+
+  async function tryDocTabDownload() {
+    if (!cleanDocUrl.startsWith("http") && !isDingTalkImg) return "";
     try {
-      const targetUrl = new URL(cleanDocUrl);
-      const targetHost = targetUrl.hostname.toLowerCase();
-      const targetPath = targetUrl.pathname;
       const tabs = await chrome.tabs.query({});
-      const matchedTab = tabs.find((tab) => {
-        if (!tab.url || isProtectedBrowserUrl(tab.url)) return false;
-        try {
-          const parsed = new URL(tab.url);
-          return parsed.hostname.toLowerCase() === targetHost && parsed.pathname === targetPath;
-        } catch (_) {
-          return false;
-        }
-      });
+      let matchedTab = null;
+      if (cleanDocUrl.startsWith("http")) {
+        const targetUrl = new URL(cleanDocUrl);
+        const targetHost = targetUrl.hostname.toLowerCase();
+        const targetPath = targetUrl.pathname;
+        matchedTab = tabs.find((tab) => {
+          if (!tab.url || isProtectedBrowserUrl(tab.url)) return false;
+          try {
+            const parsed = new URL(tab.url);
+            return parsed.hostname.toLowerCase() === targetHost && parsed.pathname === targetPath;
+          } catch (_) {
+            return false;
+          }
+        });
+      }
+      if (!matchedTab && isDingTalkImg) {
+        matchedTab = tabs.find((tab) => tab.url && !isProtectedBrowserUrl(tab.url) && isDingTalkDocUrl(tab.url));
+      }
       if (matchedTab) {
-        const items = await downloadImagesViaDocTab(matchedTab.id, cleanDocUrl, [cleanUrl]);
+        const items = await downloadImagesViaDocTab(matchedTab.id, cleanDocUrl || matchedTab.url, [cleanUrl]);
         if (items && items[0]?.dataUrl) {
-          return { dataUrl: items[0].dataUrl };
+          return items[0].dataUrl;
         }
       }
     } catch (err) {
       console.warn("handleFetchPreviewImage doc tab fallback failed:", err);
     }
+    return "";
+  }
+
+  // 钉钉图片在扩展后台直接 fetch 会因跨站缺少 SameSite=Lax Cookie 返回 HTTP 200 的「暂无权限访问」占位图，
+  // 因此必须优先在已打开的钉钉文档标签页同源上下文中拉取。
+  if (isDingTalkImg) {
+    const tabDataUrl = await tryDocTabDownload();
+    if (tabDataUrl) return { dataUrl: tabDataUrl };
+  }
+
+  const direct = await fetchImageAsBase64(cleanUrl);
+  if (direct && direct.dataUrl) {
+    return { dataUrl: direct.dataUrl };
+  }
+
+  if (!isDingTalkImg) {
+    const tabDataUrl = await tryDocTabDownload();
+    if (tabDataUrl) return { dataUrl: tabDataUrl };
   }
 
   return { dataUrl: "" };
@@ -6882,8 +8050,9 @@ async function handleAddScheduleTasks(newTasks) {
       return { ...task, id, status: "pending", error: "", postUrl: "", dryRun: task.dryRun !== false };
     });
     const merged = pruneExpiredDoneSchedules([...scheduledTasks, ...added]).tasks;
-    // 保留全部 pending / firing / error 任务，仅当已完成 (done) 超过 300 条时按时间裁剪最老的历史记录
-    const doneTasks = merged.filter((t) => t && t.status === "done");
+    // 待核对及待补写无条件保留，数量上限仅适用于可安全清理的完成历史。
+    const needsFollowUp = (t) => t && (t.submittedWithoutReceipt || (t.postUrl && !t.writeBackOk));
+    const doneTasks = merged.filter((t) => t && t.status === "done" && !needsFollowUp(t));
     let finalTasks = merged;
     if (doneTasks.length > 300) {
       const keepDoneIds = new Set(
@@ -6893,7 +8062,7 @@ async function handleAddScheduleTasks(newTasks) {
           .slice(0, 300)
           .map((t) => t.id)
       );
-      finalTasks = merged.filter((t) => !t || t.status !== "done" || keepDoneIds.has(t.id));
+      finalTasks = merged.filter((t) => !t || t.status !== "done" || needsFollowUp(t) || keepDoneIds.has(t.id));
     }
     await chrome.storage.local.set({ scheduledTasks: finalTasks });
     for (const task of added) await armSchedule(task);

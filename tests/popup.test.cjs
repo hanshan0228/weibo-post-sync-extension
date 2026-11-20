@@ -37,8 +37,8 @@ class Element {
   addEventListener(name, fn) {
     this.listeners.set(name, [...(this.listeners.get(name) || []), fn]);
   }
-  async emit(name) {
-    for (const fn of this.listeners.get(name) || []) await fn({ target: this });
+  async emit(name, event = {}) {
+    for (const fn of this.listeners.get(name) || []) await fn({ target: this, ...event });
   }
   click() { return this.emit('click'); }
   appendChild(child) { this.children.push(child); child.parentElement = this; return child; }
@@ -55,12 +55,39 @@ class Element {
   focus() {}
   querySelector(selector) {
     if (selector === '.task-done-badge') return this.children.find((el) => el.classList.contains('task-done-badge')) || null;
-    if (!this.nodes.has(selector)) this.nodes.set(selector, new Element());
+    if (!this.nodes.has(selector)) {
+      const node = new Element();
+      if (selector === '.task-item-cb') {
+        const match = this._html.match(/<input[^>]*class="task-item-cb"[^>]*>/);
+        node.dataset.taskIndex = match?.[0].match(/data-task-index="(\d+)"/)?.[1];
+        node.checked = /\schecked(?:\s|>)/.test(match?.[0] || '');
+      }
+      if (selector === '.task-delete-btn') {
+        const match = this._html.match(/<button[^>]*class="[^"]*task-delete-btn[^"]*"[^>]*>/);
+        node.dataset.taskIndex = match?.[0].match(/data-task-index="(\d+)"/)?.[1];
+      }
+      node.closest = (selector) => selector === '.task-item-card' ? this : null;
+      this.nodes.set(selector, node);
+    }
     return this.nodes.get(selector);
   }
   querySelectorAll(selector) {
     if (selector === '.chip') return this.chips || [];
     if (selector === '.task-item-card') return this.children.filter((el) => el.classList.contains('task-item-card'));
+    if (['.task-item-cb', '.task-item-cb:checked', '.sched-card-header', '.task-delete-btn'].includes(selector)) {
+      const cards = this.children.filter((el) => el.classList.contains('task-item-card'));
+      const subSel = selector.endsWith(':checked') ? '.task-item-cb' : selector;
+      const nodes = cards.map((card) => card.querySelector(subSel));
+      return selector.endsWith(':checked') ? nodes.filter((node) => node.checked) : nodes;
+    }
+    if (selector === '.filter-chip') {
+      if (!this.nodes.has(selector)) this.nodes.set(selector, [...this._html.matchAll(/data-doc="([^"]+)"/g)].map((match) => {
+        const chip = new Element();
+        chip.dataset.doc = match[1];
+        return chip;
+      }));
+      return this.nodes.get(selector);
+    }
     return [];
   }
 }
@@ -126,7 +153,8 @@ async function loadPopup(stored = {}, responses = {}, overrides = {}) {
       onMessage: { addListener: (fn) => messages.push(fn) },
       sendMessage(request, callback) {
         sent.push(request);
-        const response = responses[request.action] || { ok: true };
+        const configured = responses[request.action];
+        const response = typeof configured === 'function' ? configured(request) : configured || { ok: true };
         if (callback) { queueMicrotask(() => callback(response)); return; }
         return Promise.resolve(response);
       },
@@ -145,6 +173,81 @@ async function loadPopup(stored = {}, responses = {}, overrides = {}) {
   await new Promise((resolve) => setImmediate(resolve));
   return { api: context.__test, elements, storage, sent, alerts, messages, aliasChip, delayChip, editChip, schedFilterChips };
 }
+
+test('扫描选择跨搜索、文档切换与排程广播保留，操作只处理当前筛选', async () => {
+  const app = await loadPopup();
+  const tasks = [
+    { docId: 'a', docName: '甲表', docUrl: 'https://example.invalid/a', row: 2, account: 'Mock甲', content: '苹果' },
+    { docId: 'b', docName: '乙表', docUrl: 'https://example.invalid/b', row: 2, account: 'Mock乙', content: '香蕉' },
+  ];
+  app.api.setScannedTasks(tasks);
+  app.api.renderTaskList(tasks);
+  const list = app.elements.get('taskListContainer');
+  let cb = list.querySelectorAll('.task-item-cb')[0];
+  cb.checked = false;
+  await cb.emit('change');
+  const search = app.elements.get('taskSearchInput');
+  search.value = '香蕉';
+  await search.emit('input');
+  assert.deepEqual([...app.api.getSelectedTasks().map((t) => t.account)], ['Mock乙']);
+  await app.elements.get('btnToggleSelectAll').click();
+  search.value = '';
+  await search.emit('input');
+  assert.deepEqual(list.querySelectorAll('.task-item-cb').map((node) => node.checked), [false, false]);
+  await list.children[0].querySelector('.sched-card-header').click();
+  await app.elements.get('taskDocFilterChips').querySelectorAll('.filter-chip').find((chip) => chip.dataset.doc === '乙表').click();
+  assert.equal(app.api.getSelectedTasks().length, 0, '隐藏的已选任务不参与当前筛选操作');
+  await app.elements.get('btnToggleSelectAll').click();
+  for (const fn of app.messages) fn({ action: 'SCHEDULE_UPDATED' });
+  await new Promise((resolve) => setImmediate(resolve));
+  await app.elements.get('taskDocFilterChips').querySelectorAll('.filter-chip').find((chip) => chip.dataset.doc === 'all').click();
+  assert.deepEqual(list.querySelectorAll('.task-item-cb').map((node) => node.checked), [true, true]);
+  cb = list.querySelectorAll('.task-item-cb')[0];
+  cb.checked = false;
+  await cb.emit('change');
+  for (const fn of app.messages) fn({ action: 'SCHEDULE_UPDATED' });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(list.querySelectorAll('.task-item-cb')[0].checked, false);
+  assert.match(app.elements.get('btnToggleSelectAll').title, /当前筛选/);
+});
+
+test('排程默认值随队列变化，用户明确选择优先且任务删除后清理选择', async () => {
+  const app = await loadPopup();
+  const task = { docId: 'a', docUrl: 'https://example.invalid/a', row: 2, content: 'Mock正文' };
+  app.api.setScannedTasks([task]);
+  app.api.renderTaskList([task]);
+  app.storage.scheduledTasks = [{ ...task, id: 'Mock排程', status: 'pending' }];
+  for (const fn of app.messages) fn({ action: 'SCHEDULE_UPDATED' });
+  await new Promise((resolve) => setImmediate(resolve));
+  const list = app.elements.get('taskListContainer');
+  assert.equal(list.querySelectorAll('.task-item-cb')[0].checked, false);
+  const cb = list.querySelectorAll('.task-item-cb')[0];
+  cb.checked = true;
+  await cb.emit('change');
+  app.api.renderTaskList([{ ...task, docName: 'Mock新名称' }]);
+  assert.equal(list.querySelectorAll('.task-item-cb')[0].checked, true);
+  app.api.renderTaskList([]);
+  app.api.renderTaskList([task]);
+  assert.equal(list.querySelectorAll('.task-item-cb')[0].checked, false);
+});
+
+test('手动话题置顶回车重入被同步拦截，失败后释放守卫', async () => {
+  let rejectRequest;
+  const app = await loadPopup({}, { MANUAL_TOPIC_PIN: () => new Promise((_resolve, reject) => { rejectRequest = reject; }) });
+  const input = app.elements.get('manualPinUrlInput');
+  input.value = 'https://example.invalid/Mock';
+  const first = app.elements.get('btnManualPinSubmit').click();
+  input.emit('keydown', { key: 'Enter', preventDefault() {} });
+  assert.equal(app.sent.filter((m) => m.action === 'MANUAL_TOPIC_PIN').length, 1);
+  rejectRequest(new Error('Mock发送失败'));
+  await first;
+  assert.equal(app.elements.get('btnManualPinSubmit').disabled, false);
+  assert.ok(app.elements.get('logWindow').children.some((node) => node.textContent.includes('Mock发送失败')));
+  const retry = app.elements.get('btnManualPinSubmit').click();
+  assert.equal(app.sent.filter((m) => m.action === 'MANUAL_TOPIC_PIN').length, 2);
+  rejectRequest(new Error('Mock再次失败'));
+  await retry;
+});
 
 test('后台定时任务启动广播同步启用停止按钮并禁用启动入口', async () => {
   const app = await loadPopup();
@@ -588,12 +691,53 @@ test('发博账本支持一键复制全部成功发布账号名与链接及单�
   await new Promise((r) => setImmediate(r));
   const cards = app.elements.get('ledgerListContainer').children;
   assert.equal(cards.length, 3);
+  assert.match(cards[0].innerHTML, /btn-copy-ledger-url/);
+  assert.match(cards[0].innerHTML, /🔗 链接/);
   assert.match(cards[0].innerHTML, /btn-copy-ledger-item/);
+  assert.match(cards[0].innerHTML, /📋 账号\+链接/);
+  assert.doesNotMatch(cards[1].innerHTML, /btn-copy-ledger-url/);
   assert.doesNotMatch(cards[1].innerHTML, /btn-copy-ledger-item/);
 
   await app.elements.get('btnCopyLedgerLinks').click();
   assert.equal(copied.length, 1);
   assert.equal(copied[0], '瑞峰财经 https://weibo.com/111/Aaa\n对焦Focus https://weibo.com/222/Bbb');
+});
+
+test('发博账本支持按文档/任务解析/演练草稿/账号筛选及按文档分组展示', async () => {
+  const now = Date.now();
+  const app = await loadPopup({
+    publishLedger: [
+      { id: '1', account: '瑞峰财经', docName: '表A', docUrl: 'https://docs.qq.com/sheet/A', mode: '真实发布', writeBackOk: true, postUrl: 'https://weibo.com/1/A', timestamp: now },
+      { id: '2', account: '新浪科普', docName: '任务解析', mode: '真实发布', writeBackOk: false, postUrl: 'https://weibo.com/2/B', timestamp: now - 1000 },
+      { id: '3', account: '瑞峰财经', docName: '表B', docUrl: 'https://docs.qq.com/sheet/B', mode: '安全演练', postUrl: '', timestamp: now - 2000 },
+    ],
+  });
+
+  await app.elements.get('tabNavLedger').click();
+  await new Promise((r) => setImmediate(r));
+  assert.equal(app.elements.get('ledgerListContainer').children.length, 3);
+
+  // 按账号筛选
+  app.elements.get('ledgerAccountFilter').value = '瑞峰财经';
+  await app.elements.get('ledgerAccountFilter').listeners.get('change')[0]();
+  assert.equal(app.elements.get('ledgerListContainer').children.length, 2);
+
+  // 按文档分组
+  app.elements.get('ledgerAccountFilter').value = 'all';
+  app.elements.get('ledgerGroupMode').value = 'doc';
+  await app.elements.get('ledgerGroupMode').listeners.get('change')[0]();
+  const groups = app.elements.get('ledgerListContainer').children;
+  assert.equal(groups.length, 3);
+  assert.match(groups[0].children[0].innerHTML, /📁 表A/);
+  assert.match(groups[1].children[0].innerHTML, /📁 任务解析/);
+
+  // 任务解析无云文档记录不应混入“待处理”
+  const pendingChip = Array.from(app.elements.get('ledgerFilterChips')?.children || [])
+    .find((c) => c?.dataset?.ledgerFilter === 'writeback_fail');
+  if (pendingChip) {
+    await pendingChip.click();
+    assert.equal(app.elements.get('ledgerListContainer').children.length, 0);
+  }
 });
 
 test('扫图后支持在前端渲染配图缩略图、防盗链回退拉取以及点击放大预览', async () => {
@@ -1069,9 +1213,11 @@ test('@新浪热点值班 仅跟 N小号（无大号/+小号/和小号）时仅�
   assert.deepEqual(new Set(accts), new Set(['新浪科普', '新浪生活', '新浪文旅', '新浪手机']));
 });
 
-test('点击智能解析预览左侧的一键粘贴按钮可将剪贴板内容填入解析框', async () => {
+test('点击智能解析预览左侧的一键粘贴解析按钮可将剪贴板内容填入解析框并立即完成解析预览', async () => {
   const clipText = '测试剪贴板派单正文\n@新浪热点值班 辛苦4小号';
-  const app = await loadPopup({}, {}, {
+  const app = await loadPopup({
+    cachedPlatformAccounts: ['新浪热点', '小号1', '小号2', '小号3', '小号4'],
+  }, {}, {
     navigator: { clipboard: { readText: async () => clipText } },
   });
   const input = app.elements.get('taskParserInput');
@@ -1080,6 +1226,7 @@ test('点击智能解析预览左侧的一键粘贴按钮可将剪贴板内容�
   assert.equal(input.value, clipText);
   assert.equal(input.style.display, 'block');
   assert.equal(app.elements.get('btnToggleParserInput').textContent, '🔼 收起原文');
+  assert.equal(app.elements.get('parserCountBadge').textContent, '已解析 4 条任务');
 });
 
 test('运行状态日志倒序渲染，最新日志在最上面且靠近顶部时保持置顶', async () => {
@@ -1249,6 +1396,233 @@ test('话题置顶页面支持状态筛选、关键词搜索、批量粘贴链�
   assert.equal(manualCalls.length, 2);
   assert.equal(manualCalls[0].url, 'https://weibo.com/1/A');
   assert.equal(manualCalls[1].url, 'https://weibo.com/1/B');
+});
+
+test('待发任务清单支持单条删除、批量删除已选与清空清单并同步缓存', async () => {
+  const app = await loadPopup({
+    cachedScannedTasks: [
+      { docUrl: 'https://alidocs.dingtalk.com/i/nodes/1', docName: '主表', row: 2, account: '新浪财经', content: '任务一' },
+      { docUrl: 'https://alidocs.dingtalk.com/i/nodes/1', docName: '主表', row: 3, account: '新浪体育', content: '任务二' },
+      { docUrl: 'https://alidocs.dingtalk.com/i/nodes/1', docName: '主表', row: 4, account: '新浪科技', content: '任务三' },
+    ],
+    cachedScannedAt: Date.now() - 1000,
+  });
+
+  const list = app.elements.get('taskListContainer');
+  assert.equal(list.children.length, 3);
+  assert.equal(app.elements.get('btnDeleteSelectedTasks').style.display, 'inline-block');
+  assert.equal(app.elements.get('btnClearScannedTasks').style.display, 'inline-block');
+
+  // 1. 单条删除第一条任务
+  const firstDelBtn = list.querySelectorAll('.task-delete-btn')[0];
+  await firstDelBtn.click({ stopPropagation() {} });
+  assert.equal(list.children.length, 2);
+  assert.equal(app.storage.cachedScannedTasks.length, 2);
+
+  // 2. 勾选第一条并点击“删除已选”
+  app.elements.get('taskListContainer').querySelectorAll = (sel) => (
+    sel === '.task-item-cb:checked' ? [{ dataset: { taskIndex: '0' } }] : []
+  );
+  await app.elements.get('btnDeleteSelectedTasks').click();
+  assert.equal(list.children.length, 1);
+  assert.equal(app.storage.cachedScannedTasks.length, 1);
+  assert.equal(app.storage.cachedScannedTasks[0].content, '任务三');
+
+  // 3. 点击“清空”按钮
+  await app.elements.get('btnClearScannedTasks').click();
+  assert.equal(app.storage.cachedScannedTasks.length, 0);
+  assert.equal(app.elements.get('taskCountBadge').textContent, '0 条');
+  assert.equal(app.elements.get('btnDeleteSelectedTasks').style.display, 'none');
+  assert.equal(app.elements.get('btnClearScannedTasks').style.display, 'none');
+});
+
+test('任务解析：@xxx值班老师 仅抽小号时不误加主号，且普通短句不被当成指令吞掉', async () => {
+  const app = await loadPopup({
+    cachedPlatformAccounts: ['新浪热点', '小号甲', '小号乙'],
+  });
+  const tasks1 = await app.api.parseBatchTaskText('这是测试正文\n@新浪热点值班老师 辛苦2个小号发');
+  assert.equal(tasks1.length, 2);
+  assert.equal(tasks1.some((t) => t.account === '新浪热点'), false);
+
+  const tasks2 = await app.api.parseBatchTaskText('@小号甲\n第一句内容\n今天产品正式发布！');
+  assert.equal(tasks2.length, 1);
+  assert.equal(tasks2[0].content, '第一句内容\n今天产品正式发布！');
+});
+
+test('任务解析：投票有效选项不足2个或正文为空时，拦截立即执行', async () => {
+  const app = await loadPopup();
+  let startCalled = 0;
+  app.onMessage = async (msg) => {
+    if (msg.action === 'START_PIPELINE') startCalled += 1;
+    return { ok: true };
+  };
+  app.api.setParsedTasks([{ account: '小号甲', content: '投票正文', poll: { title: '投票', options: ['只有一项', '   '], days: 30 } }]);
+  await app.elements.get('btnParserRunNow').click();
+  assert.equal(startCalled, 0);
+
+  app.api.setParsedTasks([{ account: '小号甲', content: '   ', poll: null }]);
+  await app.elements.get('btnParserRunNow').click();
+  assert.equal(startCalled, 0);
+});
+
+test('任务解析：文末含“散列发布/错峰发布”等修饰词的派单指令能正确识别并绑定到上方正文', async () => {
+  const app = await loadPopup({
+    cachedPlatformAccounts: ['新浪热点', '小号1', '小号2', '小号3', '小号4', '小号5'],
+  });
+  const sample = [
+    '就在不久前，我们还惊叹于人形机器人登台扭秧歌。#周跃峰表示智能体时代需要硅基黑土地#（央视网）http://t.cn/AXof4aVp',
+    '',
+    '\u2005\u2005@新浪热点值班\u2005\u2005辛苦老师大号+5个小号散列发布',
+  ].join('\n');
+  const tasks = await app.api.parseBatchTaskText(sample);
+  assert.equal(tasks.length, 6);
+  assert.ok(tasks.every((t) => t.scatterPublish === true));
+  assert.ok(tasks.some((t) => t.account === '新浪热点'));
+  assert.equal(tasks.filter((t) => t.account.startsWith('小号')).length, 5);
+  assert.equal(tasks[0].content, '就在不久前，我们还惊叹于人形机器人登台扭秧歌。#周跃峰表示智能体时代需要硅基黑土地#（央视网）http://t.cn/AXof4aVp');
+});
+
+test('末尾带“大号发布投票+小号原发”的纯派单指令行不会误解析成新浪热点正文任务', async () => {
+  const app = await loadPopup({
+    cachedPlatformAccounts: ['新浪热点', '新浪新闻滚动', '新浪健康派', '硬核大脑'],
+  });
+  const sample = [
+    '@新浪新闻滚动 、@新浪健康派、@硬核大脑',
+    '#尹烨称生命不能被浓缩成token#活到100岁，是福气还是折磨？（尹烨）#尹烨谈为什么AI干不掉生命科学# #新浪新闻探索大会#',
+    'http://t.cn/AXWWTNPk ',
+    '',
+    '\u2005@新浪热点值班\u2005辛苦老师 大号发布投票+小号原发   ',
+  ].join('\n');
+  const tasks = await app.api.parseBatchTaskText(sample);
+  assert.deepEqual(Array.from(tasks, (t) => t.account), ['新浪新闻滚动', '新浪健康派', '硬核大脑']);
+  assert.ok(tasks.every((t) => t.content.includes('#尹烨称生命不能被浓缩成token#')));
+});
+
+test('末尾带“@新浪热点值班 辛苦转发博文”的纯派单指令行不会误解析成新浪热点正文任务', async () => {
+  const app = await loadPopup({
+    cachedPlatformAccounts: ['新浪热点', '瑞峰财经', '微资讯', '新浪新闻滚动', '新浪健康派', '硬核大脑', '新浪运动'],
+  });
+  const sample = [
+    '转发链接：https://weibo.com/1618051664/Rs7TBEYQY?refer_flag=1001030103_ ',
+    '',
+    '转发文案：',
+    '@新浪热点 @瑞峰财经、@微资讯、@新浪新闻滚动',
+    '#尹烨称生命不能被浓缩成token#如果AI能把新药研发缩到几周，人类寿命可能大大增加！#尹烨谈为什么AI干不掉生命科学# #新浪新闻探索大会#',
+    '',
+    '',
+    '@新浪健康派、@硬核大脑、@新浪运动',
+    '#尹烨称生命不能被浓缩成token#AI收割了翻译、写作、编程、数学，却在生物学门前倒下。#尹烨谈为什么AI干不掉生命科学# #新浪新闻探索大会#',
+    '',
+    '\u2005@新浪热点值班\u2005 辛苦转发博文',
+  ].join('\n');
+  const tasks = await app.api.parseBatchTaskText(sample);
+  assert.deepEqual(
+    Array.from(tasks, (t) => t.account),
+    ['新浪热点', '瑞峰财经', '微资讯', '新浪新闻滚动', '新浪健康派', '硬核大脑']
+  );
+  assert.ok(tasks.every((t) => t.repostUrl.includes('Rs7TBEYQY')));
+  assert.ok(tasks.every((t) => t.content.includes('#尹烨称生命不能被浓缩成token#')));
+});
+
+test('末尾带“辛苦老师仅转发”的纯派单指令不误拆任务且默认跳过已下线账号新浪运动', async () => {
+  const app = await loadPopup({
+    cachedPlatformAccounts: ['新浪热点', 'BOOM视频', '民生温度计', '手机头条', '瑞峰财经', '微资讯', '新浪健康派', '硬核大脑', '新浪新闻滚动'],
+  });
+  const sample = [
+    '转发链接：https://weibo.com/2028810631/Rs8qEb8YY?refer_flag=1001030103_',
+    '',
+    '@新浪热点、@BOOM视频、@民生温度计',
+    '郝景芳畅想，AI时代人人都可能成为一个小的创业团队。',
+    '',
+    '@手机头条、@瑞峰财经、@微资讯',
+    '郝景芳期待AI算法2.0。',
+    '',
+    '@新浪健康派、@硬核大脑、@新浪运动、@新浪新闻滚动',
+    '郝景芳说最希望参与改变的事。',
+    '',
+    '\u2005\u2005@新浪热点值班\u2005\u2005辛苦老师仅转发',
+  ].join('\n');
+  const tasks = await app.api.parseBatchTaskText(sample);
+  assert.deepEqual(
+    Array.from(tasks, (t) => t.account),
+    ['新浪热点', 'BOOM视频', '民生温度计', '手机头条', '瑞峰财经', '微资讯', '新浪健康派', '硬核大脑', '新浪新闻滚动']
+  );
+  assert.ok(!tasks.some((t) => t.account === '新浪运动'));
+  assert.ok(!tasks.some((t) => t.content === '仅转发'));
+});
+
+test('扫描文档返回docTitles时自动同步前端文档卡槽名称', async () => {
+  const docTitle = '蒙牛 #祖传的喝奶说法怎么越听越烧心#11月20日18点';
+  const app = await loadPopup({
+    docPresets: [{ id: 'slot_1', name: '文档 1 (主表)', url: 'https://docs.qq.com/sheet/DSUZrVkNrdFFYb1h5?tab=1qv4tm', linkCol: 'E' }],
+  }, {
+    SCAN_DOC_TASKS: {
+      ok: true,
+      docTitles: { slot_1: docTitle },
+      tasks: [{ docId: 'slot_1', docName: docTitle, docTitle, docUrl: 'https://docs.qq.com/sheet/DSUZrVkNrdFFYb1h5?tab=1qv4tm', targetSheetId: '1qv4tm', row: 2, targetCell: 'E2', account: '新浪热点', content: '测试文案', imgUrls: [] }],
+    },
+  });
+  await app.elements.get('btnScanTasks').click();
+  const slotCard = app.elements.get('docSlotsContainer').children[0];
+  assert.equal(app.storage.docPresets[0].name, docTitle);
+  assert.ok(slotCard.innerHTML.includes(docTitle));
+});
+
+test('任务解析勾选“本次放行重发”后透传allowDuplicateBypass并在执行结束后自动复位', async () => {
+  let capturedConfig = null;
+  const app = await loadPopup({
+    cachedPlatformAccounts: ['新浪热点'],
+  }, {
+    START_PIPELINE: (msg) => {
+      capturedConfig = msg.config;
+      return { ok: true, summary: { processed: 1, published: 1 } };
+    },
+  });
+  app.elements.get('taskParserInput').value = '@新浪热点\n测试放行重发正文';
+  await app.elements.get('btnParseTasks').click();
+  const onceToggle = app.elements.get('parserAllowDuplicateOnceToggle');
+  onceToggle.checked = true;
+  await app.elements.get('btnParserRunNow').click();
+  assert.equal(capturedConfig.allowDuplicateBypass, true);
+  assert.equal(onceToggle.checked, false);
+});
+
+test('问句末尾紧跟话题标签且下方带A/B/C/D选项时无需勾选优先投票即可自动识别为投票任务', async () => {
+  const app = await loadPopup({
+    cachedPlatformAccounts: ['新浪热点'],
+  });
+  const sample = [
+    '你觉得生命难以被AI复刻的主要原因是？#尹烨称生命的验证昂贵不可逆##新浪新闻探索大会#',
+    'A. 生命超高维度多模态，系统极度复杂',
+    'B. 生命存在动态变化演化',
+    'C. 生命验证成本高昂、过程不可逆',
+    'D. 环境语境会改变基因表达，变量太多',
+    '',
+    '\u2005@新浪热点值班\u2005\u2005辛苦老师发布投票',
+  ].join('\n');
+  const tasks = await app.api.parseBatchTaskText(sample);
+  assert.equal(tasks.length, 1);
+  assert.equal(tasks[0].account, '新浪热点');
+  assert.ok(tasks[0].poll);
+  assert.equal(tasks[0].poll.title, '你觉得生命难以被AI复刻的主要原因是？');
+  assert.deepEqual(Array.from(tasks[0].poll.options), [
+    '生命超高维度多模态，系统极度复杂',
+    '生命存在动态变化演化',
+    '生命验证成本高昂、过程不可逆',
+    '环境语境会改变基因表达，变量太多',
+  ]);
+});
+
+test('大号+全部小号或N个小号解析时自动排除新浪军事', async () => {
+  const app = await loadPopup({
+    cachedPlatformAccounts: ['新浪热点', '新浪军事', '微资讯', '瑞峰财经'],
+  });
+  const tasksAll = await app.api.parseBatchTaskText('测试正文\n@新浪热点值班 辛苦大号+全部小号');
+  assert.deepEqual(Array.from(tasksAll, (t) => t.account), ['新浪热点', '微资讯', '瑞峰财经']);
+  assert.ok(!tasksAll.some((t) => t.account === '新浪军事'));
+
+  const tasksExplicit = await app.api.parseBatchTaskText('@新浪军事\n显式指定军事正文');
+  assert.deepEqual(Array.from(tasksExplicit, (t) => t.account), ['新浪军事']);
 });
 
 

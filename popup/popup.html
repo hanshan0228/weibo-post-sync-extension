@@ -12,10 +12,9 @@
     <header class="app-header">
       <div class="brand">
         <div class="logo-dot"></div>
-        <h1>云文档 ⇄ 微博发稿中台</h1>
+        <h1>微博智能中台</h1>
       </div>
       <div class="header-right" style="display:flex;align-items:center;gap:6px;">
-        <button id="btnGlobalStop" class="btn-global-stop" style="display:none;" title="立即停止当前正在执行的任务流水线">⏹ 停止任务</button>
         <button id="btnOpenInTab" class="btn-icon-link" title="在新标签页以独立大屏模式打开">
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
@@ -36,10 +35,11 @@
         ⏰ 定时管理 <span class="nav-badge" id="schedBadge" style="display:none;">0</span>
       </button>
       <button class="nav-tab active" id="tabNavParser">✨ 任务解析</button>
-      <button class="nav-tab" id="tabNavLedger">📚 发博账本</button>
+      <button class="nav-tab" id="tabNavLedger">📚 发博记录</button>
       <button class="nav-tab" id="tabNavTopicPin">
         📌 话题置顶 <span class="nav-badge" id="topicPinBadge" style="display:none;">0</span>
       </button>
+      <button class="nav-tab" id="tabNavHotsearch">🔥 热搜写入</button>
       <button class="nav-tab" id="tabNavSettings">⚙️ 系统设置</button>
     </nav>
 
@@ -69,9 +69,13 @@
           </div>
           <div class="section-actions">
             <button id="btnToggleSelectAll" class="btn-xs btn-outline" style="display: none;">全选/反选</button>
+            <button id="btnDeleteSelectedTasks" class="btn-xs btn-outline danger-text" style="display: none;" title="从清单中删除当前已勾选的任务">🗑️ 删除已选</button>
+            <button id="btnClearScannedTasks" class="btn-xs btn-outline danger-text" style="display: none;" title="清空当前已抓取的任务清单">🧹 清空</button>
             <button id="btnScanTasks" class="btn-sm btn-primary-outline">🔍 扫描全部文档</button>
           </div>
         </div>
+
+        <div id="scanWriteColBanner" class="scan-write-col-banner" style="display: none;"></div>
 
         <div id="taskFilterBar" style="display: none; margin-bottom: 8px;">
           <input type="text" id="taskSearchInput" class="ui-input" style="height: 28px;" placeholder="🔍 搜索账号、来源文档或正文关键词...">
@@ -200,13 +204,19 @@
         <textarea id="taskParserInput" rows="7" class="ui-textarea" placeholder="粘贴整段群聊派单文案，或单条微博投票链接 (https://weibo.com/UID/MID)..."></textarea>
 
         <div class="parser-options-row" style="margin-top: 8px;">
-          <label class="checkbox-label highlight">
-            <input type="checkbox" id="taskParserPollQuickToggle">
-            <span>📊 优先作为投票任务解析</span>
-          </label>
+          <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+            <label class="checkbox-label highlight">
+              <input type="checkbox" id="taskParserPollQuickToggle">
+              <span>📊 优先作为投票任务解析</span>
+            </label>
+            <label class="checkbox-label" title="仅本次执行跳过15分钟并发锁与12小时同文案拦截，执行完成后自动关闭">
+              <input type="checkbox" id="parserAllowDuplicateOnceToggle">
+              <span>🔓 本次放行重发</span>
+            </label>
+          </div>
           <div style="display: flex; align-items: center; gap: 6px;">
-            <button id="btnPasteParser" class="btn-sm btn-outline" title="一键粘贴剪贴板内容到解析框">📋 一键粘贴</button>
-            <button id="btnParseTasks" class="btn-sm btn-primary">🔍 智能解析预览</button>
+            <button id="btnPasteParser" class="btn-sm btn-primary btn-paste-highlight" title="一键粘贴剪贴板内容并立即智能解析预览">📋 一键粘贴解析</button>
+            <button id="btnParseTasks" class="btn-sm btn-outline">🔍 智能解析预览</button>
           </div>
         </div>
 
@@ -226,25 +236,38 @@
       <section class="card ledger-card">
         <div class="section-header">
           <div class="section-title-group">
-            <span class="section-title">📚 历史发博流水账本</span>
+            <span class="section-title">📚 历史发博记录</span>
             <span class="count-pill" id="ledgerCountBadge">0 条记录</span>
           </div>
           <div class="section-actions">
             <button id="btnCopyLedgerLinks" class="btn-xs btn-outline">📋 复制账号与链接</button>
             <button id="btnExportLedgerCsv" class="btn-xs btn-outline">📥 导出 CSV</button>
+            <button id="btnClearPublishClaims" class="btn-xs btn-outline" title="仅清除15分钟并发防重锁（不影响12小时账本防重；如需同文案重发请在任务解析勾选【本次放行重发】）">🔓 清并发锁</button>
             <button id="btnClearLedger" class="btn-xs btn-outline danger-text">🗑️ 清空</button>
           </div>
         </div>
 
-        <div class="filter-toolbar" style="margin-bottom: 6px;">
+        <div class="filter-toolbar" style="margin-bottom: 6px; flex-wrap: wrap; gap: 6px;">
           <div class="filter-chips" id="ledgerFilterChips">
             <span class="filter-chip active" data-ledger-filter="all">全部</span>
-            <span class="filter-chip" data-ledger-filter="live">真实发布</span>
-            <span class="filter-chip" data-ledger-filter="writeback_fail">回写失败</span>
+            <span class="filter-chip" data-ledger-filter="doc">云文档</span>
+            <span class="filter-chip" data-ledger-filter="parser">任务解析</span>
+            <span class="filter-chip" data-ledger-filter="writeback_fail">⚠️ 待处理</span>
+            <span class="filter-chip" data-ledger-filter="dry_draft">演练/草稿</span>
           </div>
-          <select id="ledgerDocFilter" class="ui-select">
-            <option value="all">全部来源文档</option>
-          </select>
+          <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;width:100%;">
+            <select id="ledgerDocFilter" class="ui-select" style="flex:1;min-width:120px;">
+              <option value="all">📑 全部来源文档</option>
+            </select>
+            <select id="ledgerAccountFilter" class="ui-select" style="flex:1;min-width:110px;">
+              <option value="all">👤 全部账号</option>
+            </select>
+            <select id="ledgerGroupMode" class="ui-select" style="width:auto;min-width:105px;" title="切换发博记录分组方式">
+              <option value="time">🕒 时间平铺</option>
+              <option value="doc">📁 按文档分组</option>
+              <option value="date">📅 按日期分组</option>
+            </select>
+          </div>
         </div>
         <div style="margin-bottom: 8px;">
           <input type="text" id="ledgerSearchInput" class="ui-input" style="height: 28px;" placeholder="🔍 搜索账号、来源文档或正文关键词...">
@@ -489,6 +512,195 @@
       </details>
     </main>
 
+    <!-- 面板 4.5：热搜截图识别写入 -->
+    <main id="panelHotsearch" class="tab-panel" style="display: none;">
+      <div class="hs-two-col">
+        <div class="hs-col-left">
+      <!-- 卡片 1：顶部状态与自定义配置入口 -->
+      <section class="card mb-10">
+        <div class="section-header" style="margin-bottom: 4px;">
+          <div class="section-title-group">
+            <span class="section-title">🔥 热搜识别写入</span>
+            <span class="count-pill" id="hsModelSummaryPill">加载中...</span>
+          </div>
+          <div class="section-actions">
+            <button type="button" id="btnHsOpenDoc" class="btn-xs btn-outline" title="在新标签页打开目标腾讯文档">📄 打开表格</button>
+            <button type="button" id="btnHsToggleConfig" class="btn-xs btn-outline">⚙️ 模型配置</button>
+          </div>
+        </div>
+        <div class="hs-doc-hint" id="hsDocSummaryText" style="max-width: 100%;">目标表：默认热搜表</div>
+
+        <!-- 可折叠自定义模型与文档配置面板 -->
+        <div id="hsConfigDrawer" class="hs-config-drawer" style="display: none;">
+          <div class="notice-banner info" style="margin-bottom: 8px;">
+            <span>💡 已预填默认识图大模型与目标表格；任何人都可以在下方修改并保存自己的 API Key、模型或表格地址</span>
+          </div>
+
+          <div class="hs-config-group">
+            <div class="hs-config-group-title" style="display:flex;align-items:center;justify-content:space-between;">
+              <span>主视觉大模型（OpenAI 兼容接口）</span>
+              <div style="display:flex;align-items:center;gap:6px;">
+                <span id="hsPrimaryTestResult" class="hs-test-result"></span>
+                <button type="button" id="btnHsTestPrimary" class="btn-xs btn-outline">🧪 测试连接</button>
+              </div>
+            </div>
+            <div class="hs-config-grid">
+              <div class="hs-field">
+                <label class="hs-label">配置名称</label>
+                <input type="text" id="hsPrimaryName" class="ui-input" placeholder="如：Google Gemini 官方">
+              </div>
+              <div class="hs-field">
+                <label class="hs-label">模型名称</label>
+                <div class="form-row" style="gap: 4px;">
+                  <input type="text" id="hsPrimaryModel" class="ui-input flex-1" placeholder="如：gemini-3.6-flash">
+                  <button type="button" id="btnHsFetchPrimaryModels" class="btn-xs btn-outline" title="从接口拉取可用模型列表">🔄</button>
+                </div>
+                <select id="hsPrimaryModelSelect" class="ui-select" style="display: none; margin-top: 4px; width: 100%;"></select>
+              </div>
+              <div class="hs-field hs-field-full">
+                <label class="hs-label">API 请求地址 (Base URL)</label>
+                <input type="text" id="hsPrimaryBase" class="ui-input" placeholder="https://generativelanguage.googleapis.com/v1beta/openai">
+              </div>
+              <div class="hs-field hs-field-full">
+                <label class="hs-label">API Key</label>
+                <div class="form-row" style="gap: 4px;">
+                  <input type="password" id="hsPrimaryKey" class="ui-input flex-1" placeholder="输入主模型 API Key...">
+                  <button type="button" class="btn-xs btn-outline hs-toggle-eye" data-target="hsPrimaryKey" title="显示/隐藏 Key">👁</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="hs-config-group">
+            <div class="hs-config-group-title" style="display:flex;align-items:center;justify-content:space-between;">
+              <span>兜底视觉大模型（主模型失败时自动切换）</span>
+              <div style="display:flex;align-items:center;gap:6px;">
+                <span id="hsFallbackTestResult" class="hs-test-result"></span>
+                <button type="button" id="btnHsTestFallback" class="btn-xs btn-outline">🧪 测试连接</button>
+                <label class="checkbox-label" style="font-size: 11px;">
+                  <input type="checkbox" id="hsFallbackEnabled" checked>
+                  <span>启用兜底</span>
+                </label>
+              </div>
+            </div>
+            <div class="hs-config-grid" id="hsFallbackFields">
+              <div class="hs-field">
+                <label class="hs-label">配置名称</label>
+                <input type="text" id="hsFallbackName" class="ui-input" placeholder="如：阿里云百炼 DashScope">
+              </div>
+              <div class="hs-field">
+                <label class="hs-label">模型名称</label>
+                <input type="text" id="hsFallbackModel" class="ui-input" placeholder="如：qwen3-vl-plus">
+              </div>
+              <div class="hs-field hs-field-full">
+                <label class="hs-label">API 请求地址 (Base URL)</label>
+                <input type="text" id="hsFallbackBase" class="ui-input" placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1">
+              </div>
+              <div class="hs-field hs-field-full">
+                <label class="hs-label">API Key</label>
+                <div class="form-row" style="gap: 4px;">
+                  <input type="password" id="hsFallbackKey" class="ui-input flex-1" placeholder="输入兜底模型 API Key...">
+                  <button type="button" class="btn-xs btn-outline hs-toggle-eye" data-target="hsFallbackKey" title="显示/隐藏 Key">👁</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="hs-config-group">
+            <div class="hs-config-group-title">目标腾讯文档</div>
+            <div class="hs-config-grid">
+              <div class="hs-field hs-field-full">
+                <label class="hs-label">腾讯文档链接</label>
+                <input type="text" id="hsDocUrl" class="ui-input" placeholder="https://docs.qq.com/sheet/...">
+              </div>
+              <div class="hs-field hs-field-full">
+                <label class="hs-label">子表 Sheet ID（可选，留空自动取链接 tab= 参数或首个子表）</label>
+                <input type="text" id="hsSheetId" class="ui-input" placeholder="如：lqs80s">
+              </div>
+            </div>
+          </div>
+
+          <div class="hs-config-actions">
+            <button type="button" id="btnHsResetConfig" class="btn-xs btn-outline">↩️ 恢复默认配置</button>
+            <button type="button" id="btnHsSaveConfig" class="btn-xs btn-primary">💾 保存配置</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- 卡片 2：一体化多图粘贴 + 文字直写工作台 -->
+      <section class="card mb-10">
+        <div class="hs-composer" id="hsDropzone">
+          <input type="file" id="hsFileInput" accept="image/png,image/jpeg,image/webp" multiple style="display: none;">
+
+          <!-- 已暂存的多张截图预览条 -->
+          <div class="hs-pending-wrap" id="hsPendingWrap" style="display: none;">
+            <div class="hs-pending-bar">
+              <span>已添加 <b id="hsStagedCount" class="hs-num-accent">0</b> 张截图（可继续 <kbd>Ctrl+V</kbd> 粘贴或拖入）</span>
+              <button type="button" id="btnHsClearStaged" class="btn-text danger-text" title="清空暂存截图">🗑️ 清空图片</button>
+            </div>
+            <div class="hs-thumbs-list" id="hsThumbsList"></div>
+          </div>
+
+          <!-- 统一输入框（支持输文字、粘贴/拖入多图） -->
+          <textarea id="hsTextInput" rows="3" class="hs-composer-textarea" placeholder="在此输入主持人热搜通知 / #话题# 文字，或直接 Ctrl+V 粘贴多张截图、拖拽图片进来..."></textarea>
+
+          <!-- 底部统一操作栏：添加图片 + 商业勾选紧邻写入按钮 -->
+          <div class="hs-composer-footer">
+            <div class="hs-action-btns">
+              <button type="button" id="btnHsPickImages" class="btn-xs btn-outline" title="选择本地多张截图">📎 添加图片</button>
+              <label class="hs-business-pill" id="hsBusinessPill" title="勾选后 H 列写入「商业」，不勾选默认写入「热点」（对截图和文字均生效）">
+                <input type="checkbox" id="hsBusinessToggle">
+                <span>💼 商业</span>
+                <span class="hs-business-tag" id="hsBusinessTag">热点</span>
+              </label>
+              <label class="checkbox-label" style="font-size: 11px;" title="开启后识图完立即写入表格；关闭后可先预览修改再确认写表">
+                <input type="checkbox" id="hsAutoWriteToggle" checked>
+                <span>自动写入</span>
+              </label>
+            </div>
+            <button type="button" id="btnHsProcessText" class="btn-sm btn-primary" style="white-space: nowrap;">🚀 立即写入</button>
+          </div>
+        </div>
+
+        <div id="hsBatchProgressWrap" class="hs-batch-progress" style="display: none;">
+          <div class="hs-batch-progress-head">
+            <span id="hsBatchProgressText">⏳ 准备并发处理...</span>
+            <span id="hsBatchProgressPct">0%</span>
+          </div>
+          <div class="progress-track">
+            <div class="progress-bar" id="hsBatchProgressBar" style="width: 0%;"></div>
+          </div>
+        </div>
+      </section>
+        </div>
+
+        <div class="hs-col-right">
+      <!-- 卡片 3：处理进度与历史记录 -->
+      <section class="card">
+        <div class="section-header" style="margin-bottom: 6px;">
+          <div class="section-title-group">
+            <span class="section-title">📋 识别与写表记录</span>
+            <span class="count-pill" id="hsHistoryCount">0 条</span>
+          </div>
+          <div class="section-actions">
+            <button type="button" id="btnHsRetryAllFailed" class="btn-xs btn-outline" style="display: none;">🔁 重试失败</button>
+            <button type="button" id="btnHsClearHistory" class="btn-xs btn-outline danger-text">🧹 清空记录</button>
+          </div>
+        </div>
+        <div class="filter-chips" id="hsFilterChips" style="margin-bottom: 8px;">
+          <span class="filter-chip active" data-hs-filter="all">全部 (0)</span>
+          <span class="filter-chip" data-hs-filter="success">成功 (0)</span>
+          <span class="filter-chip" data-hs-filter="skipped">跳过 (0)</span>
+          <span class="filter-chip" data-hs-filter="error">失败 (0)</span>
+        </div>
+        <div class="list-scroll large-list" id="hsHistoryList" style="max-height: 280px;">
+          <div class="empty-placeholder">暂无热搜写入记录，上传、多选或粘贴截图即可自动识别写入</div>
+        </div>
+      </section>
+        </div>
+      </div>
+    </main>
+
     <!-- 面板 5：系统设置中心 (统一收拢全部功能开关与规则) -->
     <main id="panelSettings" class="tab-panel" style="display: none;">
       <!-- 卡片 1：全局发博与安全运行开关 -->
@@ -528,6 +740,17 @@
             </div>
             <label class="toggle-switch">
               <input type="checkbox" id="schedulePauseToggle">
+              <span class="slider"></span>
+            </label>
+          </div>
+
+          <div class="switch-row">
+            <div class="switch-label-group">
+              <span class="switch-title">🔓 临时放行同文案重发 (跳过防重锁)</span>
+              <span class="switch-desc">开启后允许跳过15分钟台账锁与12小时同文案拦截（仅建议核实未发后临时开启，用完请关闭）</span>
+            </div>
+            <label class="toggle-switch">
+              <input type="checkbox" id="allowDuplicateBypassToggle">
               <span class="slider"></span>
             </label>
           </div>
@@ -597,6 +820,23 @@
         </div>
 
         <div class="list-scroll large-list" id="aliasListContainer" style="max-height: 180px;"></div>
+      </section>
+
+      <!-- 卡片 5：全套配置备份与团队同步 -->
+      <section class="card" style="margin-top: 10px;">
+        <div class="section-header">
+          <span class="section-title">📦 配置备份与团队同步</span>
+          <span class="count-pill">JSON</span>
+        </div>
+        <div class="notice-banner info" style="margin-bottom: 8px;">
+          <span>💡 一键导出或导入文档卡槽、发布账号、别名映射、话题置顶与热搜大模型配置（不含发博记录与排程队列）</span>
+        </div>
+        <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+          <button type="button" id="btnExportAllConfig" class="btn-sm btn-outline">⬇️ 导出配置 JSON</button>
+          <button type="button" id="btnCopyAllConfig" class="btn-sm btn-outline">📋 复制配置</button>
+          <button type="button" id="btnImportAllConfig" class="btn-sm btn-primary">⬆️ 导入配置 JSON</button>
+          <input type="file" id="importAllConfigInput" accept="application/json,.json" style="display: none;">
+        </div>
       </section>
     </main>
 
@@ -757,6 +997,25 @@
       </div>
     </div>
 
+    <!-- 底部全局任务进度条与停止按钮 -->
+    <div class="bottom-global-controls">
+      <div class="global-progress-wrap" id="globalProgressWrap" style="display: none;">
+        <div class="global-progress-header">
+          <span class="global-progress-stage" id="globalProgressStage">⏳ 准备就绪</span>
+          <div class="global-progress-right">
+            <span class="global-progress-pct" id="globalProgressPct">0%</span>
+            <button type="button" class="btn-xs btn-outline global-jobs-toggle" id="btnToggleGlobalJobs" style="display: none;">▾ 明细</button>
+            <button type="button" class="btn-xs btn-outline global-jobs-toggle" id="btnCloseGlobalProgress" title="收起进度条" style="display: none;">✕</button>
+          </div>
+        </div>
+        <div class="progress-track">
+          <div class="progress-bar" id="globalProgressBar" style="width: 0%;"></div>
+        </div>
+        <div class="global-jobs-detail" id="globalJobsDetail" style="display: none;"></div>
+      </div>
+      <button id="btnGlobalStop" class="btn-global-stop bottom-global-stop" style="display:none;" title="立即停止当前正在执行的任务流水线">⏹ 停止任务</button>
+    </div>
+
     <!-- 底部可折叠日志视窗 -->
     <section class="card log-card collapsible" id="logSection">
       <div class="log-header" id="logHeaderToggle">
@@ -780,6 +1039,7 @@
     </footer>
   </div>
 
+  <div id="uiToastContainer" class="ui-toast-container" aria-live="polite"></div>
   <script src="popup.js"></script>
 </body>
 </html>

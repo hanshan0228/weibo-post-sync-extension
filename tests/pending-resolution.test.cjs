@@ -110,3 +110,16 @@ test('改期清理与发布认领共用串行队列，不互相覆盖', async ()
   assert.ok(claims['sched::t2'], '未被改期列表包含的认领锁必须保留');
   assert.ok(claims['post::x'], '并发认领锁不能被改期快照覆盖');
 });
+
+test('人工核实未发布解除阻断时同步释放对应15分钟发博锁，允许立即重试', async () => {
+  const lockKey = 'post::虚构账号::虚构正文';
+  const h = harness({
+    publishLedger: [{ ...base, id: 'a', resolvedAccount: '虚构账号' }],
+    __unwrittenReceipts__: [{ ...base, id: 'a', resolvedAccount: '虚构账号' }],
+    __publishClaims__: { [lockKey]: Date.now(), 'post::其他账号::其他正文': Date.now() },
+  });
+  const result = await h.send('RESOLVE_PENDING_SUBMISSION', { ledgerId: 'a' });
+  assert.equal(result.ok, true);
+  assert.equal(h.data.__publishClaims__[lockKey], undefined);
+  assert.ok(h.data.__publishClaims__['post::其他账号::其他正文'], '无关账号的发博锁必须保留');
+});

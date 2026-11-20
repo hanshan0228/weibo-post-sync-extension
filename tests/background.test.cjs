@@ -125,19 +125,19 @@ test('拦截重复发博时不得释放上一次仍有效的锁', async () => {
 test('已关闭的发博标签页会重开后继续发布', async () => {
   const h = harness();
   stubPipeline(h);
-  h.run(`let opens = 0;
-    findOrCreateTab = async () => ({ id: 1004325714 });`);
+  let opens = 0;
+  h.chrome.tabs.create = async (value) => {
+    opens += 1;
+    h.calls.push(['tab.create', value]);
+    return { id: opens === 1 ? 1004325714 : 77, ...value };
+  };
   h.chrome.tabs.get = async (id) => {
     if (id === 1004325714) throw new Error('No tab with id: 1004325714');
     return { id, url: 'https://ai-publish-platform.weibo.com/#/post', status: 'complete' };
   };
-  h.chrome.tabs.create = async (value) => {
-    h.calls.push(['tab.create', value]);
-    return { id: 77, ...value };
-  };
   const summary = await h.run(`startPipeline(${JSON.stringify({ dryRun: false, selectedTasks: [task] })})`);
   assert.equal(summary.published, 1);
-  assert.equal(h.calls.filter(([type]) => type === 'tab.create').length, 1);
+  assert.equal(opens, 2);
 });
 test('明确未提交的失败会释放内容锁，允许立刻重试同一文案', async () => {
   const h = harness();
@@ -356,6 +356,65 @@ test('已保存回执的文档行重试仅补写，不重新调用发布函数',
   const result = await h.run(`startPipeline(${JSON.stringify({ dryRun: false, selectedTasks: [task] })})`);
   assert.equal(result.writtenBack, 1);
 });
+test('注入超时且未发现提交标记时仍保留待核对与防重证据', async () => {
+  const h = harness(); stubPipeline(h);
+  h.run(`executeInTabDirect = async (_id, fn) => {
+    if (fn === directPostToWeiboPlatform) throw new Error('页面脚本执行超时 (120秒)');
+    if (fn === directCheckWeiboPlatformReady) return { ok: true, ready: true };
+    if (fn === directCopyPublishPageResult || fn === directRecoverPublishedWeiboUrl) return { ok: false };
+    return { submitted: false };
+  };`);
+  await assert.rejects(h.run(`startPipeline(${JSON.stringify({ dryRun: false, selectedTasks: [task] })})`));
+  assert.equal(h.data.publishLedger.length, 1);
+  assert.equal(h.data.publishLedger[0].submittedWithoutReceipt, true);
+  assert.ok(Object.keys(h.data.__publishClaims__).length);
+  await assert.rejects(h.run(`startPipeline(${JSON.stringify({ dryRun: false, selectedTasks: [task] })})`), /缺少回执/);
+});
+
+test('补写旧回执沿用账本编号并清除该回执待补写状态', async () => {
+  const receipt = { id: 'old_receipt', mode: '真实发布', docUrl: task.docUrl, targetCell: task.targetCell,
+    targetSheetId: task.targetSheetId, resolvedAccount: task.account, fullContent: task.content,
+    postUrl: 'https://weibo.com/123456/Abc123', writeBackOk: false };
+  const h = harness({ publishLedger: [receipt], __unwrittenReceipts__: [receipt] });
+  stubPipeline(h);
+  const result = await h.run(`startPipeline(${JSON.stringify({ dryRun: false, selectedTasks: [task] })})`);
+  assert.equal(result.writtenBack, 1);
+  assert.equal(h.data.publishLedger.length, 1);
+  assert.equal(h.data.publishLedger[0].id, receipt.id);
+  assert.equal(h.data.publishLedger[0].writeBackOk, true);
+  assert.equal(h.data.__unwrittenReceipts__.length, 0);
+});
+
+test('恢复无编号旧回执不得删除其他文档或子表的无编号证据', async () => {
+  const receipt = { mode: '真实发布', docUrl: task.docUrl, targetCell: task.targetCell,
+    targetSheetId: task.targetSheetId, resolvedAccount: task.account, fullContent: task.content,
+    postUrl: 'https://weibo.com/123456/Abc123', writeBackOk: false };
+  const otherDoc = { ...receipt, docUrl: 'https://docs.qq.com/sheet/OTHER' };
+  const otherSheet = { ...receipt, targetSheetId: 'other_sheet' };
+  const h = harness({ publishLedger: [receipt, otherDoc, otherSheet], __unwrittenReceipts__: [receipt, otherDoc, otherSheet] });
+  stubPipeline(h);
+  await h.run(`startPipeline(${JSON.stringify({ dryRun: false, selectedTasks: [task] })})`);
+  assert.equal(h.data.publishLedger.length, 3);
+  assert.equal(h.data.__unwrittenReceipts__.length, 2);
+  for (const other of [otherDoc, otherSheet]) {
+    assert.ok(h.data.publishLedger.some(item => item.docUrl === other.docUrl && item.targetSheetId === other.targetSheetId && !item.writeBackOk));
+    assert.ok(h.data.__unwrittenReceipts__.some(item => item.docUrl === other.docUrl && item.targetSheetId === other.targetSheetId));
+  }
+});
+
+test('新增排程裁剪完成历史时保留全部待核对与待补写记录', async () => {
+  const now = Date.now();
+  const done = Array.from({ length: 301 }, (_, i) => ({ id: `done_${i}`, status: 'done',
+    completedAt: now, fireAtTimestamp: now - i, writeBackOk: true }));
+  const unresolved = { id: 'unresolved', status: 'done', submittedWithoutReceipt: true, fireAtTimestamp: now - 1000 };
+  const unwritten = { id: 'unwritten', status: 'done', postUrl: 'https://weibo.com/123/Old', writeBackOk: false, fireAtTimestamp: now - 1001 };
+  const h = harness({ scheduledTasks: [...done, unresolved, unwritten] });
+  await h.run(`handleAddScheduleTasks([{ id: 'new', content: 'Mock', fireAtTimestamp: ${now + 60000} }])`);
+  assert.ok(h.data.scheduledTasks.some(item => item.id === unresolved.id));
+  assert.ok(h.data.scheduledTasks.some(item => item.id === unwritten.id));
+  assert.equal(h.data.scheduledTasks.length, 303);
+});
+
 test('缺失firingAt的旧僵死任务可被识别，不永久卡在发布中', async () => {
   const h = harness({ scheduledTasks: [{ id:'stale', status:'firing' }] });
   await h.run('sweepAndRunDueSchedules()');
@@ -658,8 +717,8 @@ test('静默后台标签页发博挂载防降速并在结束后卸载debugger', 
   };
   const summary = await h.run(`startPipeline(${JSON.stringify({ dryRun: true, silentMode: true, selectedTasks: [task] })})`);
   assert.equal(summary.rehearsed, 1);
-  assert.ok(debuggerCalls.some((c) => c[0] === 'attach' && c[1] === 7), '静默发博前应挂载防降速debugger');
-  assert.ok(debuggerCalls.some((c) => c[0] === 'detach' && c[1] === 7), '静默发博结束后应卸载debugger');
+  assert.ok(debuggerCalls.some((c) => c[0] === 'attach' && c[1] === 123), '静默发博前应挂载防降速debugger');
+  assert.ok(debuggerCalls.some((c) => c[0] === 'detach' && c[1] === 123), '静默发博结束后应卸载debugger');
 });
 
 test('executeInTabDirect脚本执行挂起超时时立即报错退出不永久卡死', async () => {
@@ -761,8 +820,22 @@ test('handleRetryWriteBack仅执行文档补写并同步更新scheduledTasks与p
   assert.equal(postCalled, false);
   assert.equal(h.data.scheduledTasks[0].writeBackOk, true);
   assert.equal(h.data.scheduledTasks[0].writeBackError, '');
-  assert.equal(h.data.publishLedger[0].writeBackOk, false);
+  assert.equal(h.data.publishLedger[0].writeBackOk, true);
   assert.equal(h.data.__unwrittenReceipts__.length, 0);
+});
+
+test('按账本补写通过scheduleId同步排程且不修改其他子表', async () => {
+  const base = { docUrl: 'https://docs.qq.com/sheet/mock', targetCell: 'E8', targetSheetId: 'sheet-a',
+    postUrl: 'https://weibo.com/123/RetryLinked', writeBackOk: false };
+  const h = harness({ scheduledTasks: [{ ...base, id: 'sched_linked' }, { ...base, id: 'other', targetSheetId: 'sheet-b' }],
+    publishLedger: [{ ...base, id: 'led_linked', scheduleId: 'sched_linked' }, { ...base, id: 'led_other', targetSheetId: 'sheet-b' }] });
+  h.run(`findOrCreateTab = async () => ({id: 77}); waitForTabLoaded = async () => {}; executeInTabDirect = async () => ({ok: true});`);
+  const result = await h.run(`handleRetryWriteBack(${JSON.stringify({ ...base, ledgerId: 'led_linked' })})`);
+  assert.equal(result.ok, true);
+  assert.equal(h.data.scheduledTasks[0].writeBackOk, true);
+  assert.equal(h.data.publishLedger[0].writeBackOk, true);
+  assert.equal(h.data.scheduledTasks[1].writeBackOk, false);
+  assert.equal(h.data.publishLedger[1].writeBackOk, false);
 });
 
 test('补写仅清除同文档同子表的隔离回执', async () => {
@@ -969,6 +1042,65 @@ test('发博页残留上一次结果弹窗时自动刷新并重试一次而不�
   assert.equal(h.data.publishLedger[0].postUrl, 'https://weibo.com/123456/RetryOk');
 });
 
+test('复用发稿页出现账号禁用或未找到状态时自动重载发博页并重试一次', async () => {
+  const calls = [];
+  let reloadedCount = 0;
+  const h = harness();
+  stubPipeline(h);
+  h.context.calls = calls;
+  h.context.chrome.tabs.reload = async () => {
+    reloadedCount++;
+  };
+  h.run(`executeInTabDirect = async (id, func, args) => {
+    if (func === directCheckWeiboPlatformReady) return { ok: true, ready: true };
+    if (func === directPostToWeiboPlatform) {
+      calls.push(1);
+      if (calls.length === 1) {
+        return {
+          ok: false,
+          submitted: false,
+          error: '未在发稿中台各分类下找到目标账号 [新浪热点]（已定位但未能勾选(新浪热点:禁用(clsDisabled,checked=false))），已阻断发送以防发错账号',
+        };
+      }
+      return { ok: true, postUrl: 'https://weibo.com/123456/ReloadRetryOk', submitted: true };
+    }
+    return { ok: true };
+  };`);
+
+  const summary = await h.run(`startPipeline(${JSON.stringify({
+    docs: [], dryRun: false, silentMode: true,
+    selectedTasks: [{ docName: '转发解析', row: '1', targetCell: '-', account: '新浪热点', content: '重载重试正文', imgUrls: [] }],
+  })})`);
+  assert.equal(reloadedCount, 1);
+  assert.equal(calls.length, 2);
+  assert.equal(summary.published, 1);
+  assert.equal(h.data.publishLedger[0].postUrl, 'https://weibo.com/123456/ReloadRetryOk');
+});
+
+test('scanDocTasks自动抓取文档顶部标题并同步为任务docName', async () => {
+  const h = harness();
+  stubPipeline(h);
+  h.run(`executeInTabDirect = async (id, func) => {
+    if (func === directExtractDocTasks) {
+      return {
+        ok: true,
+        docTitle: '蒙牛 #祖传的喝奶说法怎么越听越烧心#11月20日18点',
+        tasks: [{ row: 2, account: '新浪热点', content: '测试内容', targetCell: 'E2', targetSheetId: '1qv4tm', imgUrls: [] }],
+      };
+    }
+    return { ok: true };
+  };`);
+
+  const docTitles = {};
+  h.context.__docTitlesOut = docTitles;
+  const tasks = await h.run(`scanDocTasks(${JSON.stringify({
+    docs: [{ id: 'slot_1', name: '文档 1 (主表)', manualName: false, url: 'https://docs.qq.com/sheet/DSUZrVkNrdFFYb1h5?tab=1qv4tm', linkCol: 'E' }],
+  })}, __docTitlesOut)`);
+
+  assert.equal(docTitles.slot_1, '蒙牛 #祖传的喝奶说法怎么越听越烧心#11月20日18点');
+  assert.equal(tasks[0].docName, '蒙牛 #祖传的喝奶说法怎么越听越烧心#11月20日18点');
+});
+
 test('合并群发批次中任一账号内容锁被占用时立即释放已占锁并阻断调用发布函数', async () => {
   const postCalls = [];
   const h = harness({
@@ -1048,36 +1180,53 @@ test('合并群发因中台缺少账号阻断时撤销待确认台账且不误�
   assert.equal(h.data.publishLedger[0].postUrl, 'https://weibo.com/100001/OK');
 });
 
-test('静默模式新建的发博标签页在流水线结束后自动关闭，复用已有标签页时不关闭', async () => {
+test('静默模式复用插件专属后台托管标签页，前台模式复用专属托管前台标签页，均不碰用户已打开的发稿后台标签页', async () => {
+  const parserTask = { ...task, docUrl: '', targetCell: '-' };
+
+  // 1. 静默模式首次新建后台托管标签 88，第二次直接复用并重载 88，不重复弹新标签、不关闭、不碰用户标签 99
   const h1 = harness();
-  h1.run('var actualFindOrCreateTab = findOrCreateTab;');
   stubPipeline(h1);
-  h1.run('findOrCreateTab = actualFindOrCreateTab;');
-  h1.chrome.tabs.query = async () => [];
+  let silentCreated = 0;
+  h1.chrome.tabs.query = async () => [{ id: 99, url: 'https://ai-publish-platform.weibo.com/#/post', status: 'complete' }];
   h1.chrome.tabs.create = async (value) => {
+    silentCreated += 1;
     h1.calls.push(['tab.create', value]);
     return { id: 88, ...value };
   };
   h1.chrome.tabs.get = async (id) => ({ id, url: 'https://ai-publish-platform.weibo.com/#/post', status: 'complete' });
+  h1.chrome.tabs.reload = async (id) => {
+    h1.calls.push(['tab.reload', id]);
+  };
   h1.chrome.tabs.remove = async (id) => {
     h1.calls.push(['tab.remove', id]);
   };
-  const parserTask = { ...task, docUrl: '', targetCell: '-' };
   await h1.run(`startPipeline(${JSON.stringify({ docs: [], dryRun: true, silentMode: true, selectedTasks: [parserTask] })})`);
+  await h1.run(`startPipeline(${JSON.stringify({ docs: [], dryRun: true, silentMode: true, selectedTasks: [parserTask] })})`);
+  assert.equal(silentCreated, 1);
   assert.equal(h1.calls.filter(([type, arg]) => type === 'tab.create' && arg.active === false).length, 1);
-  assert.deepEqual(h1.calls.filter(([type]) => type === 'tab.remove'), [['tab.remove', 88]]);
+  assert.equal(h1.calls.filter(([type, id]) => type === 'tab.reload' && id === 88).length, 1);
+  assert.deepEqual(h1.calls.filter(([type]) => type === 'tab.remove'), []);
+  assert.equal(h1.calls.filter(([type, id]) => type === 'tab.update' && id === 99).length, 0);
 
+  // 2. 前台可见模式首次新建专属托管标签 188，第二次只复用并重载 188，始终不碰用户标签 99
   const h2 = harness();
-  h2.run('var actualFindOrCreateTab = findOrCreateTab;');
   stubPipeline(h2);
-  h2.run('findOrCreateTab = actualFindOrCreateTab;');
+  let createdCount = 0;
   h2.chrome.tabs.query = async () => [{ id: 99, url: 'https://ai-publish-platform.weibo.com/#/post', status: 'complete' }];
-  h2.chrome.tabs.get = async (id) => ({ id, url: 'https://ai-publish-platform.weibo.com/#/post', status: 'complete' });
-  h2.chrome.tabs.remove = async (id) => {
-    h2.calls.push(['tab.remove', id]);
+  h2.chrome.tabs.create = async (value) => {
+    createdCount += 1;
+    h2.calls.push(['tab.create', value]);
+    return { id: 188, ...value };
   };
-  await h2.run(`startPipeline(${JSON.stringify({ docs: [], dryRun: true, silentMode: true, selectedTasks: [parserTask] })})`);
-  assert.equal(h2.calls.filter(([type]) => type === 'tab.remove').length, 0);
+  h2.chrome.tabs.get = async (id) => ({ id, url: 'https://ai-publish-platform.weibo.com/#/post', status: 'complete' });
+  h2.chrome.tabs.reload = async (id) => {
+    h2.calls.push(['tab.reload', id]);
+  };
+  await h2.run(`startPipeline(${JSON.stringify({ docs: [], dryRun: true, silentMode: false, selectedTasks: [parserTask] })})`);
+  await h2.run(`startPipeline(${JSON.stringify({ docs: [], dryRun: true, silentMode: false, selectedTasks: [parserTask] })})`);
+  assert.equal(createdCount, 1);
+  assert.equal(h2.calls.filter(([type, id]) => type === 'tab.reload' && id === 188).length, 1);
+  assert.equal(h2.calls.filter(([type, id]) => type === 'tab.update' && id === 99).length, 0);
 });
 
 test('RETRY_TOPIC_PIN_TASK 重置失败或超时的子话题状态并触发队列重新处理', async () => {
@@ -1116,8 +1265,8 @@ test('initRefererRules 同时注册 docs.qq.com 与扩展后台直连微博 Refe
   };
   await h.run('initRefererRules()');
   assert.ok(lastRulesPayload);
-  assert.deepEqual(Array.from(lastRulesPayload.removeRuleIds), [1001, 1002, 1003, 1004, 1005, 1006, 1007]);
-  assert.equal(lastRulesPayload.addRules.length, 7);
+  assert.deepEqual(Array.from(lastRulesPayload.removeRuleIds), [1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008]);
+  assert.equal(lastRulesPayload.addRules.length, 8);
   const mWeiboReferer = lastRulesPayload.addRules.find((r) => r.id === 1004);
   const mWeiboOrigin = lastRulesPayload.addRules.find((r) => r.id === 1007);
   assert.equal(mWeiboReferer.action.requestHeaders[0].value, 'https://m.s.weibo.com/');
@@ -1125,6 +1274,372 @@ test('initRefererRules 同时注册 docs.qq.com 与扩展后台直连微博 Refe
   assert.equal(mWeiboOrigin.action.requestHeaders[0].value, 'https://m.s.weibo.com');
   assert.deepEqual(Array.from(mWeiboOrigin.condition.requestMethods), ['post']);
 });
+
+test('并发调用 startPipeline 时同步排他占位阻断重复启动', async () => {
+  const h = harness();
+  stubPipeline(h);
+  const task = { row: '1', targetCell: '-', account: '虚构主号', content: '并发占位测试正文' };
+  const p1 = h.run(`startPipeline(${JSON.stringify({ dryRun: true, selectedTasks: [task] })})`);
+  const p2 = h.run(`startPipeline(${JSON.stringify({ dryRun: true, selectedTasks: [task] })})`);
+  const results = await Promise.allSettled([p1, p2]);
+  const fulfilled = results.filter((r) => r.status === 'fulfilled');
+  const rejected = results.filter((r) => r.status === 'rejected');
+  assert.equal(fulfilled.length, 1);
+  assert.equal(rejected.length, 1);
+  assert.match(rejected[0].reason.message, /已有流水线正在执行中/);
+});
+
+test('无 targetCell 的任务解析/本地任务命中 12 小时台账防重时阻断重复发博', async () => {
+  const h = harness({
+    publishLedger: [{
+      id: 'led_dup_1',
+      mode: '真实发布',
+      resolvedAccount: '虚构主号',
+      fullContent: '任务解析防重测试正文',
+      postUrl: 'https://weibo.com/123456/AlreadySent',
+      timestamp: Date.now() - 10 * 60 * 1000,
+    }],
+    __publishClaims__: {},
+  });
+  let postCalled = 0;
+  stubPipeline(h, {
+    onDirectPost: () => {
+      postCalled += 1;
+      return { ok: true, postUrl: 'https://weibo.com/123456/Dup' };
+    },
+  });
+  const task = { row: '1', targetCell: '-', account: '虚构主号', content: '任务解析防重测试正文' };
+  await assert.rejects(
+    h.run(`startPipeline(${JSON.stringify({ dryRun: false, selectedTasks: [task] })})`),
+    /已拦截重复发博.*12小时内已发布过相同文案/
+  );
+  assert.equal(postCalled, 0);
+});
+
+test('定时维护清理：发博记录保留3天（保留未回写异常），扫描缓存超24小时自动清空', async () => {
+  const now = 1_700_000_000_000;
+  const fourDaysAgo = now - 4 * 24 * 60 * 60 * 1000;
+  const twoDaysAgo = now - 2 * 24 * 60 * 60 * 1000;
+  const h = harness({
+    publishLedger: [
+      { id: 'old_ok', mode: '真实发布', postUrl: 'https://weibo.com/1/1', writeBackOk: true, timestamp: fourDaysAgo },
+      { id: 'old_dry', mode: '安全演练', writeBackOk: false, timestamp: fourDaysAgo },
+      { id: 'old_unwritten', mode: '真实发布', postUrl: 'https://weibo.com/1/2', writeBackOk: false, timestamp: fourDaysAgo },
+      { id: 'recent_ok', mode: '真实发布', postUrl: 'https://weibo.com/1/3', writeBackOk: true, timestamp: twoDaysAgo },
+    ],
+    cachedScannedTasks: [{ row: 2, content: '旧扫描缓存' }],
+    cachedScannedAt: now - 25 * 60 * 60 * 1000,
+  });
+
+  const res = await h.run(`cleanupMaintenanceStorage(${now})`);
+  assert.equal(res.ledgerRemoved, 2);
+  assert.equal(res.cacheCleared, 1);
+  assert.deepEqual(h.data.publishLedger.map((i) => i.id), ['old_unwritten', 'recent_ok']);
+  assert.deepEqual(h.data.cachedScannedTasks, []);
+  assert.equal(h.data.cachedScannedAt, 0);
+});
+
+test('findOrCreateTab 区分同路径不同 tab 查询参数，避免多子表复用错标签页', async () => {
+  const h = harness();
+  h.chrome.tabs.query = async () => [
+    { id: 91, url: 'https://docs.qq.com/sheet/ABC?tab=one', status: 'complete' },
+  ];
+  const tabTwo = await h.run(`findOrCreateTab('https://docs.qq.com/sheet/ABC', 'https://docs.qq.com/sheet/ABC?tab=two')`);
+  assert.equal(tabTwo.id, 123);
+  const tabOne = await h.run(`findOrCreateTab('https://docs.qq.com/sheet/ABC', 'https://docs.qq.com/sheet/ABC?tab=one')`);
+  assert.equal(tabOne.id, 91);
+});
+
+test('多账号批次兜底从结果页恢复链接时按昵称映射，不把首条链接错配给首账号', async () => {
+  const h = harness();
+  stubPipeline(h);
+  h.run(`findOrCreateTab = async () => ({ id: 77, url: 'https://docs.qq.com/sheet/mock' });`);
+  const written = [];
+  h.run(`const prevExec = executeInTabDirect; executeInTabDirect = async (id, fn, args, ...rest) => {
+    if (fn === directPostToWeiboPlatform) return { ok: false, submitted: true, error: '超时' };
+    if (fn === directCopyPublishPageResult) {
+      return {
+        ok: true,
+        postUrl: 'https://weibo.com/200/UrlB',
+        postEntries: [
+          { nick: '账号B', normNick: '账号b', url: 'https://weibo.com/200/UrlB' },
+          { nick: '账号A', normNick: '账号a', url: 'https://weibo.com/100/UrlA' },
+        ],
+        source: 'publish_model',
+      };
+    }
+    if (fn === directWriteCellToDoc) {
+      return { ok: true, cell: args[0], value: args[1] };
+    }
+    return prevExec(id, fn, args, ...rest);
+  };`);
+  const origWrite = h.run;
+  h.run(`const execBefore = executeInTabDirect; executeInTabDirect = async (id, fn, args, ...rest) => {
+    const res = await execBefore(id, fn, args, ...rest);
+    if (fn === directWriteCellToDoc) globalThis.__testWrites = [...(globalThis.__testWrites || []), { cell: args[0], url: args[1] }];
+    return res;
+  };`);
+  const t1 = { ...task, row: 2, targetCell: 'E2', account: '账号A', content: '多号恢复测试文案' };
+  const t2 = { ...task, row: 3, targetCell: 'E3', account: '账号B', content: '多号恢复测试文案' };
+  const res = await h.run(`startPipeline(${JSON.stringify({ dryRun: false, silentMode: true, selectedTasks: [t1, t2] })})`);
+  assert.equal(res.published, 2);
+  const writes = await h.run('globalThis.__testWrites');
+  assert.deepEqual(JSON.parse(JSON.stringify(writes)), [
+    { cell: 'E2', url: 'https://weibo.com/100/UrlA' },
+    { cell: 'E3', url: 'https://weibo.com/200/UrlB' },
+  ]);
+});
+
+test('放行开关 allowDuplicateBypass 可跳过15分钟台账锁与12小时同文案拦截，CLEAR_PUBLISH_CLAIMS 可清锁', async () => {
+  const lockKey = 'post::虚构主号::重复放行测试正文';
+  const h = harness({
+    allowDuplicateBypass: true,
+    __publishClaims__: { [lockKey]: Date.now() },
+    publishLedger: [{
+      id: 'dup_1',
+      mode: '真实发布',
+      resolvedAccount: '虚构主号',
+      fullContent: '重复放行测试正文',
+      postUrl: 'https://weibo.com/123456/Old',
+      timestamp: Date.now(),
+    }],
+  });
+  let postCount = 0;
+  stubPipeline(h, { ok: true, postUrl: 'https://weibo.com/123456/NewBypass' });
+  h.run(`const prevExec = executeInTabDirect; executeInTabDirect = async (id, fn, ...rest) => {
+    if (fn === directPostToWeiboPlatform) globalThis.__bypassPosts = (globalThis.__bypassPosts || 0) + 1;
+    return prevExec(id, fn, ...rest);
+  };`);
+  const parserTask = { row: '1', targetCell: '-', account: '虚构主号', content: '重复放行测试正文' };
+  const res = await h.run(`startPipeline(${JSON.stringify({ dryRun: false, silentMode: true, selectedTasks: [parserTask] })})`);
+  postCount = await h.run('globalThis.__bypassPosts || 0');
+  assert.equal(res.published, 1);
+  assert.equal(postCount, 1);
+
+  const cleared = await h.send({ action: 'CLEAR_PUBLISH_CLAIMS' });
+  assert.equal(cleared.ok, true);
+  assert.equal(cleared.cleared, 1);
+  assert.deepEqual(h.data.__publishClaims__, {});
+});
+
+test('scanDocTasks 复用已打开文档页时强制 bypassCache 刷新并等待运行时就绪，避免读取旧缓存', async () => {
+  const h = harness();
+  h.run(`
+    globalThis.__reloads = [];
+    globalThis.__waits = [];
+    globalThis.__extractCount = 0;
+    chrome.tabs.reload = async (id, opts) => { globalThis.__reloads.push({ id, opts }); };
+    findOrCreateTab = async () => ({ id: 88, url: 'https://docs.qq.com/sheet/MOCK?tab=t1', status: 'complete' });
+    waitForTabLoaded = async (id, timeout, expectNav) => {
+      globalThis.__waits.push({ id, timeout, expectNav });
+      return { id, url: 'https://docs.qq.com/sheet/MOCK?tab=t1', status: 'complete' };
+    };
+    executeInTabDirect = async (_id, fn) => {
+      if (fn === directExtractDocTasks) {
+        globalThis.__extractCount += 1;
+        if (globalThis.__extractCount === 1) {
+          return { ok: false, error: '腾讯文档表格运行时尚未就绪，已阻断页面文本猜测，请等表格加载完成后再扫描' };
+        }
+        return {
+          ok: true,
+          docTitle: '更新后的文档',
+          tasks: [{ row: 2, targetCell: 'E2', account: '测试账号', content: '修改后的最新正文', targetSheetId: 't1' }],
+        };
+      }
+      return { ok: true };
+    };
+  `);
+  const tasks = await h.run(`scanDocTasks({ docs: [{ id: 'd1', name: '测试表', url: 'https://docs.qq.com/sheet/MOCK?tab=t1', linkCol: 'E' }] })`);
+  assert.equal(tasks.length, 1);
+  assert.equal(tasks[0].content, '修改后的最新正文');
+  assert.deepEqual(JSON.parse(JSON.stringify(h.run('globalThis.__reloads'))), [{ id: 88, opts: { bypassCache: true } }]);
+  assert.equal(h.run('globalThis.__waits[0].expectNav'), true);
+  assert.equal(h.run('globalThis.__extractCount'), 2);
+});
+
+test('scanDocTasks 前台激活的腾讯文档不原地刷新，改用临时后台页扫描并自动关闭', async () => {
+  const h = harness();
+  h.run(`
+    globalThis.__reloads = [];
+    globalThis.__removed = [];
+    globalThis.__usedTabIds = [];
+    chrome.tabs.reload = async (id, opts) => { globalThis.__reloads.push({ id, opts }); };
+    chrome.tabs.remove = async (id) => { globalThis.__removed.push(id); };
+    findOrCreateTab = async () => ({ id: 88, active: true, url: 'https://docs.qq.com/sheet/MOCK?tab=t1', status: 'complete' });
+    waitForTabLoaded = async (id) => ({ id, url: 'https://docs.qq.com/sheet/MOCK?tab=t1', status: 'complete' });
+    executeInTabDirect = async (id, fn) => {
+      if (fn === directExtractDocTasks) {
+        globalThis.__usedTabIds.push(id);
+        return {
+          ok: true,
+          docTitle: '前台文档',
+          tasks: [{ row: 2, targetCell: 'E2', account: '测试账号', content: '后台临时页最新正文', targetSheetId: 't1' }],
+        };
+      }
+      return { ok: true };
+    };
+  `);
+  const tasks = await h.run(`scanDocTasks({ docs: [{ id: 'd1', name: '测试表', url: 'https://docs.qq.com/sheet/MOCK?tab=t1', linkCol: 'E' }] })`);
+  assert.equal(tasks.length, 1);
+  assert.equal(tasks[0].content, '后台临时页最新正文');
+  assert.equal(h.run('globalThis.__reloads.length'), 0);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.run('globalThis.__usedTabIds'))), [123]);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.run('globalThis.__removed'))), [123]);
+});
+
+test('scanDocTasks 钉钉文档优先免刷新直拉接口，失败时才 bypassCache 刷新重试', async () => {
+  const h = harness();
+  h.run(`
+    globalThis.__reloads = [];
+    globalThis.__dtCalls = 0;
+    chrome.tabs.reload = async (id, opts) => { globalThis.__reloads.push({ id, opts }); };
+    findOrCreateTab = async () => ({ id: 99, active: false, url: 'https://alidocs.dingtalk.com/i/nodes/MOCK', status: 'complete' });
+    waitForTabLoaded = async (id) => ({ id, url: 'https://alidocs.dingtalk.com/i/nodes/MOCK', status: 'complete' });
+    scanDingTalkDocTab = async () => {
+      globalThis.__dtCalls += 1;
+      if (globalThis.__dtCalls === 1) {
+        return { ok: true, docTitle: '钉钉表', tasks: [{ row: 2, targetCell: 'E2', account: '测试账号', content: '直拉最新' }] };
+      }
+      if (globalThis.__dtCalls === 2) {
+        return { ok: false, error: '临时拉取失败' };
+      }
+      return { ok: true, docTitle: '钉钉表', tasks: [{ row: 2, targetCell: 'E2', account: '测试账号', content: '刷新后最新' }] };
+    };
+  `);
+  const first = await h.run(`scanDocTasks({ docs: [{ id: 'd1', name: '钉钉表', url: 'https://alidocs.dingtalk.com/i/nodes/MOCK', linkCol: 'E' }] })`);
+  assert.equal(first[0].content, '直拉最新');
+  assert.equal(h.run('globalThis.__reloads.length'), 0);
+
+  const second = await h.run(`scanDocTasks({ docs: [{ id: 'd1', name: '钉钉表', url: 'https://alidocs.dingtalk.com/i/nodes/MOCK', linkCol: 'E' }] })`);
+  assert.equal(second[0].content, '刷新后最新');
+  assert.deepEqual(JSON.parse(JSON.stringify(h.run('globalThis.__reloads'))), [{ id: 99, opts: { bypassCache: true } }]);
+});
+
+test('getOrCreateManagedSilentWeiboTab 复用同一后台托管标签页且不激活前台，关闭后可自动重建', async () => {
+  const h = harness();
+  h.run(`
+    globalThis.__tabCreateCount = 0;
+    globalThis.__tabExists = true;
+    globalThis.__tabUpdates = [];
+    globalThis.__tabReloads = [];
+    chrome.tabs.create = async (opts) => {
+      globalThis.__tabCreateCount += 1;
+      globalThis.__tabExists = true;
+      return { id: 300 + globalThis.__tabCreateCount, ...opts };
+    };
+    chrome.tabs.get = async (id) => {
+      if (!globalThis.__tabExists) throw new Error('No tab with id: ' + id);
+      return { id, url: 'https://ai-publish-platform.weibo.com/#/post', status: 'complete', windowId: 1 };
+    };
+    chrome.tabs.update = async (id, opts) => {
+      globalThis.__tabUpdates.push({ id, opts });
+      return { id, ...opts };
+    };
+    chrome.tabs.reload = async (id) => { globalThis.__tabReloads.push(id); };
+  `);
+
+  const t1 = await h.run(`getOrCreateManagedSilentWeiboTab('https://ai-publish-platform.weibo.com/#/post')`);
+  assert.equal(t1.id, 301);
+  assert.equal(t1.active, false);
+  assert.equal(h.data.__managedSilentWeiboTabId__, 301);
+
+  const t2 = await h.run(`getOrCreateManagedSilentWeiboTab('https://ai-publish-platform.weibo.com/#/post')`);
+  assert.equal(t2.id, 301);
+  assert.equal(h.run('globalThis.__tabCreateCount'), 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.run('globalThis.__tabUpdates'))), [{ id: 301, opts: { url: 'https://ai-publish-platform.weibo.com/#/post' } }]);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.run('globalThis.__tabReloads'))), [301]);
+
+  h.run('globalThis.__tabExists = false;');
+  const t3 = await h.run(`getOrCreateManagedSilentWeiboTab('https://ai-publish-platform.weibo.com/#/post')`);
+  assert.equal(t3.id, 302);
+  assert.equal(t3.active, false);
+  assert.equal(h.data.__managedSilentWeiboTabId__, 302);
+});
+
+test('钉钉多子表联合扫描且列打分不被账号ID/原文链接干扰', async () => {
+  const h = harness();
+  const workbook = {
+    sheetsMeta: [
+      { id: 's_op', title: '运营文案' },
+      { id: 's_res', title: '资源包文案' },
+      { id: 's_media', title: '媒介' },
+    ],
+    content: {
+      s_op: {
+        rows: [
+          [0, 0, [[0, { value: '账号ID' }], [1, { value: '账号名称' }], [2, { value: '文案' }], [3, { value: '原文链接' }], [4, { value: '微博链接' }]]],
+          [1, 0, [[0, { value: '10001' }], [1, { value: '主号A' }], [2, { value: '运营文案正文' }], [3, { value: 'https://example.com/ref' }]]],
+        ],
+      },
+      s_res: {
+        rows: [
+          [0, 0, [[0, { value: '账号名称' }], [1, { value: '文案' }], [2, { value: '链接' }]]],
+          [1, 0, [[0, { value: '资源号B' }], [1, { value: '资源包正文' }]]],
+        ],
+      },
+      s_media: {
+        rows: [
+          [0, 0, [[0, { value: '账号名称' }], [1, { value: '文案' }], [2, { value: '链接' }]]],
+          [1, 0, [[0, { value: '媒介号C' }], [1, { value: '不应混入的正文' }]]],
+        ],
+      },
+    },
+  };
+  const payload = { data: { documentContent: { checkpoint: { content: JSON.stringify(workbook) } } } };
+  const res = await h.run(`parseDingTalkDocumentPayload(${JSON.stringify(payload)})`);
+  assert.equal(res.ok, true);
+  assert.equal(res.tasks.length, 2);
+  assert.equal(res.tasks[0].account, '主号A');
+  assert.equal(res.tasks[0].targetCell, 'E2');
+  assert.equal(res.tasks[0].targetSheetId, 's_op');
+  assert.equal(res.tasks[1].account, '资源号B');
+  assert.equal(res.tasks[1].targetCell, 'C2');
+  assert.equal(res.tasks[1].targetSheetId, 's_res');
+});
+
+test('钉钉预览图走任意已打开钉钉标签页同源兜底且注册Referer规则', async () => {
+  const h = harness();
+  h.run(`
+    globalThis.__capturedRules = null;
+    chrome.declarativeNetRequest = {
+      updateDynamicRules: async (arg) => { globalThis.__capturedRules = arg; }
+    };
+    initRefererRules();
+    chrome.tabs.query = async () => [{ id: 77, url: 'https://alidocs.dingtalk.com/i/nodes/OTHER_DOC', status: 'complete' }];
+    downloadImagesViaDocTab = async (tabId, docUrl, urls) => {
+      return tabId === 77 ? [{ url: urls[0], dataUrl: 'data:image/png;base64,MOCKDATA' }] : [];
+    };
+  `);
+  const rules = h.run('globalThis.__capturedRules');
+  assert.equal(rules.addRules.some((r) => r.id === 1008 && r.condition.urlFilter === '||alidocs.dingtalk.com/'), true);
+
+  const imgRes = await h.run(`handleFetchPreviewImage('https://alidocs.dingtalk.com/core/api/resources/img/abc', 'https://alidocs.dingtalk.com/i/nodes/TARGET_DOC')`);
+  assert.equal(imgRes.dataUrl, 'data:image/png;base64,MOCKDATA');
+});
+
+test('钉钉含团队列时默认只保留新浪热点团队（兼容合并单元格延续）', async () => {
+  const h = harness();
+  const workbook = {
+    sheetsMeta: [{ id: 's1', title: '运营文案' }],
+    content: {
+      s1: {
+        rows: [
+          [0, 0, [[0, { value: '团队' }], [1, { value: '账号名称' }], [2, { value: '文案' }], [3, { value: '链接' }]]],
+          [1, 0, [[0, { value: '新浪新闻' }], [1, { value: '新闻号' }], [2, { value: '新闻团队文案' }]]],
+          [2, 0, [[0, { value: '新浪热点' }], [1, { value: '热点号1' }], [2, { value: '热点团队文案1' }]]],
+          [3, 0, [[1, { value: '热点号2' }], [2, { value: '热点团队延续行文案2' }]]],
+          [4, 0, [[0, { value: '头条新闻' }], [1, { value: '头条号' }], [2, { value: '头条团队文案' }]]],
+        ],
+      },
+    },
+  };
+  const payload = { data: { documentContent: { checkpoint: { content: JSON.stringify(workbook) } } } };
+  const res = await h.run(`parseDingTalkDocumentPayload(${JSON.stringify(payload)})`);
+  assert.equal(res.ok, true);
+  assert.equal(res.tasks.length, 2);
+  assert.deepEqual(Array.from(res.tasks.map((t) => t.account)), ['热点号1', '热点号2']);
+});
+
 
 
 

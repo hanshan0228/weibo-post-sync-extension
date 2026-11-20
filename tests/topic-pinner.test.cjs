@@ -63,7 +63,7 @@ function createTopicHarness(initial = {}) {
     setTimeout: (fn) => { queueMicrotask(fn); return 1; },
     clearTimeout() {},
   });
-  vm.runInContext(topicPinnerSource, context, { filename: 'topic_pinner.js' });
+  vm.runInContext(topicPinnerSource, context, { filename: path.join(__dirname, '../background/topic_pinner.js') });
   return {
     context,
     alarms,
@@ -855,6 +855,277 @@ test('当 s.weibo.com 触发访客校验时才懒加载后台标签页兜底完�
   assert.equal(saved.topics[0].status, 'skipped_other_host');
 });
 
+test('回归：链接解析拒绝伪造域名和非 HTTP 协议', () => {
+  const h = createTopicHarness();
+  for (const url of [
+    'https://weibo.com.evil.test/123/Abc',
+    'https://evilweibo.cn/123/Abc',
+    'https://weibo.cn.evil.test/detail/123',
+    'ftp://weibo.com/123/Abc',
+  ]) {
+    assert.throws(() => h.run(`parseWeiboPostUrl(${JSON.stringify(url)})`), /微博域名|协议/);
+  }
+  assert.equal(h.run(`parseWeiboPostUrl('https://www.weibo.com/123/Abc').mblogid`), 'Abc');
+});
+
+test('回归：队列运行中入队的新 pending 会自动继续处理', async () => {
+  const h = createTopicHarness({ topicPinTasks: [{ id: 'first', status: 'pending', topics: [] }] });
+  let release;
+  let entered;
+  const started = new Promise((resolve) => { entered = resolve; });
+  const blocked = new Promise((resolve) => { release = resolve; });
+  const processed = [];
+  h.context.processSingleTopicPinTask = async (task) => {
+    processed.push(task.id);
+    if (task.id === 'first') { entered(); await blocked; }
+    await h.context.updateTopicPinTask(task.id, { status: 'done' });
+  };
+  const running = h.run('processTopicPinQueue()');
+  await started;
+  const next = await h.run(`enqueueTopicPinTask({ mode: 'manual_apply', hashtags: ['Mock新任务'], autoPin: false })`);
+  release();
+  await running;
+  assert.deepEqual(processed, ['first', next.id]);
+  assert.equal(h.data.topicPinTasks.find((task) => task.id === next.id).status, 'done');
+});
+
+test('回归：巡检入队持久化失败后不标 seen，下轮能重新入队', async () => {
+  const h = createTopicHarness({ topicPinConfig: { monitorUid: '100001' } });
+  h.run(`
+    ensureTopicPinWorkerTab = async () => ({ id: 77 });
+    navigateTabAndWait = async () => {};
+    processTopicPinQueue = async () => {};
+    runInMainWorld = async () => ({ ok: true, post: {
+      id: 'mock-monitor-post', url: 'https://weibo.com/100001/Mock', text: '#Mock巡检#'
+    } });
+  `);
+  const originalSet = h.context.chrome.storage.local.set;
+  let failOnce = true;
+  h.context.chrome.storage.local.set = async (value) => {
+    if (value.topicPinTasks && failOnce) { failOnce = false; throw new Error('mock storage failure'); }
+    if (value.topicPinTasks) assert.equal(value.topicPinLastPostId, 'mock-monitor-post');
+    if (value.topicPinLastPostId) assert.ok(value.topicPinTasks, '任务和 seen 必须原子写入');
+    return originalSet(value);
+  };
+  const first = await h.run('checkWeiboMonitorOnce({ manual: true })');
+  assert.equal(first.ok, false);
+  assert.notEqual(h.data.topicPinLastPostId, 'mock-monitor-post');
+  const retry = await h.run('checkWeiboMonitorOnce({ manual: true })');
+  assert.equal(retry.newPost, true);
+  assert.equal(h.data.topicPinTasks.length, 1);
+  assert.equal(h.data.topicPinLastPostId, 'mock-monitor-post');
+  const repeated = await h.run('checkWeiboMonitorOnce({ manual: true })');
+  assert.equal(repeated.newPost, false);
+  assert.equal(h.data.topicPinTasks.length, 1);
+});
+
+for (const response of ['network', 'html', 'visitor', 'unknown-json']) {
+  test(`回归：申请 POST 结果未知（${response}）不触发页面重复提交`, async () => {
+    const h = createTopicHarness();
+    let submitCalls = 0;
+    let fallbackCalls = 0;
+    attachHttpGlobals(h, { fetchMock: async (url) => {
+      const json = (obj) => ({ ok: true, status: 200, url, async text() { return JSON.stringify(obj); } });
+      if (url.includes('/category')) return json({ data: [{ id: 1, name: '社会' }] });
+      if (url.includes('/location')) return json({ data: [{ id: 1, name: '全国' }] });
+      if (url.includes('/uploadpic')) return json({ data: { original_pic: 'https://mock.invalid/avatar.jpg' } });
+      assert.equal(url, 'https://m.s.weibo.com/ajax_claim/apply');
+      submitCalls += 1;
+      if (response === 'network') throw new Error('mock lost response');
+      if (response === 'unknown-json') return json({});
+      return { ok: true, status: 200, url: response === 'visitor' ? 'https://passport.weibo.com/visitor/' : url,
+        async text() { return '<html>mock response</html>'; } };
+    } });
+    h.context.applyForHostInTab = async () => { fallbackCalls += 1; return { status: 'applied' }; };
+    const result = await h.run(`applyForHostSmart(async () => 88, 'Mock话题', {
+      hostAccountName: 'Mock主持人', hostApply: { imageDataUrl: 'data:image/jpeg;base64,/9j/4A==' }
+    }, false, { canApply: true, applyHref: 'https://m.s.weibo.com/claim/info?object_id=mock' })`);
+    assert.equal(result.status, 'unknown');
+    assert.equal(submitCalls, 1);
+    assert.equal(fallbackCalls, 0);
+  });
+}
+
+test('回归：未知申请结果跨轮只复核权限，禁止重提且不误报申请成功', async () => {
+  for (const autoPin of [true, false]) {
+    const h = createTopicHarness({ topicPinConfig: { hostAccountName: 'Mock主持人' } });
+    let calls = 0;
+    h.context.applyForHostSmart = async () => { calls += 1; return { status: 'unknown', reason: 'mock response lost' }; };
+    h.context.inspectTopicSmart = async () => ({ canApply: true });
+    const task = await h.run(`enqueueTopicPinTask({ mode: 'manual_apply', hashtags: ['Mock未知结果'], autoPin: ${autoPin} })`);
+    await h.run('processTopicPinQueue()');
+    let saved = h.data.topicPinTasks.find((item) => item.id === task.id);
+    assert.equal(calls, 1);
+    assert.equal(saved.status, autoPin ? 'waiting_review' : 'error');
+    assert.equal(saved.topics[0].status, autoPin ? 'applied' : 'error');
+    if (autoPin) {
+      await h.run(`updateTopicPinTask('${task.id}', { nextCheckAt: 0 })`);
+      await h.run('processTopicPinQueue()');
+      saved = h.data.topicPinTasks.find((item) => item.id === task.id);
+      assert.equal(calls, 1);
+      assert.equal(saved.status, 'waiting_review');
+    }
+  }
+});
+
+test('回归：重试重置 pending 后保留未知提交标记，所有申请入口均禁止重提', async () => {
+  for (const mode of ['manual_apply', 'manual_pin']) {
+    for (const autoPin of [true, false]) {
+      const h = createTopicHarness({ topicPinConfig: { hostAccountName: 'Mock主持人' } });
+      let applyCalls = 0;
+      let inspectCalls = 0;
+      h.context.applyForHostSmart = async () => { applyCalls += 1; return { status: 'unknown', reason: 'mock unknown' }; };
+      h.context.inspectTopicSmart = async () => { inspectCalls += 1; return { canApply: true }; };
+      const task = await h.run(`enqueueTopicPinTask({ mode: '${mode}', hashtags: ['Mock重试'], autoPin: ${autoPin} })`);
+      await h.run('processTopicPinQueue()');
+      const first = h.data.topicPinTasks.find((item) => item.id === task.id);
+      assert.equal(first.topics[0].submissionUnknown, true);
+      const beforeInspects = inspectCalls;
+      await h.context.updateTopicPinTask(task.id, {
+        status: 'pending', nextCheckAt: null,
+        topics: first.topics.map((topic) => ({ ...topic, status: 'pending', note: '等待重试' })),
+      });
+      await h.run('processTopicPinQueue()');
+      const retried = h.data.topicPinTasks.find((item) => item.id === task.id);
+      assert.equal(applyCalls, 1);
+      assert.equal(inspectCalls, beforeInspects + 1);
+      assert.equal(retried.topics[0].submissionUnknown, true);
+      assert.equal(retried.status, autoPin ? 'waiting_review' : 'error');
+    }
+  }
+});
+
+test('回归：多话题后续异常不会丢失已提交未知标记，重试不重提第一话题', async () => {
+  const h = createTopicHarness();
+  let firstCalls = 0;
+  h.context.applyForHostSmart = async (_resolve, hashtag) => {
+    if (hashtag === 'Mock第一话题') { firstCalls += 1; return { status: 'unknown', reason: 'mock unknown' }; }
+    throw new Error('mock second topic failure');
+  };
+  const task = await h.run(`enqueueTopicPinTask({ mode: 'manual_apply', hashtags: ['Mock第一话题', 'Mock第二话题'], autoPin: true })`);
+  await h.run('processTopicPinQueue()');
+  let saved = h.data.topicPinTasks.find((item) => item.id === task.id);
+  assert.equal(saved.status, 'error');
+  assert.equal(saved.topics[0].submissionUnknown, true);
+  h.context.inspectTopicSmart = async () => ({ canApply: true });
+  await h.context.updateTopicPinTask(task.id, { status: 'pending', topics: saved.topics.map((topic) => ({ ...topic, status: 'pending' })) });
+  await h.run('processTopicPinQueue()');
+  saved = h.data.topicPinTasks.find((item) => item.id === task.id);
+  assert.equal(firstCalls, 1);
+  assert.equal(saved.topics[0].submissionUnknown, true);
+});
+
+for (const popupUrl of [
+  'https://m.s.weibo.com.evil.test/claim/info',
+  'https://unrelated.invalid/claim/info',
+  'https://m.s.weibo.com/profile',
+  'https://m.s.weibo.com/claim/manage',
+  'about:blank',
+  'delayed-claim',
+]) {
+  test(`回归：同 opener 弹窗需真实申请 URL 才可接管或清理（${popupUrl}）`, async () => {
+    const h = createTopicHarness();
+    let listener;
+    let popupReads = 0;
+    let currentPopupUrl = 'about:blank';
+    const inspected = [];
+    const updated = [];
+    const removed = [];
+    const searchUrl = 'https://s.weibo.com/weibo?q=%23Mock%E5%BC%B9%E7%AA%97%23';
+    h.context.chrome.tabs.onCreated = { addListener(fn) { listener = fn; }, removeListener() {} };
+    h.context.navigateTabAndWait = async () => {};
+    h.context.chrome.tabs.get = async (id) => {
+      if (id === 88) return { id, url: searchUrl, status: 'complete' };
+      popupReads += 1;
+      currentPopupUrl = popupUrl === 'delayed-claim'
+        ? (popupReads < 3 ? 'about:blank' : 'https://m.s.weibo.com/claim/info?object_id=mock')
+        : popupUrl;
+      return { id, url: currentPopupUrl, status: 'complete' };
+    };
+    h.context.chrome.tabs.update = async (id) => { assert.notEqual(currentPopupUrl, 'about:blank'); updated.push(id); };
+    h.context.chrome.tabs.remove = async (id) => { removed.push(id); };
+    h.context.waitForTabComplete = async (id) => {
+      assert.notEqual(currentPopupUrl, 'about:blank');
+      return h.context.chrome.tabs.get(id);
+    };
+    h.context.runInMainWorld = async (id) => {
+      inspected.push(id);
+      if (id === 88) { listener({ id: 901, openerTabId: 88, url: 'about:blank' }); return { status: 'clicked' }; }
+      assert.equal(currentPopupUrl, 'https://m.s.weibo.com/claim/info?object_id=mock');
+      return { status: 'other_host' };
+    };
+    const result = await h.run(`applyForHostInTab(88, 'Mock弹窗', { hostAccountName: 'Mock主持人' }, true)`);
+    if (popupUrl === 'delayed-claim') {
+      assert.equal(result.status, 'other_host');
+      assert.ok(popupReads >= 3);
+      assert.deepEqual(inspected, [88, 901]);
+      assert.deepEqual(updated, [901]);
+      assert.deepEqual(removed, [901]);
+    } else {
+      assert.deepEqual(inspected, [88]);
+      assert.deepEqual(updated, []);
+      assert.deepEqual(removed, []);
+    }
+  });
+}
+
+for (const owned of [false, true]) {
+  test(`回归：申请弹窗仅接管自身 opener，等待失败清理（owned=${owned}）`, async () => {
+    const h = createTopicHarness();
+    const removed = [];
+    const inspected = [];
+    let listener;
+    let listenerRemoved = false;
+    h.context.chrome.tabs.onCreated = {
+      addListener(fn) { listener = fn; },
+      removeListener(fn) { assert.equal(fn, listener); listenerRemoved = true; },
+    };
+    h.context.chrome.tabs.remove = async (id) => { removed.push(id); };
+    h.context.chrome.tabs.get = async (id) => ({ id, status: 'complete', url: id === 901
+      ? 'https://m.s.weibo.com/claim/info?object_id=mock'
+      : 'https://s.weibo.com/weibo?q=%23Mock%E5%BC%B9%E7%AA%97%23' });
+    h.context.navigateTabAndWait = async () => {};
+    h.context.waitForTabComplete = async (id) => {
+      if (owned) throw new Error(`mock wait failed ${id}`);
+      return { id, url: 'https://m.s.weibo.com/claim/info', status: 'complete' };
+    };
+    h.context.runInMainWorld = async (id) => {
+      inspected.push(id);
+      if (inspected.length === 1) {
+        listener({ id: 901, openerTabId: owned ? 88 : 777, url: 'about:blank' });
+        listener({ id: 902, url: 'about:blank' });
+        return { status: 'clicked' };
+      }
+      return { status: 'other_host' };
+    };
+    try { await h.run(`applyForHostInTab(88, 'Mock弹窗', { hostAccountName: 'Mock主持人' }, true)`); }
+    catch (error) { assert.match(error.message, /mock wait failed/); }
+    assert.equal(listenerRemoved, true);
+    assert.ok(inspected.every((id) => id === 88));
+    assert.deepEqual(removed, owned ? [901] : []);
+  });
+}
+
+test('回归：工作标签加载等待失败时先清理再回退，最终失败无泄漏', async () => {
+  const h = createTopicHarness();
+  let nextId = 90;
+  const removed = [];
+  h.context.chrome.windows = { async getAll() { return [{ id: 5, focused: true }]; } };
+  h.context.chrome.tabs.create = async (opts) => ({ id: ++nextId, ...opts });
+  h.context.chrome.tabs.remove = async (id) => { removed.push(id); };
+  h.context.waitForTabLoaded = async () => { throw new Error('mock loading failed'); };
+  await assert.rejects(h.run('ensureTopicPinWorkerTab()'), /mock loading failed/);
+  assert.deepEqual(removed, [91, 92]);
+  assert.equal(h.run('topicPinWorkerTabId'), null);
+});
+
+test('回归：外部加载等待返回 about:blank 时禁止继续查询 DOM', async () => {
+  const h = createTopicHarness();
+  h.context.chrome.tabs.get = async (id) => ({ id, status: 'complete', url: 'about:blank' });
+  h.context.waitForTabLoaded = h.context.chrome.tabs.get;
+  await assert.rejects(h.run('waitForTabComplete(88, 10)'), /加载|about:blank/);
+});
+
 test('encodeAvatarToWeiboJpegBase64 通过 OffscreenCanvas 将 PNG 中心裁剪缩放至 200~500 像素 JPEG', async () => {
   const h = createTopicHarness();
   attachHttpGlobals(h, { fetchMock: async () => { throw new Error('unused'); } });
@@ -877,5 +1148,27 @@ test('encodeAvatarToWeiboJpegBase64 通过 OffscreenCanvas 将 PNG 中心裁剪�
   assert.equal(b64, '/9j/4A==');
   assert.equal(closed, true);
   assert.deepEqual(canvasCalls[0].args.slice(1), [174, 0, 349, 349, 0, 0, 349, 349]);
+});
+
+test('话题置顶自动清理仅清除超过1天的已完成任务，保留待处理与异常任务', async () => {
+  const now = 1_700_000_000_000;
+  const twoDaysAgo = now - 2 * 24 * 60 * 60 * 1000;
+  const halfDayAgo = now - 12 * 60 * 60 * 1000;
+  const h = createTopicHarness({
+    topicPinTasks: [
+      { id: 'tp_old_done', status: 'done', updatedAt: twoDaysAgo },
+      { id: 'tp_recent_done', status: 'done', updatedAt: halfDayAgo },
+      { id: 'tp_old_error', status: 'error', updatedAt: twoDaysAgo },
+      { id: 'tp_old_wait', status: 'waiting_review', updatedAt: twoDaysAgo },
+    ],
+  });
+
+  const removed = await h.run(`cleanupExpiredTopicPinTasks(${now})`);
+  assert.equal(removed, 1);
+  const { topicPinTasks } = await h.context.chrome.storage.local.get(['topicPinTasks']);
+  assert.deepEqual(
+    topicPinTasks.map((t) => t.id),
+    ['tp_recent_done', 'tp_old_error', 'tp_old_wait']
+  );
 });
 

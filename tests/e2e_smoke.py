@@ -13,6 +13,7 @@ DOC_HTML = r'''<!doctype html><meta charset="utf-8"><title>隔离Mock文档</tit
 window.mockWrites = [];
 const rows = [ ['时间', '账号', '正文', '素材', '微博链接'],
   ['', '隔离Mock账号', '隔离测试正文', '', ''], ['', '另一个Mock账号', '第二条Mock正文', '', ''] ];
+window.mockResetTargetCell = () => { rows[1][4] = ''; };
 const sheet = { getSheetId: () => 'mock_sheet', getSheetName: () => 'Mock表',
   getIsInitialized: () => true, getRowCount: () => rows.length, getColCount: () => 5,
   getCellDataAtPosition: (r,c) => ({ value: rows[r]?.[c] || '' }) };
@@ -85,6 +86,7 @@ def run(project):
                 page.on("pageerror", lambda error: errors.append(str(error)))
                 page.goto(f"chrome-extension://{extension_id}/popup/popup.html")
                 check(page.url != "about:blank", "扩展控制面板已完成真实导航")
+                page.locator("#tabNavSync").click()
                 page.locator("#docSlotsContainer .doc-slot-row").first.wait_for()
                 check(page.locator("#docSlotsContainer .doc-slot-row").count() == 2, "空配置正确创建两个文档卡槽")
                 page.locator("#tabNavSettings").click()
@@ -92,6 +94,7 @@ def run(project):
                 if page.locator("#silentModeToggle").is_checked():
                     page.locator("label.toggle-switch:has(#silentModeToggle)").click()
                 page.reload()
+                page.locator("#tabNavSync").click()
                 page.locator("#docSlotsContainer .doc-slot-row").first.wait_for()
                 page.locator("#tabNavSettings").click()
                 check(not page.locator("#silentModeToggle").is_checked(), "关闭静默模式后重开仍正确恢复")
@@ -113,6 +116,25 @@ def run(project):
                 page.locator("#btnScanTasks").click()
                 page.locator("#taskListContainer .task-item-card").first.wait_for(timeout=25000)
                 check(page.locator("#taskListContainer .task-item-card").count() == 2, "真实扩展后台跨标签注入并提取两条Mock文档任务")
+                first_choice = page.locator("#taskListContainer .task-item-cb").first
+                first_choice.uncheck()
+                page.locator("#taskSearchInput").fill("第二条")
+                check(page.locator("#taskListContainer .task-item-card").count() == 1, "搜索仅展示匹配的Mock任务")
+                page.locator("#taskSearchInput").fill("")
+                check(not page.locator("#taskListContainer .task-item-cb").first.is_checked(), "搜索重绘后保留用户明确取消的任务")
+                page.evaluate("""() => {
+                    window.mockBeforeScheduleCard = document.querySelector('#taskListContainer .task-item-card');
+                    window.mockScheduleMessageReceived = false;
+                    chrome.runtime.onMessage.addListener(function observeSchedule(message) {
+                        if (message.action === 'SCHEDULE_UPDATED') {
+                            window.mockScheduleMessageReceived = true;
+                            chrome.runtime.onMessage.removeListener(observeSchedule);
+                        }
+                    });
+                }""")
+                worker.evaluate("() => chrome.runtime.sendMessage({ action: 'SCHEDULE_UPDATED' })")
+                page.wait_for_function("window.mockScheduleMessageReceived && !window.mockBeforeScheduleCard.isConnected")
+                check(not page.locator("#taskListContainer .task-item-cb").first.is_checked(), "确认收到后台广播并重绘后，不擅自重新勾选任务")
                 doc_page = next(p for p in context.pages if "docs.qq.com/sheet/MOCK" in p.url)
                 print("文档探针：", doc_page.url, doc_page.locator("body").inner_text())
                 task = {"id": "mock_e2e", "account": "隔离Mock账号", "content": "隔离测试正文", "row": 2,
@@ -122,14 +144,15 @@ def run(project):
                     config:{ dryRun:true, silentMode:false, selectedTasks:[task] } })""", task)
                 check(response.get("ok"), f"安全演练完成：{json.dumps(response, ensure_ascii=False)}")
                 check(doc_page.evaluate("window.mockWrites.length") == 0, "安全演练没有修改Mock文档")
-                platform_page = next(p for p in context.pages if "ai-publish-platform.weibo.com" in p.url)
-                check(platform_page.evaluate("window.mockPublishClicks") == 0, "安全演练从未点击Mock发布按钮")
+                platform_pages = [p for p in context.pages if "ai-publish-platform.weibo.com" in p.url]
+                check(sum(p.evaluate("window.mockPublishClicks || 0") for p in platform_pages) == 0, "安全演练从未点击Mock发布按钮")
                 check(response["summary"]["published"] == 0, "演练结果不冒充真实发布")
-                print("中台探针：", platform_page.url, platform_page.locator("button").all_text_contents())
+                print("中台探针：", platform_pages[-1].url, platform_pages[-1].locator("button").all_text_contents())
                 response = page.evaluate("""task => chrome.runtime.sendMessage({ action:'START_PIPELINE',
                     config:{ dryRun:false, silentMode:false, selectedTasks:[task] } })""", task)
                 check(response.get("ok"), f"全隔离模拟发布回写完成：{json.dumps(response, ensure_ascii=False)}")
-                check(platform_page.evaluate("window.mockPublishClicks") == 1, "模拟发布仅点击一次，无重复发射")
+                platform_pages = [p for p in context.pages if "ai-publish-platform.weibo.com" in p.url]
+                check(sum(p.evaluate("window.mockPublishClicks || 0") for p in platform_pages) == 1, "模拟发布仅点击一次，无重复发射")
                 check(doc_page.evaluate("window.mockWrites.length") == 1, "模拟回执准确回写一次指定Mock单元格")
                 check(doc_page.evaluate("window.mockWrites[0].sheetId === 'mock_sheet' && window.mockWrites[0].rowIndex === 1 && window.mockWrites[0].colIndex === 4"), "回写位置为指定子表E2")
                 ledger = page.evaluate("async () => (await chrome.storage.local.get('publishLedger')).publishLedger")
@@ -137,6 +160,32 @@ def run(project):
                 page.locator("#tabNavLedger").click()
                 page.locator("#ledgerListContainer .ledger-item-card").first.wait_for()
                 check(page.locator("#ledgerListContainer .ledger-item-card").count() == 2, "账本页真实渲染两条执行记录")
+                original_receipt_id = ledger[0]["id"]
+                writes_before_recovery = doc_page.evaluate("window.mockWrites.length")
+                doc_page.evaluate("window.mockResetTargetCell()")
+                page.evaluate("""async () => {
+                    const { publishLedger } = await chrome.storage.local.get('publishLedger');
+                    const updated = publishLedger.map(item => item.mode === '真实发布'
+                        ? { ...item, writeBackOk: false, writeBackError: '隔离模拟写回中断' } : item);
+                    await chrome.storage.local.set({ publishLedger: updated,
+                        __unwrittenReceipts__: updated.filter(item => item.mode === '真实发布') });
+                }""")
+                response = page.evaluate("""task => chrome.runtime.sendMessage({ action:'START_PIPELINE',
+                    config:{ dryRun:false, silentMode:false, selectedTasks:[task] } })""", task)
+                check(response.get("ok") and response["summary"]["writtenBack"] == 1, "旧回执恢复路径成功补写Mock文档")
+                platform_pages = [p for p in context.pages if "ai-publish-platform.weibo.com" in p.url]
+                check(sum(p.evaluate("window.mockPublishClicks || 0") for p in platform_pages) == 1, "旧回执补写未再次点击Mock发布按钮")
+                check(doc_page.evaluate("window.mockWrites.length") == writes_before_recovery + 1,
+                      "恢复路径实际新增一次Mock文档写入")
+                restored_write = doc_page.evaluate("window.mockWrites[window.mockWrites.length - 1]")
+                check(restored_write["sheetId"] == "mock_sheet" and restored_write["rowIndex"] == 1
+                      and restored_write["colIndex"] == 4 and restored_write["text"] == ledger[0]["postUrl"],
+                      "恢复路径实际写入指定子表E2及原回执链接")
+                recovered = page.evaluate("async () => chrome.storage.local.get(['publishLedger', '__unwrittenReceipts__'])")
+                check(len(recovered["publishLedger"]) == 2 and recovered["publishLedger"][0]["id"] == original_receipt_id,
+                      "恢复回执沿用原编号，不制造重复账本")
+                check(recovered["publishLedger"][0]["writeBackOk"] and not recovered["__unwrittenReceipts__"],
+                      "补写成功后账本及隔离回执状态一致")
                 check(not errors, f"控制面板无未处理JavaScript异常：{errors}")
                 print("已阻断非夹具请求：", len(blocked))
                 print("隔离浏览器端到端回归全部通过；未接触日常浏览器配置或真实账户。")

@@ -38,7 +38,7 @@ function spreadsheet(rows, sheetId = 'wanted') {
   return { workbook: { worksheetManager: { sheetList: [sheet] } }, e2eTools: { getCellEditValue: (_wb, _r, _c, _sid, cell) => cell || '' } };
 }
 
-function legacyContext(file, document) {
+function legacyContext(file, document, overrides = {}) {
   let listener;
   const context = {
     console, Date, Event: class {}, KeyboardEvent: class {},
@@ -46,6 +46,7 @@ function legacyContext(file, document) {
     window: { location: { href: 'https://ai-publish-platform.weibo.com/#/post', hostname: 'ai-publish-platform.weibo.com' } },
     chrome: { runtime: { onMessage: { addListener: (fn) => { listener = fn; } } } },
     document,
+    ...overrides,
   };
   vm.createContext(context);
   vm.runInContext(fs.readFileSync(path.join(root, 'content_scripts', file), 'utf8'), context,
@@ -208,6 +209,101 @@ test('目标账号之外仍有勾选时必须阻断', async () => {
   assert.equal(textarea.value || '', '');
 });
 
+test('旧发布入口空账号在任何DOM操作前拒绝', async () => {
+  let touches = 0;
+  const send = legacyContext('weibo_poster.js', {
+    querySelector() { touches++; throw new Error('不应访问DOM'); },
+    querySelectorAll() { touches++; return []; },
+  });
+  for (const account of [undefined, '', '   ']) {
+    const result = await send({ action: 'POST_WEIBO_TASK', dryRun: true, task: { account, content: 'Mock正文' } });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /账号/);
+  }
+  assert.equal(touches, 0);
+});
+
+test('旧发布消息排他执行，拒绝并发任务且失败后可重试', async () => {
+  let scans = 0;
+  const send = legacyContext('weibo_poster.js', {
+    querySelectorAll() { scans++; return []; },
+    querySelector() { throw new Error('找不到账号时不可填正文'); },
+  });
+  const request = { action: 'POST_WEIBO_TASK', dryRun: true, task: { account: 'Mock账号', content: 'Mock正文' } };
+  const first = send(request);
+  const afterFirst = scans;
+  const second = await send(request);
+  assert.equal(second.ok, false);
+  assert.match(second.error, /执行|进行|处理中/);
+  // 首任务在异步查找中继续扫描；并发请求应立即拒绝而非启动另一套查找。
+  const firstResult = await first;
+  assert.match(firstResult.error, /账号/);
+  assert.ok(afterFirst > 0);
+  const retry = await send(request);
+  assert.match(retry.error, /账号/);
+  assert.doesNotMatch(retry.error, /正在执行/);
+});
+
+test('旧发布入口演练成功后释放排他锁且不点击发布', async () => {
+  let checked = false;
+  let publishClicks = 0;
+  const textarea = { value: '', focus() {}, dispatchEvent() {} };
+  const box = {
+    innerText: 'Mock账号', querySelector: () => ({ checked }),
+    click() { checked = !checked; },
+  };
+  const publish = { innerText: '保存并发布', disabled: false, getAttribute: () => null, click() { publishClicks++; } };
+  const send = legacyContext('weibo_poster.js', {
+    querySelector: () => textarea,
+    querySelectorAll: (selector) => selector.includes('n-checkbox--checked') ? (checked ? [box] : [])
+      : selector.includes('checkbox') ? [box] : selector.includes('button') ? [publish] : [],
+    getElementById: () => ({ style: {}, parentNode: null }),
+  }, { window: { location: { hostname: 'ai-publish-platform.weibo.com' }, HTMLTextAreaElement: class {} } });
+  for (const content of ['Mock第一条', 'Mock第二条']) {
+    const result = await send({ action: 'POST_WEIBO_TASK', dryRun: true, task: { account: 'Mock账号', content } });
+    assert.equal(result.ok, true, result.error);
+    assert.equal(result.data.dryRun, true);
+    assert.equal(textarea.value, content);
+  }
+  assert.equal(publishClicks, 0);
+});
+
+for (const scenario of ['跨分类清理成功', '残留账号无法取消', '填正文后重新出现残留']) {
+  test(`旧入口跨分类唯一账号校验：${scenario}`, async () => {
+    let activeTab = '热点';
+    let publishClicks = 0;
+    const checked = { Mock目标: false, Mock残留: true };
+    const boxes = Object.keys(checked).map((name) => ({
+      innerText: name, querySelector: () => ({ checked: checked[name] }),
+      click() { if (name !== 'Mock残留' || scenario !== '残留账号无法取消') checked[name] = !checked[name]; },
+    }));
+    const visible = () => activeTab === '填充' ? [boxes[0]] : activeTab === '军事' ? [boxes[1]] : [];
+    const textarea = { value: '', focus() {}, dispatchEvent() {
+      if (scenario === '填正文后重新出现残留') checked.Mock残留 = true;
+    } };
+    const publish = { innerText: '保存并发布', disabled: false, getAttribute: () => null, click() { publishClicks++; } };
+    const tabs = ['热点', '垂类', '军事', '填充', '游戏'].map((name) => ({ innerText: name, click() { activeTab = name; } }));
+    const send = legacyContext('weibo_poster.js', {
+      querySelector: () => textarea,
+      querySelectorAll: (selector) => selector.includes('n-tabs-tab') ? tabs
+        : selector.includes('n-checkbox--checked') ? visible().filter((box) => checked[box.innerText])
+        : selector.includes('checkbox') ? visible() : selector.includes('button') ? [publish] : [],
+      getElementById: () => ({ style: {}, parentNode: null }),
+    }, { window: { location: { hostname: 'ai-publish-platform.weibo.com' }, HTMLTextAreaElement: class {} } });
+    const result = await send({ action: 'POST_WEIBO_TASK', dryRun: true, task: { account: 'Mock目标', content: 'Mock唯一账号正文' } });
+    assert.equal(publishClicks, 0);
+    if (scenario === '跨分类清理成功') {
+      assert.equal(result.ok, true, result.error);
+      assert.equal(checked.Mock残留, false);
+      assert.equal(checked.Mock目标, true);
+    } else {
+      assert.equal(result.ok, false);
+      assert.match(result.error, /账号|唯一/);
+      if (scenario === '残留账号无法取消') assert.equal(textarea.value, '');
+    }
+  });
+}
+
 test('旧内容脚本找不到指定账号时须拒绝并且不填正文', async () => {
   const textarea = { value: '', focus() {}, dispatchEvent() {} };
   const document = { querySelector: () => textarea, querySelectorAll: () => [] };
@@ -304,6 +400,75 @@ test('文档回写列支持 AA，不得生成乱码地址', () => {
   const result = c.directExtractDocTasks('wanted', 'AA', '');
   assert.equal(result.ok, true);
   assert.equal(result.tasks[0].targetCell, 'AA2');
+});
+
+test('表头为空白时自动根据已有微博链接推断回写列（如 H 列），不误落回默认 E 列', () => {
+  const rows = [
+    ['时间', '账号', '文案', '', '备注', '', '', ''],
+    ['10:00', '账号A', '已完成文案', '', '', '', '', 'https://weibo.com/123/Done1'],
+    ['11:00', '账号B', '待发文案', '', '', '', '', ''],
+  ];
+  const c = load({ window: { SpreadsheetApp: spreadsheet(rows) } });
+  const result = c.directExtractDocTasks('wanted', 'E', '');
+  assert.equal(result.ok, true);
+  assert.equal(result.tasks.length, 1);
+  assert.equal(result.tasks[0].targetCell, 'H3');
+});
+
+test('手动指定回写列 forceLinkCol=true 时优先于模糊表头匹配', () => {
+  const rows = [
+    ['时间', '账号', '文案', '', '原文链接', '', '', ''],
+    ['10:00', '账号A', '待发文案', '', '', '', '', ''],
+  ];
+  const c = load({ window: { SpreadsheetApp: spreadsheet(rows) } });
+  const result = c.directExtractDocTasks('wanted', 'H', '', false, true);
+  assert.equal(result.ok, true);
+  assert.equal(result.linkColLetterUsed, 'H');
+  assert.equal(result.linkColSource, '手动指定列');
+  assert.equal(result.tasks[0].targetCell, 'H2');
+});
+
+test('以实际微博链接所在列为主，手动指定仅在无实际链接和明确表头时兜底', () => {
+  const rows = [
+    ['时间', '账号', '文案', '', '回写', '', '', ''],
+    ['10:00', '账号A', '已发布文案', '', 'https://weibo.com/123/Done', '', '', ''],
+    ['11:00', '账号B', '待发文案', '', '', '', '', ''],
+  ];
+  const c = load({ window: { SpreadsheetApp: spreadsheet(rows) } });
+  const result = c.directExtractDocTasks('wanted', 'H', '', false, true);
+  assert.equal(result.ok, true);
+  assert.equal(result.linkColLetterUsed, 'E');
+  assert.equal(result.linkColSource, '已有链接推断');
+  assert.equal(result.tasks.length, 1);
+  assert.equal(result.tasks[0].account, '账号B');
+  assert.equal(result.tasks[0].targetCell, 'E3');
+});
+
+test('原文链接和视频链接不会压过精确的链接回写列', () => {
+  const rows = [
+    ['时间', '账号', '文案', '原文链接', '视频链接', '链接'],
+    ['10:00', '账号A', '待发文案', 'https://example.com/src', 'https://example.com/vid', ''],
+  ];
+  const c = load({ window: { SpreadsheetApp: spreadsheet(rows) } });
+  const result = c.directExtractDocTasks('wanted', 'H', '', false, false);
+  assert.equal(result.ok, true);
+  assert.equal(result.linkColLetterUsed, 'F');
+  assert.equal(result.tasks.length, 1);
+  assert.equal(result.tasks[0].targetCell, 'F2');
+});
+
+test('只读文档状态下 directWriteCellToDoc 直接阻断写回并报错', async () => {
+  let setCalled = false;
+  const app = spreadsheet([['', '账号', '文案', '', '', '', '', ''], ['', '账号A', '正文', '', '', '', '', '']]);
+  app.workbook.isReadOnly = () => true;
+  app.behaviorApi = { cellApi: { setSingleValue: async () => { setCalled = true; } } };
+  const c = load({ window: { SpreadsheetApp: app } });
+  const res = await c.directWriteCellToDoc('H2', 'https://weibo.com/123/Abc', 'wanted', {
+    sheetId: 'wanted', row: 2, linkCol: 7, contentCol: 2, accountCol: 1, headerRow: 1, content: '正文', account: '账号A', link: '',
+  });
+  assert.equal(res.ok, false);
+  assert.match(res.error, /只读/);
+  assert.equal(setCalled, false);
 });
 
 test('选中更优表头时，未出现的配图和时间列不可残留旧行坐标', () => {
@@ -840,6 +1005,12 @@ test('微博列表无账号列时不能将相同正文的链接归属到目标�
 
 test('独立投票页提取函数可完整保留全部4个选项与标题', () => {
   const c = load({
+    window: {
+      location: { href: 'https://ai-publish-platform.weibo.com/#/post', hostname: 'ai-publish-platform.weibo.com' },
+      getComputedStyle: () => ({ display: 'block', visibility: 'visible', opacity: '1' }),
+      HTMLTextAreaElement: { prototype: {} },
+      HTMLInputElement: { prototype: {} },
+    },
     document: {
       body: {
         innerText: [
@@ -1561,6 +1732,179 @@ test('群发非首账号可凭提交上下文恢复，正文自带旧直链不�
   const result = await c.directRecoverPublishedWeiboUrl('虚构小号', content);
   assert.equal(result.ok, false);
   assert.doesNotMatch(result.error, /缺少本次提交上下文/);
+});
+
+test('directPostToWeiboPlatform支持隐藏分类面板及带括号DOM标签的账号兜底勾选', async () => {
+  const checkedState = { '瑞峰财经': false, '新浪新能源（垂类）': false };
+  const makeAccountNode = (labelText, visible) => {
+    const node = {
+      innerText: labelText,
+      textContent: labelText,
+      className: 'account_selector_checkbox n-checkbox',
+      classList: {
+        contains: (cls) => cls === 'n-checkbox--checked' && !!checkedState[labelText],
+      },
+      getAttribute: () => null,
+      getBoundingClientRect: () => (visible ? { width: 80, height: 24 } : { width: 0, height: 0 }),
+      getClientRects: () => (visible ? [{ width: 80, height: 24 }] : []),
+      offsetWidth: visible ? 80 : 0,
+      offsetHeight: visible ? 24 : 0,
+      scrollIntoView() {},
+      click() {
+        checkedState[labelText] = !checkedState[labelText];
+      },
+      closest(sel) {
+        return sel.includes('.n-checkbox') ? node : null;
+      },
+      querySelector(sel) {
+        if (sel.includes('input[type="checkbox"]')) {
+          return {
+            get checked() { return !!checkedState[labelText]; },
+            click() { checkedState[labelText] = !checkedState[labelText]; },
+          };
+        }
+        return null;
+      },
+    };
+    return node;
+  };
+
+  const visibleAcct = makeAccountNode('瑞峰财经', true);
+  const hiddenAcct = makeAccountNode('新浪新能源（垂类）', false);
+  const textarea = {
+    value: '',
+    focus() {},
+    dispatchEvent() {},
+    getBoundingClientRect: () => ({ width: 200, height: 80 }),
+    getClientRects: () => [{ width: 200, height: 80 }],
+  };
+  const modeRadio = {
+    innerText: '立即发布',
+    classList: { contains: (cls) => cls === 'n-radio--checked' },
+    getAttribute: () => 'true',
+    closest: () => null,
+    querySelector: () => null,
+  };
+  const c = load({
+    window: {
+      location: { href: 'https://ai-publish-platform.weibo.com/#/post', hostname: 'ai-publish-platform.weibo.com' },
+      getComputedStyle: () => ({ display: 'block', visibility: 'visible', opacity: '1' }),
+      HTMLTextAreaElement: { prototype: {} },
+      HTMLInputElement: { prototype: {} },
+    },
+    document: {
+      body: { innerText: '', innerHTML: '', appendChild() {} },
+      getElementById: () => null,
+      createElement: () => ({ style: {}, remove() {} }),
+      querySelector: (sel) => (sel.includes('textarea') ? textarea : null),
+      querySelectorAll: (sel) => {
+        if (sel.includes('.n-checkbox__label') || sel.includes('.account_selector_checkbox')) {
+          return [visibleAcct, hiddenAcct];
+        }
+        if (sel.includes('.n-radio')) return [modeRadio];
+        return [];
+      },
+      addEventListener() {},
+      removeEventListener() {},
+    },
+  });
+
+  const res = await c.directPostToWeiboPlatform({
+    account: '瑞峰财经',
+    accounts: ['瑞峰财经', '新浪新能源'],
+    content: '隐藏分类兜底测试正文',
+  }, true);
+
+  assert.equal(res.ok, true, res.error);
+  assert.equal(checkedState['瑞峰财经'], true);
+  assert.equal(checkedState['新浪新能源（垂类）'], true);
+});
+
+test('directPostToWeiboPlatform遇到延迟关闭的二次确认弹窗时只点击一次确认按钮不重复发博', async () => {
+  let confirmClicks = 0;
+  let pollTicks = 0;
+  const vis = () => ({ width: 100, height: 24 });
+  const emptyRect = () => ({ width: 0, height: 0 });
+  const textarea = { value: '', focus() {}, dispatchEvent() {}, getBoundingClientRect: vis, getClientRects: () => [vis()] };
+  const modeRadio = {
+    innerText: '立即发布',
+    classList: { contains: (cls) => cls === 'n-radio--checked' },
+    getAttribute: () => 'true',
+    closest: () => null,
+    querySelector: () => null,
+  };
+  const acctBox = {
+    innerText: '新浪热点',
+    textContent: '新浪热点',
+    classList: { contains: () => false },
+    getAttribute: () => 'false',
+    closest: () => null,
+    querySelector: () => ({ checked: true }),
+    scrollIntoView() {},
+    getBoundingClientRect: vis,
+    getClientRects: () => [vis()],
+  };
+  const publishBtn = {
+    innerText: '保存并发布',
+    disabled: false,
+    classList: { contains: () => false },
+    getAttribute: () => null,
+    closest: () => null,
+    scrollIntoView() {},
+    click() {},
+    getBoundingClientRect: vis,
+    getClientRects: () => [vis()],
+  };
+  const confirmBtn = {
+    innerText: '确认发布',
+    disabled: false,
+    classList: { contains: () => false },
+    getAttribute: () => null,
+    click() { confirmClicks++; },
+    getBoundingClientRect: vis,
+    getClientRects: () => [vis()],
+  };
+  const confirmModal = {
+    innerText: '确定立即发布该微博吗？',
+    querySelectorAll: (sel) => (sel.includes('button') ? [confirmBtn] : []),
+    getBoundingClientRect: () => (pollTicks < 4 ? vis() : emptyRect()),
+    getClientRects: () => (pollTicks < 4 ? [vis()] : []),
+  };
+  const c = load({
+    window: {
+      location: { href: 'https://ai-publish-platform.weibo.com/#/post', hostname: 'ai-publish-platform.weibo.com' },
+      getComputedStyle: () => ({ display: 'block', visibility: 'visible', opacity: '1' }),
+      HTMLTextAreaElement: { prototype: {} },
+      HTMLInputElement: { prototype: {} },
+    },
+    document: {
+      body: { innerText: '', innerHTML: '', appendChild() {} },
+      getElementById: () => null,
+      createElement: () => ({ style: {}, remove() {} }),
+      querySelector: (sel) => (sel.includes('textarea') ? textarea : null),
+      querySelectorAll: (sel) => {
+        if (sel.includes('.n-checkbox__label') || sel.includes('.account_selector_checkbox')) return [acctBox];
+        if (sel.includes('.n-radio')) return [modeRadio];
+        if (sel.includes('.publish_model') && sel.includes('n-dialog')) {
+          pollTicks++;
+          return pollTicks < 4 ? [confirmModal] : [];
+        }
+        if (sel.includes('.publish_model_item') || sel.includes('.weibo-link-item')) {
+          return pollTicks >= 4 ? [{
+            querySelector: (s) => (s.includes('nickname') ? { innerText: '新浪热点' } : { href: 'https://weibo.com/2318910945/ONCE01' }),
+          }] : [];
+        }
+        if (sel.includes('button')) return [publishBtn];
+        return [];
+      },
+      addEventListener() {},
+      removeEventListener() {},
+    },
+  });
+
+  const res = await c.directPostToWeiboPlatform({ account: '新浪热点', content: '确认弹窗防连点正文' }, false);
+  assert.equal(res.ok, true, res.error);
+  assert.equal(confirmClicks, 1);
 });
 
 

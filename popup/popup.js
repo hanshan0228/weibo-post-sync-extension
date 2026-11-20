@@ -18,6 +18,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   const tabNavParser = document.getElementById("tabNavParser");
   const tabNavLedger = document.getElementById("tabNavLedger");
   const tabNavTopicPin = document.getElementById("tabNavTopicPin");
+  const tabNavHotsearch = document.getElementById("tabNavHotsearch");
   const tabNavSettings = document.getElementById("tabNavSettings");
 
   const panelSync = document.getElementById("panelSync");
@@ -25,12 +26,13 @@ document.addEventListener("DOMContentLoaded", async () => {
   const panelParser = document.getElementById("panelParser");
   const panelLedger = document.getElementById("panelLedger");
   const panelTopicPin = document.getElementById("panelTopicPin");
+  const panelHotsearch = document.getElementById("panelHotsearch");
   const panelSettings = document.getElementById("panelSettings");
   const schedBadge = document.getElementById("schedBadge");
   const topicPinBadge = document.getElementById("topicPinBadge");
 
   const navTabIndicator = document.getElementById("navTabIndicator");
-  const tabOrder = ["sync", "schedule", "parser", "ledger", "topicPin", "settings"];
+  const tabOrder = ["sync", "schedule", "parser", "ledger", "topicPin", "hotsearch", "settings"];
   let activeTabName = "parser";
 
   const syncNavIndicator = (activeBtn, instant = false) => {
@@ -64,16 +66,19 @@ document.addEventListener("DOMContentLoaded", async () => {
     panel.classList.add("is-entering");
   };
 
-  const switchTab = (tabName) => {
+  const switchTab = (tabName, persist = true) => {
     const prevIdx = tabOrder.indexOf(activeTabName);
     const nextIdx = tabOrder.indexOf(tabName);
     const dir = prevIdx !== -1 && nextIdx !== -1 && prevIdx !== nextIdx ? (nextIdx > prevIdx ? 1 : -1) : 0;
     activeTabName = tabName;
+    if (persist && chrome?.storage?.local?.set) {
+      chrome.storage.local.set({ lastActivePopupTab: tabName }).catch(() => {});
+    }
 
-    [tabNavSync, tabNavSchedule, tabNavParser, tabNavLedger, tabNavTopicPin, tabNavSettings].forEach((btn) => {
+    [tabNavSync, tabNavSchedule, tabNavParser, tabNavLedger, tabNavTopicPin, tabNavHotsearch, tabNavSettings].forEach((btn) => {
       btn?.classList.remove("active", "is-fallback-bg");
     });
-    [panelSync, panelSchedule, panelParser, panelLedger, panelTopicPin, panelSettings].forEach((p) => {
+    [panelSync, panelSchedule, panelParser, panelLedger, panelTopicPin, panelHotsearch, panelSettings].forEach((p) => {
       if (p) {
         p.style.display = "none";
         p.classList.remove("is-entering");
@@ -101,6 +106,10 @@ document.addEventListener("DOMContentLoaded", async () => {
       activeBtn = tabNavTopicPin;
       activePanel = panelTopicPin;
       refreshTopicPinState();
+    } else if (tabName === "hotsearch") {
+      activeBtn = tabNavHotsearch;
+      activePanel = panelHotsearch;
+      refreshHotsearchState();
     } else if (tabName === "settings") {
       activeBtn = tabNavSettings;
       activePanel = panelSettings;
@@ -137,6 +146,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   tabNavParser?.addEventListener("click", () => switchTab("parser"));
   tabNavLedger?.addEventListener("click", () => switchTab("ledger"));
   tabNavTopicPin?.addEventListener("click", () => switchTab("topicPin"));
+  tabNavHotsearch?.addEventListener("click", () => switchTab("hotsearch"));
   tabNavSettings?.addEventListener("click", () => switchTab("settings"));
 
   // ── 3. 折叠日志面板 ──
@@ -162,12 +172,16 @@ document.addEventListener("DOMContentLoaded", async () => {
   const dryRunDesc = document.getElementById("dryRunDesc");
   const silentModeToggle = document.getElementById("silentModeToggle");
   const schedulePauseToggle = document.getElementById("schedulePauseToggle");
+  const allowDuplicateBypassToggle = document.getElementById("allowDuplicateBypassToggle");
   const dryRunActiveBanner = document.getElementById("dryRunActiveBanner");
   const btnDisableDryRunQuick = document.getElementById("btnDisableDryRunQuick");
   const btnGoToSettingsFromParser = document.getElementById("btnGoToSettingsFromParser");
   const btnScanTasks = document.getElementById("btnScanTasks");
   const btnToggleSelectAll = document.getElementById("btnToggleSelectAll");
+  const btnDeleteSelectedTasks = document.getElementById("btnDeleteSelectedTasks");
+  const btnClearScannedTasks = document.getElementById("btnClearScannedTasks");
   const taskCountBadge = document.getElementById("taskCountBadge");
+  const scanWriteColBanner = document.getElementById("scanWriteColBanner");
   const taskFilterBar = document.getElementById("taskFilterBar");
   const taskSearchInput = document.getElementById("taskSearchInput");
   const taskDocFilterChips = document.getElementById("taskDocFilterChips");
@@ -181,6 +195,138 @@ document.addEventListener("DOMContentLoaded", async () => {
   const progressBar = document.getElementById("progressBar");
   const progressStage = document.getElementById("progressStage");
   const progressPct = document.getElementById("progressPct");
+  const globalProgressWrap = document.getElementById("globalProgressWrap");
+  const globalProgressBar = document.getElementById("globalProgressBar");
+  const globalProgressStage = document.getElementById("globalProgressStage");
+  const globalProgressPct = document.getElementById("globalProgressPct");
+  const btnToggleGlobalJobs = document.getElementById("btnToggleGlobalJobs");
+  const btnCloseGlobalProgress = document.getElementById("btnCloseGlobalProgress");
+  const globalJobsDetail = document.getElementById("globalJobsDetail");
+  let globalJobsExpanded = false;
+  let lastGlobalJobs = [];
+  let globalProgressHideTimer = null;
+  let globalProgressDismissed = false;
+
+  btnCloseGlobalProgress?.addEventListener("click", () => {
+    if (globalProgressHideTimer) {
+      clearTimeout(globalProgressHideTimer);
+      globalProgressHideTimer = null;
+    }
+    globalProgressDismissed = true;
+    globalJobsExpanded = false;
+    if (globalJobsDetail) globalJobsDetail.style.display = "none";
+    if (globalProgressWrap) globalProgressWrap.style.display = "none";
+  });
+
+  function renderGlobalJobsDetail(jobs) {
+    if (!globalJobsDetail || !btnToggleGlobalJobs) return;
+    if (!Array.isArray(jobs) || jobs.length === 0) {
+      btnToggleGlobalJobs.style.display = "none";
+      globalJobsDetail.style.display = "none";
+      globalJobsDetail.innerHTML = "";
+      return;
+    }
+    const runningCount = jobs.filter((j) => j.isRunning).length;
+    btnToggleGlobalJobs.style.display = "inline-block";
+    btnToggleGlobalJobs.textContent = `${globalJobsExpanded ? "▴" : "▾"} 明细 (${runningCount > 0 ? runningCount : jobs.length})`;
+    if (!globalJobsExpanded) {
+      globalJobsDetail.style.display = "none";
+      return;
+    }
+    globalJobsDetail.style.display = "flex";
+    globalJobsDetail.innerHTML = jobs.map((j) => {
+      const pct = Math.max(0, Math.min(100, Number(j.percentage) || 0));
+      const rowCls = j.status === "error" ? "is-error" : (j.status === "done" && !j.isRunning ? "is-done" : "");
+      const stopBtn = j.isRunning && j.id === "pipeline"
+        ? `<button type="button" class="btn-xs btn-outline danger-text btn-stop-global-job" data-job-id="${escapeHtml(j.id)}" style="padding:0 5px;height:18px;font-size:10px;">⏹</button>`
+        : "";
+      return `
+        <div class="global-job-row ${rowCls}">
+          <span class="global-job-badge">${escapeHtml(j.label || j.id)}</span>
+          <span class="global-job-stage" title="${escapeHtml(j.stage || "")}">${escapeHtml(j.stage || "")}</span>
+          <div class="global-job-mini-track"><div class="global-job-mini-bar" style="width:${pct}%"></div></div>
+          <span class="global-job-pct">${pct}%</span>
+          ${stopBtn}
+        </div>
+      `;
+    }).join("");
+    globalJobsDetail.querySelectorAll(".btn-stop-global-job").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        if (btn.dataset.jobId === "pipeline") handleStopPipelineClick();
+      });
+    });
+  }
+
+  btnToggleGlobalJobs?.addEventListener("click", () => {
+    globalJobsExpanded = !globalJobsExpanded;
+    renderGlobalJobsDetail(lastGlobalJobs);
+  });
+
+  function syncProgressUI(stage, percentage, isRunning, activeJobs = null) {
+    const pct = Math.max(0, Math.min(100, Number(percentage) || 0));
+    const stageText = String(stage || "准备就绪");
+    if (progressWrap) progressWrap.style.display = "block";
+    if (progressStage) progressStage.textContent = stageText;
+    if (progressPct) progressPct.textContent = `${pct}%`;
+    if (progressBar) progressBar.style.width = `${pct}%`;
+
+    const jobs = Array.isArray(activeJobs) && activeJobs.length > 0
+      ? activeJobs
+      : [{ id: "pipeline", label: "主发博", stage: stageText, percentage: pct, isRunning: !!isRunning, status: isRunning ? "running" : (pct >= 100 ? "done" : "idle") }];
+    lastGlobalJobs = jobs;
+    const runningJobs = jobs.filter((j) => j.isRunning);
+    const hasError = jobs.some((j) => j.status === "error");
+    const anyRunning = runningJobs.length > 0 || !!isRunning;
+
+    let summaryStage = stageText;
+    let summaryPct = pct;
+    if (runningJobs.length >= 2) {
+      summaryPct = Math.round(runningJobs.reduce((sum, j) => sum + (Number(j.percentage) || 0), 0) / runningJobs.length);
+      summaryStage = `🚀 运行中 (${runningJobs.length} 项任务) · ${runningJobs.map((j) => `${j.label} ${Math.round(Number(j.percentage) || 0)}%`).join(" | ")}`;
+    } else if (runningJobs.length === 1) {
+      summaryPct = Math.round(Number(runningJobs[0].percentage) || pct);
+      summaryStage = `🚀 [${runningJobs[0].label}] ${runningJobs[0].stage || stageText}`;
+    } else if (hasError) {
+      summaryStage = `⚠️ ${jobs.find((j) => j.status === "error")?.stage || stageText}`;
+    } else if (summaryPct >= 100) {
+      summaryStage = `✅ ${stageText}`;
+    }
+
+    if (globalProgressStage) globalProgressStage.textContent = summaryStage;
+    if (globalProgressPct) globalProgressPct.textContent = `${summaryPct}%`;
+    if (globalProgressBar) globalProgressBar.style.width = `${summaryPct}%`;
+    if (globalProgressWrap) {
+      if (globalProgressHideTimer) {
+        clearTimeout(globalProgressHideTimer);
+        globalProgressHideTimer = null;
+      }
+      globalProgressWrap.classList?.toggle("is-running", anyRunning);
+      globalProgressWrap.classList?.toggle("has-error", !anyRunning && hasError);
+      globalProgressWrap.classList?.toggle("is-done", !anyRunning && !hasError && summaryPct >= 100);
+      if (btnCloseGlobalProgress) {
+        btnCloseGlobalProgress.style.display = !anyRunning && (hasError || summaryPct >= 100) ? "inline-block" : "none";
+      }
+      if (anyRunning) {
+        globalProgressDismissed = false;
+        globalProgressWrap.style.display = "block";
+      } else if (hasError) {
+        if (!globalProgressDismissed) globalProgressWrap.style.display = "block";
+      } else if (summaryPct >= 100) {
+        if (!globalProgressDismissed) {
+          globalProgressWrap.style.display = "block";
+          globalProgressHideTimer = setTimeout(() => {
+            if (globalProgressWrap) globalProgressWrap.style.display = "none";
+            globalJobsExpanded = false;
+            if (globalJobsDetail) globalJobsDetail.style.display = "none";
+            globalProgressHideTimer = null;
+          }, 4000);
+        }
+      } else {
+        globalProgressWrap.style.display = "none";
+      }
+    }
+    renderGlobalJobsDetail(jobs);
+  }
 
   // 定时面板控件
   const schedModeRadios = document.querySelectorAll('input[name="schedMode"]');
@@ -226,9 +372,13 @@ document.addEventListener("DOMContentLoaded", async () => {
   const ledgerFilterChips = document.querySelectorAll("#ledgerFilterChips .filter-chip");
   const ledgerSearchInput = document.getElementById("ledgerSearchInput");
   const ledgerDocFilter = document.getElementById("ledgerDocFilter");
+  const ledgerAccountFilter = document.getElementById("ledgerAccountFilter");
+  const ledgerGroupMode = document.getElementById("ledgerGroupMode");
+  const collapsedLedgerGroups = new Set();
   const btnCopyLedgerLinks = document.getElementById("btnCopyLedgerLinks");
   const btnExportLedgerCsv = document.getElementById("btnExportLedgerCsv");
   const btnClearLedger = document.getElementById("btnClearLedger");
+  const btnClearPublishClaims = document.getElementById("btnClearPublishClaims");
 
   // 任务解析控件
   const taskParserInput = document.getElementById("taskParserInput");
@@ -242,6 +392,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   const parsedTasksPreviewContainer = document.getElementById("parsedTasksPreviewContainer");
   const btnParserToSchedule = document.getElementById("btnParserToSchedule");
   const btnParserRunNow = document.getElementById("btnParserRunNow");
+  const parserAllowDuplicateOnceToggle = document.getElementById("parserAllowDuplicateOnceToggle");
 
   // 支持的发布账号管理控件
   const supportedAccountsListContainer = document.getElementById("supportedAccountsListContainer");
@@ -287,6 +438,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   // 状态变量
   let docSlots = [];
   let scannedTasks = [];
+  const taskSelectionOverrides = new Map();
   let cachedScheduledTasks = [];
   let cachedPlatformAccounts = [];
   let customAccounts = [];
@@ -331,11 +483,32 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   // ── 5. 多文档卡槽初始化与渲染 ──
   const defaultSlots = [
-    { id: "slot_1", name: "文档 1 (主表)", url: "", linkCol: "E" },
-    { id: "slot_2", name: "文档 2 (副表)", url: "", linkCol: "E" },
+    { id: "slot_1", name: "文档 1 (主表)", url: "", linkCol: "H" },
+    { id: "slot_2", name: "文档 2 (副表)", url: "", linkCol: "H" },
   ];
 
-  chrome.storage.local.get(["docPresets", "docUrl", "linkCol", "dryRun", "silentMode", "cachedScannedTasks", "cachedScannedAt", "scheduledTasks", "cachedPlatformAccounts", "customAccounts", "disabledAccounts", "docSlotsCollapsed"], (stored) => {
+  function renderScanWriteColBanner(docLinkCols) {
+    if (!scanWriteColBanner) return;
+    const entries = Object.values(docLinkCols || {}).filter((item) => item && item.col);
+    if (!entries.length) {
+      scanWriteColBanner.style.display = "none";
+      scanWriteColBanner.classList.remove("has-warning");
+      scanWriteColBanner.innerHTML = "";
+      return;
+    }
+    const hasWarn = entries.some((item) => item.warning);
+    scanWriteColBanner.classList.toggle("has-warning", hasWarn);
+    const pills = entries.map((item) => {
+      const prefix = entries.length > 1 && item.docName ? `${escapeHtml(item.docName)}：` : "";
+      const src = item.source ? `（${escapeHtml(item.source)}）` : "";
+      const warn = item.warning ? ` · ⚠ ${escapeHtml(item.warning)}` : "";
+      return `<span class="scan-write-col-pill">${prefix}写回列 ${escapeHtml(item.col)} 列${src}</span>${warn ? `<span class="scan-write-col-warn">${warn}</span>` : ""}`;
+    });
+    scanWriteColBanner.innerHTML = `<span>📌 当前回写列：</span>${pills.join("")}`;
+    scanWriteColBanner.style.display = "flex";
+  }
+
+  chrome.storage.local.get(["docPresets", "docUrl", "linkCol", "dryRun", "silentMode", "allowDuplicateBypass", "cachedScannedTasks", "cachedScannedAt", "cachedDocLinkCols", "scheduledTasks", "cachedPlatformAccounts", "customAccounts", "disabledAccounts", "docSlotsCollapsed"], (stored) => {
     if (Array.isArray(stored.scheduledTasks)) {
       cachedScheduledTasks = stored.scheduledTasks;
     }
@@ -350,11 +523,14 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
     renderSupportedAccountsList();
     if (Array.isArray(stored.docPresets) && stored.docPresets.length > 0) {
-      docSlots = stored.docPresets;
+      docSlots = stored.docPresets.map((s) => ({
+        ...s,
+        linkCol: (!s.manualLinkCol && (!s.linkCol || s.linkCol === "E")) ? "H" : s.linkCol,
+      }));
     } else if (stored.docUrl) {
       docSlots = [
-        { id: "slot_1", name: "文档 1 (主表)", url: stored.docUrl, linkCol: stored.linkCol || "E" },
-        { id: "slot_2", name: "文档 2 (副表)", url: "", linkCol: "E" },
+        { id: "slot_1", name: "文档 1 (主表)", url: stored.docUrl, linkCol: stored.linkCol || "H" },
+        { id: "slot_2", name: "文档 2 (副表)", url: "", linkCol: "H" },
       ];
     } else {
       docSlots = defaultSlots;
@@ -364,6 +540,9 @@ document.addEventListener("DOMContentLoaded", async () => {
 
     if (silentModeToggle) {
       silentModeToggle.checked = stored.silentMode !== false; // 默认开启静默无感发博
+    }
+    if (allowDuplicateBypassToggle) {
+      allowDuplicateBypassToggle.checked = stored.allowDuplicateBypass === true;
     }
 
     renderDocSlots();
@@ -391,12 +570,18 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
 
     if (Array.isArray(stored.cachedScannedTasks) && stored.cachedScannedTasks.length > 0) {
-      scannedTasks = stored.cachedScannedTasks;
-      renderTaskList(scannedTasks);
-      if (taskCountBadge && stored.cachedScannedAt) {
-        const cacheTime = new Date(stored.cachedScannedAt).toLocaleTimeString("zh-CN", { hour12: false, hour: "2-digit", minute: "2-digit" });
-        taskCountBadge.textContent = `共 ${scannedTasks.length} 条 (缓存 ${cacheTime})`;
-        taskCountBadge.title = "来自上次扫描缓存，若云文档已更新请点击【重新扫描全部文档】";
+      const cacheAgeMs = stored.cachedScannedAt ? Date.now() - Number(stored.cachedScannedAt) : 0;
+      if (stored.cachedScannedAt && cacheAgeMs >= 24 * 60 * 60 * 1000) {
+        chrome.storage.local.set({ cachedScannedTasks: [], cachedScannedAt: 0 });
+      } else {
+        scannedTasks = stored.cachedScannedTasks;
+        renderScanWriteColBanner(stored.cachedDocLinkCols || {});
+        renderTaskList(scannedTasks);
+        if (taskCountBadge && stored.cachedScannedAt) {
+          const cacheTime = new Date(stored.cachedScannedAt).toLocaleTimeString("zh-CN", { hour12: false, hour: "2-digit", minute: "2-digit" });
+          taskCountBadge.textContent = `共 ${scannedTasks.length} 条 (缓存 ${cacheTime})`;
+          taskCountBadge.title = "来自上次扫描缓存，若云文档已更新请点击【重新扫描全部文档】";
+        }
       }
     }
   });
@@ -412,11 +597,11 @@ document.addEventListener("DOMContentLoaded", async () => {
           logs.forEach((item) => renderLogItem(item.detail, item.level, item.time));
         }
         updatePipelineControls(!!isRunning);
-        if (isRunning) {
-          progressWrap.style.display = "block";
-          progressStage.textContent = stage;
-          progressPct.textContent = `${percentage}%`;
-          progressBar.style.width = `${percentage}%`;
+        const recentJobs = Array.isArray(resp.activeJobs) ? resp.activeJobs : [];
+        const hasRecentActivity = isRunning ||
+          recentJobs.some((j) => j.isRunning || j.status === "error" || (j.updatedAt && Date.now() - j.updatedAt < 5000));
+        if (hasRecentActivity) {
+          syncProgressUI(stage, percentage, !!isRunning, recentJobs);
         }
       }
     });
@@ -451,6 +636,16 @@ document.addEventListener("DOMContentLoaded", async () => {
     return "📌 默认首个工作表";
   }
 
+  function cleanCloudDocTitle(rawTitle) {
+    const cleaned = String(rawTitle || "")
+      .replace(/\s*[-–—|]\s*(?:腾讯在线文档|腾讯文档|钉钉文档|钉钉).*$/i, "")
+      .trim();
+    if (!cleaned || /^(?:腾讯在线文档|腾讯文档|钉钉文档|加载中\.{0,3}|无标题)$/i.test(cleaned)) {
+      return "";
+    }
+    return cleaned;
+  }
+
   function renderDocSlots() {
     docSlotsContainer.innerHTML = "";
     if (docSlotsCount) {
@@ -471,7 +666,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       row.innerHTML = `
         <div class="doc-slot-top">
           <div class="doc-slot-badge-group">
-            <input type="text" class="doc-slot-name-input ${slotBadgeClass}" maxlength="24" placeholder="${escapeHtml(defaultName)}" value="${escapeHtml(slotName)}" title="点击修改文档自定义名称">
+            <input type="text" class="doc-slot-name-input ${slotBadgeClass}" maxlength="80" placeholder="${escapeHtml(defaultName)}" value="${escapeHtml(slotName)}" title="点击修改文档自定义名称">
             <span class="doc-slot-tag-pos" title="${escapeHtml(posHint)}">${escapeHtml(posHint)}</span>
           </div>
           <div class="doc-slot-quick-btns">
@@ -484,7 +679,10 @@ document.addEventListener("DOMContentLoaded", async () => {
           <input type="text" class="doc-slot-url-input" placeholder="输入或粘贴腾讯文档/钉钉表格链接 (含 tab=xxx 指定子表)..." value="${escapeHtml(slot.url || "")}">
         </div>
         <div class="doc-slot-subbar">
-          <span class="doc-slot-tab-hint">💡 自动智能识别表头中的账号、正文、配图与发布回执列</span>
+          <span class="doc-slot-tab-hint">💡 智能识别表头，表头空白时按兜底列回写</span>
+          <label class="doc-slot-col-wrap" title="当表头未写“微博链接/回执”等名称时，默认回写到该列（如 H）">
+            回写列<input type="text" class="doc-slot-col-input" maxlength="3" placeholder="H" value="${escapeHtml((slot.linkCol || "H").toUpperCase())}">
+          </label>
         </div>
       `;
 
@@ -507,6 +705,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         nameInput.addEventListener("input", (e) => {
           const val = e.target.value.trim();
           slot.name = val || defaultName;
+          slot.manualName = !!val;
           saveSlotsConfig();
           syncScannedDocName(slot.name);
         });
@@ -514,6 +713,7 @@ document.addEventListener("DOMContentLoaded", async () => {
           const val = e.target.value.trim();
           const finalName = val || defaultName;
           slot.name = finalName;
+          slot.manualName = !!val;
           e.target.value = finalName;
           saveSlotsConfig();
           syncScannedDocName(finalName);
@@ -525,11 +725,31 @@ document.addEventListener("DOMContentLoaded", async () => {
       const posTag = row.querySelector(".doc-slot-tag-pos");
 
       urlInput.addEventListener("input", (e) => {
-        slot.url = e.target.value.trim();
+        const nextUrl = e.target.value.trim();
+        if (nextUrl !== slot.url) slot.manualName = false;
+        slot.url = nextUrl;
         posTag.textContent = parseSubSheetHint(slot.url);
         posTag.title = posTag.textContent;
         saveSlotsConfig();
       });
+
+      const linkColInput = row.querySelector(".doc-slot-col-input");
+      if (linkColInput) {
+        linkColInput.addEventListener("input", (e) => {
+          const cleanCol = e.target.value.replace(/[^a-zA-Z]/g, "").toUpperCase().slice(0, 3);
+          e.target.value = cleanCol;
+          slot.linkCol = cleanCol || "H";
+          slot.manualLinkCol = !!cleanCol;
+          saveSlotsConfig();
+        });
+        linkColInput.addEventListener("blur", (e) => {
+          const cleanCol = e.target.value.replace(/[^a-zA-Z]/g, "").toUpperCase().slice(0, 3);
+          e.target.value = cleanCol || "H";
+          slot.linkCol = cleanCol || "H";
+          slot.manualLinkCol = !!cleanCol;
+          saveSlotsConfig();
+        });
+      }
 
       // 绑定“填入当前页”
       const btnFillCurr = row.querySelector(".btn-fill-curr");
@@ -539,9 +759,16 @@ document.addEventListener("DOMContentLoaded", async () => {
           if (tab && tab.url) {
             if (tab.url.includes("docs.qq.com") || tab.url.includes("alidocs.dingtalk.com")) {
               slot.url = tab.url;
+              slot.manualName = false;
               urlInput.value = tab.url;
               posTag.textContent = parseSubSheetHint(tab.url);
               posTag.title = posTag.textContent;
+              const pageDocTitle = cleanCloudDocTitle(tab.title || "");
+              if (pageDocTitle) {
+                slot.name = pageDocTitle;
+                if (nameInput) nameInput.value = pageDocTitle;
+                syncScannedDocName(pageDocTitle);
+              }
               saveSlotsConfig();
               appendLog(`已成功将当前页填入 [${slot.name || defaultName}]: ${tab.title || tab.url}`, "success");
             } else {
@@ -584,7 +811,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       id: `slot_${Date.now()}`,
       name: `文档 ${newIdx}`,
       url: "",
-      linkCol: "E",
+      linkCol: "H",
     };
     docSlots.push(newSlot);
     saveSlotsConfig();
@@ -636,6 +863,10 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (btnAddToSchedule) {
       btnAddToSchedule.textContent = `⏰ 定时发布${countParen}`;
     }
+    if (btnDeleteSelectedTasks) {
+      btnDeleteSelectedTasks.disabled = selectedCount === 0;
+      btnDeleteSelectedTasks.textContent = `🗑️ 删除已选${countParen}`;
+    }
     if (taskCountBadge && scannedTasks.length > 0) {
       taskCountBadge.textContent = `已选 ${selectedCount} / 共 ${scannedTasks.length} 条`;
     }
@@ -680,14 +911,30 @@ document.addEventListener("DOMContentLoaded", async () => {
           docs: targetSlots.map((s, idx) => ({
             id: s.id,
             name: s.name || `文档 ${idx + 1}`,
+            manualName: !!s.manualName,
             url: s.url.trim(),
-            linkCol: (s.linkCol || "E").trim().toUpperCase(),
+            linkCol: (s.linkCol || "H").trim().toUpperCase(),
+            manualLinkCol: !!s.manualLinkCol,
           })),
         },
       });
 
       if (resp && resp.ok) {
         scannedTasks = resp.tasks || [];
+        const docTitles = resp.docTitles || {};
+        let slotsTitleUpdated = false;
+        docSlots.forEach((s) => {
+          const matchedTaskTitle = scannedTasks.find((t) => t.docId === s.id && t.docTitle)?.docTitle || "";
+          const nextTitle = cleanCloudDocTitle(docTitles[s.id] || matchedTaskTitle || "");
+          if (nextTitle && !s.manualName && s.name !== nextTitle) {
+            s.name = nextTitle;
+            slotsTitleUpdated = true;
+          }
+        });
+        if (slotsTitleUpdated) {
+          saveSlotsConfig();
+          renderDocSlots();
+        }
         const compactCached = scannedTasks.slice(0, 300).map((t) => ({
           docId: t.docId,
           docIndex: t.docIndex,
@@ -707,7 +954,9 @@ document.addEventListener("DOMContentLoaded", async () => {
         chrome.storage.local.set({
           cachedScannedTasks: compactCached,
           cachedScannedAt: compactCached.length > 0 ? Date.now() : 0,
+          cachedDocLinkCols: resp.docLinkCols || {},
         }).catch(() => {});
+        renderScanWriteColBanner(resp.docLinkCols || {});
         if (taskCountBadge) taskCountBadge.title = "";
         renderTaskList(scannedTasks);
         appendLog(`扫描完成！共发现 ${scannedTasks.length} 条待发布任务`, scannedTasks.length ? "success" : "warn");
@@ -766,7 +1015,18 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (imagePreviewImg) {
       imagePreviewImg.dataset.rawUrl = rawUrl;
       imagePreviewImg.dataset.fallbackTried = "0";
-      imagePreviewImg.src = resolvedSrc;
+      const needsProxyFetch = rawUrl.includes("alidocs.dingtalk.com") && !previewImageCache.has(rawUrl);
+      if (needsProxyFetch) {
+        imagePreviewImg.src = "";
+        imagePreviewImg.dataset.fallbackTried = "1";
+        resolvePreviewImageFallback(rawUrl, previewState.docUrl).then((dataUrl) => {
+          if (dataUrl && imagePreviewImg.dataset?.rawUrl === rawUrl) {
+            imagePreviewImg.src = dataUrl;
+          }
+        });
+      } else {
+        imagePreviewImg.src = resolvedSrc;
+      }
     }
   }
 
@@ -849,15 +1109,81 @@ document.addEventListener("DOMContentLoaded", async () => {
           img.style.display = "none";
         }
       });
+      if (img.dataset?.needsFetch === "1") {
+        const rawUrl = img.dataset?.rawUrl || "";
+        if (rawUrl) {
+          img.dataset.fallbackTried = "1";
+          const taskIdx = parseInt(img.dataset?.taskIndex ?? "0", 10);
+          const docUrl = typeof getDocUrl === "function" ? getDocUrl(taskIdx) : getDocUrl;
+          resolvePreviewImageFallback(rawUrl, docUrl).then((dataUrl) => {
+            if (dataUrl) {
+              img.src = dataUrl;
+              img.style.display = "";
+            } else {
+              img.style.display = "none";
+            }
+          });
+        }
+      }
     });
   }
 
+  function rememberTaskSelection(cb) {
+    const task = scannedTasks[Number(cb.dataset.taskIndex)];
+    if (task) taskSelectionOverrides.set(getTaskCardId(task), cb.checked);
+  }
+
+  function persistScannedTasksCache() {
+    const compactCached = scannedTasks.slice(0, 300).map((t) => ({
+      docUrl: t.docUrl,
+      docName: t.docName,
+      docIndex: t.docIndex,
+      docPlatform: t.docPlatform,
+      targetSheetId: t.targetSheetId,
+      linkCol: t.linkCol,
+      row: t.row,
+      targetCell: t.targetCell,
+      account: t.account,
+      content: t.content,
+      time: t.time,
+      imgUrls: Array.isArray(t.imgUrls) ? t.imgUrls.slice(0, 9) : [],
+    }));
+    chrome.storage.local.set({
+      cachedScannedTasks: compactCached,
+      cachedScannedAt: compactCached.length > 0 ? Date.now() : 0,
+    });
+  }
+
+  function removeScannedTasksByIds(idSet) {
+    if (!idSet || idSet.size === 0) return 0;
+    const beforeLen = scannedTasks.length;
+    scannedTasks = scannedTasks.filter((t) => {
+      const id = getTaskCardId(t);
+      const keep = !idSet.has(id);
+      if (!keep) taskSelectionOverrides.delete(id);
+      return keep;
+    });
+    const removed = beforeLen - scannedTasks.length;
+    if (removed > 0) {
+      persistScannedTasksCache();
+      renderTaskList(scannedTasks);
+    }
+    return removed;
+  }
+
   function renderTaskList(tasks) {
+    const validTaskIds = new Set((tasks || []).map(getTaskCardId));
+    for (const id of taskSelectionOverrides.keys()) {
+      if (!validTaskIds.has(id)) taskSelectionOverrides.delete(id);
+    }
+    btnToggleSelectAll.title = "全选/取消仅作用于当前筛选结果；立即发布与定时发布也仅处理当前可见勾选项";
     taskListContainer.innerHTML = "";
     if (!tasks || tasks.length === 0) {
       taskListContainer.innerHTML = `<div class="empty-placeholder">没有发现未填链接的待发任务（所有行均已写回或正文为空）</div>`;
       taskCountBadge.textContent = "0 条";
       btnToggleSelectAll.style.display = "none";
+      if (btnDeleteSelectedTasks) btnDeleteSelectedTasks.style.display = "none";
+      if (btnClearScannedTasks) btnClearScannedTasks.style.display = "none";
       if (taskFilterBar) taskFilterBar.style.display = "none";
       if (taskDocFilterChips) taskDocFilterChips.style.display = "none";
       updateDryRunUI(dryRunToggle.checked);
@@ -866,6 +1192,8 @@ document.addEventListener("DOMContentLoaded", async () => {
 
     taskCountBadge.textContent = `共 ${tasks.length} 条`;
     btnToggleSelectAll.style.display = "inline-block";
+    if (btnDeleteSelectedTasks) btnDeleteSelectedTasks.style.display = "inline-block";
+    if (btnClearScannedTasks) btnClearScannedTasks.style.display = "inline-block";
     if (taskFilterBar) taskFilterBar.style.display = "block";
 
     const distinctDocs = Array.from(new Set(tasks.map((t) => t.docName || `文档 ${t.docIndex || 1}`)));
@@ -916,6 +1244,7 @@ document.addEventListener("DOMContentLoaded", async () => {
 
       const schedKey = `${String(t.docUrl || "").trim()}|${String(t.targetSheetId || "")}|${String(t.row ?? "")}`;
       const isAlreadyScheduled = Boolean(t.docUrl && t.row != null && activeSchedKeys.has(schedKey));
+      const isSelected = taskSelectionOverrides.get(getTaskCardId(t)) ?? !isAlreadyScheduled;
       const scheduledBadge = isAlreadyScheduled
         ? `<span class="sched-status-pill pending" title="该行已在定时队列等待触发，默认取消勾选以防重复排程">⏰ 已排程</span>`
         : "";
@@ -928,13 +1257,19 @@ document.addEventListener("DOMContentLoaded", async () => {
         ? `<span class="sched-sub-meta" title="点击下方缩略图可放大预览">🖼️ ${imgList.length}张</span>`
         : "";
       const thumbsHtml = imgList.length > 0
-        ? `<div class="task-images-row">${imgList.map((u, imgIdx) => `
-            <img src="${escapeHtml(getPreviewImageSrc(u))}" class="task-thumb-img" referrerpolicy="no-referrer" data-task-index="${index}" data-img-index="${imgIdx}" data-raw-url="${escapeHtml(u)}" title="点击放大预览配图 ${imgIdx + 1}">
-          `).join("")}</div>`
+        ? `<div class="task-images-row">${imgList.map((u, imgIdx) => {
+            const isDingTalkImg = String(u || "").includes("alidocs.dingtalk.com");
+            const cached = previewImageCache.has(String(u || "").trim());
+            const needsFetch = isDingTalkImg && !cached;
+            const imgSrc = needsFetch ? "" : getPreviewImageSrc(u);
+            return `
+            <img src="${escapeHtml(imgSrc)}" class="task-thumb-img"${isDingTalkImg ? "" : ' referrerpolicy="no-referrer"'}${needsFetch ? ' data-needs-fetch="1"' : ""} data-task-index="${index}" data-img-index="${imgIdx}" data-raw-url="${escapeHtml(u)}" title="点击放大预览配图 ${imgIdx + 1}">
+          `;
+          }).join("")}</div>`
         : "";
 
       card.innerHTML = `
-        <input type="checkbox" class="task-item-cb" data-task-index="${index}" ${isAlreadyScheduled ? "" : "checked"} style="margin-top: 3px;">
+        <input type="checkbox" class="task-item-cb" data-task-index="${index}" ${isSelected ? "checked" : ""} style="margin-top: 3px;">
         <div class="sched-card-body">
           <div class="sched-card-header">
             <div class="sched-card-left-meta">
@@ -944,6 +1279,9 @@ document.addEventListener("DOMContentLoaded", async () => {
               ${imgHint}
               ${timeHint}
               ${scheduledBadge}
+            </div>
+            <div class="sched-card-actions">
+              <button type="button" class="btn-xs btn-outline danger-text task-delete-btn" data-task-index="${index}" title="从待发清单中删除此条">🗑️ 删除</button>
             </div>
           </div>
           <div class="sched-card-content" title="点击展开/收起全文">${escapeHtml(t.content)}</div>
@@ -959,7 +1297,10 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
 
     taskListContainer.querySelectorAll(".task-item-cb").forEach((cb) => {
-      cb.addEventListener("change", () => updateDryRunUI(dryRunToggle.checked));
+      cb.addEventListener("change", () => {
+        rememberTaskSelection(cb);
+        updateDryRunUI(dryRunToggle.checked);
+      });
     });
 
     taskListContainer.querySelectorAll(".sched-card-header").forEach((hdr) => {
@@ -970,6 +1311,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         const cb = card ? card.querySelector(".task-item-cb") : null;
         if (cb) {
           cb.checked = !cb.checked;
+          rememberTaskSelection(cb);
           updateDryRunUI(dryRunToggle.checked);
         }
       });
@@ -977,6 +1319,18 @@ document.addEventListener("DOMContentLoaded", async () => {
 
     taskListContainer.querySelectorAll(".sched-card-content").forEach((el) => {
       el.addEventListener("click", () => el.classList.toggle("is-expanded"));
+    });
+
+    taskListContainer.querySelectorAll(".task-delete-btn").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e?.stopPropagation?.();
+        const task = scannedTasks[Number(btn.dataset.taskIndex)];
+        if (!task) return;
+        const removed = removeScannedTasksByIds(new Set([getTaskCardId(task)]));
+        if (removed > 0) {
+          appendLog(`已从待发清单移除 1 条任务（${task.account || "默认账号"} · 行 ${task.row}）`, "info");
+        }
+      });
     });
 
     bindThumbImages(
@@ -1000,8 +1354,32 @@ document.addEventListener("DOMContentLoaded", async () => {
   btnToggleSelectAll.addEventListener("click", () => {
     const checkboxes = taskListContainer.querySelectorAll(".task-item-cb");
     const anyUnchecked = Array.from(checkboxes).some((cb) => !cb.checked);
-    checkboxes.forEach((cb) => (cb.checked = anyUnchecked));
+    checkboxes.forEach((cb) => {
+      cb.checked = anyUnchecked;
+      rememberTaskSelection(cb);
+    });
     updateDryRunUI(dryRunToggle.checked);
+  });
+
+  btnDeleteSelectedTasks?.addEventListener("click", () => {
+    const selected = getSelectedTasks();
+    if (selected.length === 0) return;
+    const removed = removeScannedTasksByIds(new Set(selected.map(getTaskCardId)));
+    if (removed > 0) {
+      appendLog(`已从待发清单删除 ${removed} 条已选任务`, "info");
+    }
+  });
+
+  btnClearScannedTasks?.addEventListener("click", () => {
+    if (scannedTasks.length === 0) return;
+    const total = scannedTasks.length;
+    scannedTasks = [];
+    taskSelectionOverrides.clear();
+    persistScannedTasksCache();
+    renderScanWriteColBanner({});
+    chrome.storage.local.set({ cachedDocLinkCols: {} }).catch(() => {});
+    renderTaskList(scannedTasks);
+    appendLog(`已清空待发任务清单（共移除 ${total} 条）`, "info");
   });
 
   // ── 7. 定时排程选项与入队确认弹窗逻辑 ──
@@ -1132,6 +1510,20 @@ document.addEventListener("DOMContentLoaded", async () => {
 
     if (pendingEnqueueSource === "parser") {
       if (parsedTaskGroups.length === 0) return;
+      for (let i = 0; i < parsedTaskGroups.length; i++) {
+        const item = parsedTaskGroups[i];
+        if (!String(item?.content || "").trim()) {
+          appendLog(`第 ${i + 1} 组任务正文为空，请补充后再加入定时！`, "warn");
+          return;
+        }
+        if (item?.poll) {
+          const validOpts = (item.poll.options || []).map((o) => String(o || "").trim()).filter(Boolean);
+          if (validOpts.length < 2) {
+            appendLog(`第 ${i + 1} 组投票任务有效选项不足 2 个，请补充后再加入定时！`, "warn");
+            return;
+          }
+        }
+      }
       const parserMode = document.querySelector('input[name="parserSchedMode"]:checked')?.value || "stagger";
       let customTs = 0;
       if (parserMode === "custom") {
@@ -1166,6 +1558,7 @@ document.addEventListener("DOMContentLoaded", async () => {
             : null,
           repostUrl: t.repostUrl || "",
           commentOriginal: !!t.commentOriginal,
+          scatterPublish: !!t.scatterPublish,
           imgUrls: [],
           fireAtTimestamp: fireTs,
           fireAtTime: fireStr,
@@ -1678,7 +2071,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       return;
     }
 
-    filteredTasks.forEach((t) => {
+    filteredTasks.forEach((t, index) => {
       const card = document.createElement("div");
       card.className = "sched-item-card";
       card.id = `sched-card-${t.id}`;
@@ -1711,14 +2104,22 @@ document.addEventListener("DOMContentLoaded", async () => {
       const cellHint = t.targetCell && t.targetCell !== "-" ? ` · ${escapeHtml(t.targetCell)}` : "";
       const rowHint = t.row && t.row !== "-" ? ` · #行${t.row}` : "";
       const pollMeta = t.poll ? `<span class="sched-sub-meta is-poll">📊 投票</span>` : "";
-      const imgMeta = (t.imgUrls && t.imgUrls.length > 0)
-        ? `<span class="sched-sub-meta is-img btn-sched-img-preview" data-id="${t.id}" title="点击放大预览全部配图">🖼️ ${t.imgUrls.length}图</span>`
+      const safeTaskId = escapeHtml(t.id);
+      const safePostUrl = sanitizeHttpUrl(t.postUrl);
+      const schedImgList = Array.isArray(t.imgUrls) ? t.imgUrls.filter(Boolean).slice(0, 9) : [];
+      const imgMeta = schedImgList.length > 0
+        ? `<span class="sched-sub-meta is-img btn-sched-img-preview" data-id="${safeTaskId}" title="点击放大预览全部配图">🖼️ ${schedImgList.length}图</span>`
+        : "";
+      const schedThumbsHtml = schedImgList.length > 0
+        ? `<div class="task-images-row">${schedImgList.map((u, imgIdx) => `
+            <img src="${escapeHtml(getPreviewImageSrc(u))}" class="task-thumb-img" referrerpolicy="no-referrer" data-task-index="${index}" data-img-index="${imgIdx}" data-raw-url="${escapeHtml(u)}" title="点击放大预览配图 ${imgIdx + 1}">
+          `).join("")}</div>`
         : "";
 
       const isChecked = selectedSchedIds.has(t.id);
 
       card.innerHTML = `
-        <input type="checkbox" class="task-item-cb sched-item-cb" data-id="${t.id}" ${isChecked ? "checked" : ""} style="margin-top: 4px;">
+        <input type="checkbox" class="task-item-cb sched-item-cb" data-id="${safeTaskId}" ${isChecked ? "checked" : ""} style="margin-top: 4px;">
         <div class="sched-card-body">
           <div class="sched-card-header">
             <div class="sched-card-left-meta">
@@ -1734,6 +2135,7 @@ document.addEventListener("DOMContentLoaded", async () => {
           </div>
 
           <div class="sched-card-content" title="${escapeHtml(t.content)}">${escapeHtml(t.content)}</div>
+          ${schedThumbsHtml}
 
           ${t.status === "error" && t.error ? `
             <div style="font-size:11px;color:#991B1B;background:#FEF2F2;padding:4px 8px;border-radius:4px;border:1px solid #FECACA;">
@@ -1750,20 +2152,20 @@ document.addEventListener("DOMContentLoaded", async () => {
             <div class="sched-card-tags">
               <span class="sched-sub-meta">📄 ${escapeHtml(docName)}${rowHint}${cellHint}</span>
               <span class="sched-mode-dot ${t.dryRun !== false ? "is-dry" : "is-live"}">${t.dryRun !== false ? "演练" : "实盘"}</span>
-              ${t.postUrl ? `<a href="${escapeHtml(t.postUrl)}" target="_blank" style="color:var(--primary);text-decoration:none;font-weight:600;">🔗 微博直链 ↗</a>` : ""}
+              ${safePostUrl ? `<a href="${escapeHtml(safePostUrl)}" target="_blank" rel="noopener noreferrer" style="color:var(--primary);text-decoration:none;font-weight:600;">🔗 微博直链 ↗</a>` : ""}
             </div>
             <div class="sched-card-actions">
               ${(t.status === "pending" || t.status === "error") ? `
-                <button type="button" class="sched-btn-clean primary btn-fire-now" data-id="${t.id}">🚀 立即发布</button>
-                <button type="button" class="sched-btn-clean btn-delay-10" data-id="${t.id}" title="顺延10分钟">+10分</button>
-                <button type="button" class="sched-btn-clean btn-edit-task" data-id="${t.id}">✏️ 编辑</button>
-                <button type="button" class="sched-btn-clean danger btn-cancel-sched" data-id="${t.id}">🗑️ 取消</button>
+                <button type="button" class="sched-btn-clean primary btn-fire-now" data-id="${safeTaskId}">🚀 立即发布</button>
+                <button type="button" class="sched-btn-clean btn-delay-10" data-id="${safeTaskId}" title="顺延10分钟">+10分</button>
+                <button type="button" class="sched-btn-clean btn-edit-task" data-id="${safeTaskId}">✏️ 编辑</button>
+                <button type="button" class="sched-btn-clean danger btn-cancel-sched" data-id="${safeTaskId}">🗑️ 取消</button>
               ` : ""}
               ${(t.status === "done" && t.postUrl && !t.writeBackOk && t.dryRun === false && !t.preparedOnly && t.targetCell && t.targetCell !== "-" && t.docUrl) ? `
-                <button type="button" class="sched-btn-clean primary btn-retry-writeback" data-id="${t.id}">📝 补写文档</button>
+                <button type="button" class="sched-btn-clean primary btn-retry-writeback" data-id="${safeTaskId}">📝 补写文档</button>
               ` : ""}
               ${t.status === "done" ? `
-                <button type="button" class="sched-btn-clean btn-cancel-sched" data-id="${t.id}">🗑️ 删除</button>
+                <button type="button" class="sched-btn-clean btn-cancel-sched" data-id="${safeTaskId}">🗑️ 删除</button>
               ` : ""}
             </div>
           </div>
@@ -1796,6 +2198,12 @@ document.addEventListener("DOMContentLoaded", async () => {
         }
       });
     });
+
+    bindThumbImages(
+      schedListContainer,
+      (taskIdx) => (filteredTasks[taskIdx]?.imgUrls || []).filter(Boolean).slice(0, 9),
+      (taskIdx) => filteredTasks[taskIdx]?.docUrl || ""
+    );
 
     schedListContainer.querySelectorAll(".sched-card-content").forEach((el) => {
       el.addEventListener("click", () => {
@@ -2154,8 +2562,29 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
   }
 
+  function showToast(msg, type = "info") {
+    if (typeof document === "undefined" || typeof document.createElement !== "function") return;
+    const container = document.getElementById("uiToastContainer");
+    if (!container) return;
+    const toast = document.createElement("div");
+    toast.className = `ui-toast is-${type}`;
+    toast.textContent = String(msg || "").slice(0, 120);
+    container.appendChild(toast);
+    while (container.children.length > 3) {
+      container.removeChild(container.firstChild);
+    }
+    setTimeout(() => toast.classList.add("is-visible"), 10);
+    setTimeout(() => {
+      toast.classList.remove("is-visible");
+      setTimeout(() => toast.remove(), 220);
+    }, type === "error" ? 3600 : 2400);
+  }
+
   function appendLog(msg, type = "info") {
     renderLogItem(msg, type);
+    if (type === "success" || type === "error") {
+      showToast(msg, type);
+    }
   }
 
   btnCopyLog?.addEventListener("click", async (e) => {
@@ -2180,7 +2609,12 @@ document.addEventListener("DOMContentLoaded", async () => {
     chrome.runtime.sendMessage({ action: "CLEAR_LOGS" });
   });
 
+  let onHotsearchBatchProgress = null;
+
   chrome.runtime.onMessage.addListener((request) => {
+    if (request.action === "HOTSEARCH_BATCH_PROGRESS" && typeof onHotsearchBatchProgress === "function") {
+      onHotsearchBatchProgress(request);
+    }
     if (request.action === "SCHEDULE_UPDATED") {
       refreshScheduleQueue().then(() => {
         if (scannedTasks.length > 0) renderTaskList(scannedTasks);
@@ -2239,17 +2673,15 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
 
     if (request.action === "PIPELINE_PROGRESS") {
-      const { stage, percentage, isRunning } = request.payload;
+      const { stage, percentage, isRunning, activeJobs } = request.payload;
       if (typeof isRunning === "boolean") updatePipelineControls(isRunning);
-      progressWrap.style.display = "block";
-      progressStage.textContent = stage;
-      progressPct.textContent = `${percentage}%`;
-      progressBar.style.width = `${percentage}%`;
+      syncProgressUI(stage, percentage, !!isRunning, activeJobs);
     }
   });
 
   // ── 11. 开始即时发布 ──
   btnStart.addEventListener("click", async () => {
+    if (btnStart.disabled) return;
     const validSlots = docSlots.filter((s) => s.url && s.url.trim().startsWith("http"));
     if (validSlots.length === 0) {
       appendLog("请先填入至少一个云文档链接！", "error");
@@ -2265,10 +2697,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     saveSlotsConfig();
 
     updatePipelineControls(true);
-    progressWrap.style.display = "block";
-    progressBar.style.width = "5%";
-    progressPct.textContent = "5%";
-    progressStage.textContent = "正在启动多文档同步流水线...";
+    syncProgressUI("正在启动多文档同步流水线...", 5, true);
 
     try {
       const resp = await chrome.runtime.sendMessage({
@@ -2278,7 +2707,8 @@ document.addEventListener("DOMContentLoaded", async () => {
             id: s.id,
             name: s.name || `文档 ${idx + 1}`,
             url: s.url.trim(),
-            linkCol: (s.linkCol || "E").trim().toUpperCase(),
+            linkCol: (s.linkCol || "H").trim().toUpperCase(),
+            manualLinkCol: !!s.manualLinkCol,
           })),
           dryRun: dryRunToggle.checked,
           silentMode: silentModeToggle ? silentModeToggle.checked : true,
@@ -2294,6 +2724,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     } catch (err) {
       appendLog(`通讯异常: ${err.message}`, "error");
     } finally {
+      if (btnParserRunNow) btnParserRunNow.disabled = false;
       await refreshPipelineControls();
     }
   });
@@ -2306,6 +2737,9 @@ document.addEventListener("DOMContentLoaded", async () => {
       appendLog(resp?.message || "已向后台发送停止指令", "warn");
     } catch (err) {
       appendLog(`停止失败: ${err.message}`, "error");
+    } finally {
+      if (btnParserRunNow) btnParserRunNow.disabled = false;
+      await refreshPipelineControls();
     }
   }
 
@@ -2342,6 +2776,15 @@ document.addEventListener("DOMContentLoaded", async () => {
       chrome.runtime.sendMessage({ action: "SWEEP_DUE_SCHEDULES" }, () => { if (chrome.runtime.lastError) {} });
     }
     appendLog(newPaused ? "⏸️ 定时队列已全局暂停挂起" : "▶️ 定时队列已恢复正常触发", newPaused ? "warn" : "success");
+  });
+
+  allowDuplicateBypassToggle?.addEventListener("change", async () => {
+    const enabled = !!allowDuplicateBypassToggle.checked;
+    await chrome.storage.local.set({ allowDuplicateBypass: enabled });
+    appendLog(
+      enabled ? "🔓 已开启【临时放行同文案重发】：将跳过 15 分钟防重锁与 12 小时同文案拦截" : "🔒 已关闭【临时放行同文案重发】，恢复防重发保护",
+      enabled ? "warn" : "info"
+    );
   });
 
   btnTogglePauseSched?.addEventListener("click", async () => {
@@ -2395,13 +2838,47 @@ document.addEventListener("DOMContentLoaded", async () => {
     return acct ? `${acct} ${url}` : url;
   }
 
+  function isLedgerDocSource(item) {
+    return Boolean(item?.docUrl || (item?.docName && item.docName !== "任务解析" && item.docName !== "自由文本解析"));
+  }
+
+  function isLedgerPendingIssue(item) {
+    if (!item || item.mode !== "真实发布") return false;
+    if (item.submittedWithoutReceipt && !item.postUrl) return true;
+    const needsDocWriteBack = Boolean(item.docUrl && item.targetCell && item.targetCell !== "-");
+    return Boolean(needsDocWriteBack && item.postUrl && !item.writeBackOk);
+  }
+
+  function formatLedgerDateGroupLabel(item) {
+    const ts = Number(item?.timestamp || 0);
+    if (!ts) {
+      const timeStr = String(item?.time || "").trim();
+      const dateMatch = timeStr.match(/^(\d{4}[-/]\d{1,2}[-/]\d{1,2})/);
+      return dateMatch ? dateMatch[1] : "较早记录";
+    }
+    const d = new Date(ts);
+    const now = new Date();
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    const startOfItem = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+    const diffDays = Math.round((startOfToday - startOfItem) / 86400000);
+    if (diffDays === 0) return "今天";
+    if (diffDays === 1) return "昨天";
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return `${d.getFullYear()}-${m}-${day}`;
+  }
+
   function filterLedgerItems(publishLedger) {
     const query = (ledgerSearchInput?.value || "").trim().toLowerCase();
     const docFilter = ledgerDocFilter?.value || "all";
+    const acctFilter = ledgerAccountFilter?.value || "all";
     return (publishLedger || []).filter((item) => {
-      if (currentLedgerFilter === "live" && item.mode !== "真实发布") return false;
-      if (currentLedgerFilter === "writeback_fail" && !(item.mode === "真实发布" && item.postUrl && !item.writeBackOk)) return false;
-      if (docFilter !== "all" && item.docName !== docFilter) return false;
+      if (currentLedgerFilter === "doc" && !isLedgerDocSource(item)) return false;
+      if (currentLedgerFilter === "parser" && isLedgerDocSource(item)) return false;
+      if (currentLedgerFilter === "writeback_fail" && !isLedgerPendingIssue(item)) return false;
+      if (currentLedgerFilter === "dry_draft" && item.mode === "真实发布") return false;
+      if (docFilter !== "all" && (item.docName || "任务解析") !== docFilter) return false;
+      if (acctFilter !== "all" && (item.account || "默认账号") !== acctFilter) return false;
       if (query) {
         const mAcct = String(item.account || "").toLowerCase().includes(query);
         const mContent = String(item.fullContent || item.contentSummary || "").toLowerCase().includes(query);
@@ -2439,15 +2916,35 @@ document.addEventListener("DOMContentLoaded", async () => {
 
     // 填充文档筛选下拉框
     if (ledgerDocFilter) {
-      const docNames = Array.from(new Set(publishLedger.map((i) => i.docName).filter(Boolean)));
+      const docNames = Array.from(new Set(publishLedger.map((i) => i.docName || "任务解析")));
       const curVal = ledgerDocFilter.value;
       ledgerDocFilter.innerHTML = `<option value="all">📑 全部来源文档 (${publishLedger.length})</option>`;
       docNames.forEach((name) => {
-        const count = publishLedger.filter((i) => i.docName === name).length;
+        const count = publishLedger.filter((i) => (i.docName || "任务解析") === name).length;
         ledgerDocFilter.innerHTML += `<option value="${escapeHtml(name)}">${escapeHtml(name)} (${count})</option>`;
       });
       ledgerDocFilter.value = (curVal && docNames.includes(curVal)) ? curVal : "all";
     }
+
+    // 填充账号筛选下拉框
+    if (ledgerAccountFilter) {
+      const acctNames = Array.from(new Set(publishLedger.map((i) => i.account || "默认账号")));
+      const curAcct = ledgerAccountFilter.value;
+      ledgerAccountFilter.innerHTML = `<option value="all">👤 全部账号 (${acctNames.length})</option>`;
+      acctNames.forEach((name) => {
+        const count = publishLedger.filter((i) => (i.account || "默认账号") === name).length;
+        ledgerAccountFilter.innerHTML += `<option value="${escapeHtml(name)}">${escapeHtml(name)} (${count})</option>`;
+      });
+      ledgerAccountFilter.value = (curAcct && acctNames.includes(curAcct)) ? curAcct : "all";
+    }
+
+    // 更新“待处理”芯片角标数量
+    const pendingIssueCount = publishLedger.filter(isLedgerPendingIssue).length;
+    ledgerFilterChips.forEach((chip) => {
+      if (chip.dataset?.ledgerFilter === "writeback_fail") {
+        chip.textContent = pendingIssueCount > 0 ? `⚠️ 待处理 (${pendingIssueCount})` : "⚠️ 待处理";
+      }
+    });
 
     const filtered = filterLedgerItems(publishLedger);
 
@@ -2461,16 +2958,20 @@ document.addEventListener("DOMContentLoaded", async () => {
       return;
     }
 
-    filtered.forEach((item, idx) => {
+    const buildLedgerCard = (item, idx) => {
       const card = document.createElement("div");
       card.className = "ledger-item-card";
       const copyLine = formatLedgerCopyLine(item);
+      const cleanPostUrl = sanitizeHttpUrl(item.postUrl);
+      const copyUrlBtnHtml = cleanPostUrl
+        ? `<button type="button" class="sched-btn-clean btn-copy-ledger-url" data-idx="${idx}" title="仅复制博文链接">🔗 链接</button>`
+        : "";
       const copyBtnHtml = copyLine
-        ? `<button type="button" class="sched-btn-clean btn-copy-ledger-item" data-idx="${idx}" title="复制账号名和博文链接">📋 复制</button>`
+        ? `<button type="button" class="sched-btn-clean btn-copy-ledger-item" data-idx="${idx}" title="复制账号名和博文链接">📋 账号+链接</button>`
         : "";
       const canRetryWriteBack = item.mode === "真实发布" && item.postUrl && !item.writeBackOk && item.targetCell && item.targetCell !== "-" && item.docUrl;
       const retryWriteBackBtnHtml = canRetryWriteBack
-        ? `<button type="button" class="sched-btn-clean primary btn-retry-ledger-writeback" data-idx="${idx}">📝 补写文档</button>`
+        ? `<input type="text" class="doc-slot-col-input ledger-retry-cell" data-idx="${idx}" maxlength="8" value="${escapeHtml(item.targetCell)}" title="可修改补写单元格（如 H9）" style="width:40px;"><button type="button" class="sched-btn-clean primary btn-retry-ledger-writeback" data-idx="${idx}">📝 补写文档</button>`
         : "";
       const manualReceiptHtml = item.id && item.mode === "真实发布" && item.submittedWithoutReceipt && !item.postUrl
         ? `<div style="display:flex;gap:6px;margin:8px 0;"><input class="ledger-manual-url" type="url" placeholder="粘贴已发布微博链接" aria-label="微博链接" style="flex:1;min-width:0;"><button type="button" class="sched-btn-clean primary btn-manual-receipt" data-idx="${idx}">保存并补写</button></div>`
@@ -2481,12 +2982,15 @@ document.addEventListener("DOMContentLoaded", async () => {
       const writeBackWarnHtml = (!item.writeBackOk && item.writeBackError)
         ? `<div style="font-size:11px;color:#92400E;background:#FFFBEB;padding:4px 8px;border-radius:4px;border:1px solid #FDE68A;">⚠ 回写失败原因: ${escapeHtml(item.writeBackError)}</div>`
         : "";
+      const isDoc = isLedgerDocSource(item);
+      const sourceBadgeHtml = `<span class="ledger-source-pill ${isDoc ? "is-doc" : "is-parser"}">${isDoc ? "📄 云文档" : "🪄 任务解析"}</span>`;
       card.innerHTML = `
         <div class="ledger-item-body">
           <div class="sched-card-header">
             <div class="sched-card-left-meta">
               <span class="sched-acct-name">👤 ${escapeHtml(item.account || "默认账号")}</span>
-              <span class="sched-sub-meta">${escapeHtml(item.docName || "主表")} · 行 ${item.row || "-"}</span>
+              ${sourceBadgeHtml}
+              <span class="sched-sub-meta">${escapeHtml(item.docName || "任务解析")} · 行 ${item.row || "-"}</span>
               <span class="sched-sub-meta">[${escapeHtml(item.trigger || "即时")}]</span>
             </div>
             <div class="sched-card-right-status">
@@ -2501,17 +3005,88 @@ document.addEventListener("DOMContentLoaded", async () => {
           ${writeBackWarnHtml}
           <div class="sched-card-footer" style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
             <div class="sched-card-tags">
-              ${item.postUrl ? `<a href="${escapeHtml(item.postUrl)}" target="_blank" title="${escapeHtml(item.postUrl)}" style="color:var(--primary);text-decoration:none;font-weight:600;">🔗 查看微博 ↗</a>` : `<span style="color:var(--text-sub);font-size:11px;">${item.submittedWithoutReceipt ? "待人工核对链接" : "无链接（演练/草稿）"}</span>`}
+              ${sanitizeHttpUrl(item.postUrl) ? `<a href="${escapeHtml(sanitizeHttpUrl(item.postUrl))}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(item.postUrl)}" style="color:var(--primary);text-decoration:none;font-weight:600;">🔗 查看微博 ↗</a>` : `<span style="color:var(--text-sub);font-size:11px;">${item.submittedWithoutReceipt ? "待人工核对链接" : "无链接（演练/草稿）"}</span>`}
             </div>
             <div style="display:flex;align-items:center;gap:6px;">
               ${retryWriteBackBtnHtml}
+              ${copyUrlBtnHtml}
               ${copyBtnHtml}
             </div>
           </div>
         </div>
       `;
-      ledgerListContainer.appendChild(card);
-    });
+      return card;
+    };
+
+    const groupMode = ledgerGroupMode?.value || "time";
+    if (groupMode === "doc" || groupMode === "date") {
+      const groups = new Map();
+      filtered.forEach((item, idx) => {
+        const key = groupMode === "doc" ? (item.docName || "任务解析") : formatLedgerDateGroupLabel(item);
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push({ item, idx });
+      });
+
+      groups.forEach((entries, groupKey) => {
+        const groupId = `${groupMode}:${groupKey}`;
+        const isCollapsed = collapsedLedgerGroups.has(groupId);
+        const liveCount = entries.filter(({ item }) => item.mode === "真实发布").length;
+        const issueCount = entries.filter(({ item }) => isLedgerPendingIssue(item)).length;
+        const groupLines = entries
+          .filter(({ item }) => item.mode === "真实发布")
+          .map(({ item }) => formatLedgerCopyLine(item))
+          .filter(Boolean);
+
+        const wrap = document.createElement("div");
+        wrap.className = "ledger-group-wrap";
+
+        const header = document.createElement("div");
+        header.className = "ledger-group-header";
+        header.innerHTML = `
+          <span>${isCollapsed ? "▶" : "▼"} ${groupMode === "doc" ? "📁" : "📅"} ${escapeHtml(groupKey)}</span>
+          <div class="ledger-group-meta">
+            <span>共 ${entries.length} 条${liveCount ? ` · 真实 ${liveCount}` : ""}${issueCount ? ` · ⚠️ 异常 ${issueCount}` : ""}</span>
+            ${groupLines.length ? `<button type="button" class="sched-btn-clean btn-copy-ledger-group" title="复制本组全部账号与链接">📋 复制本组</button>` : ""}
+          </div>
+        `;
+
+        const body = document.createElement("div");
+        body.className = "ledger-group-body";
+        if (isCollapsed) body.style.display = "none";
+
+        entries.forEach(({ item, idx }) => {
+          body.appendChild(buildLedgerCard(item, idx));
+        });
+
+        header.addEventListener("click", (e) => {
+          if (e.target?.closest?.(".btn-copy-ledger-group")) return;
+          if (collapsedLedgerGroups.has(groupId)) collapsedLedgerGroups.delete(groupId);
+          else collapsedLedgerGroups.add(groupId);
+          renderLedgerList();
+        });
+
+        const groupCopyBtn = header.querySelector?.(".btn-copy-ledger-group");
+        if (groupCopyBtn) {
+          groupCopyBtn.addEventListener("click", async (e) => {
+            e.stopPropagation();
+            const ok = await writeTextToClipboard(groupLines.join("\n"));
+            if (ok) {
+              groupCopyBtn.textContent = "✅ 已复制";
+              setTimeout(() => { groupCopyBtn.textContent = "📋 复制本组"; }, 1500);
+              appendLog(`📋 已复制分组 [${groupKey}] 共 ${groupLines.length} 条账号与链接`, "success");
+            }
+          });
+        }
+
+        wrap.appendChild(header);
+        wrap.appendChild(body);
+        ledgerListContainer.appendChild(wrap);
+      });
+    } else {
+      filtered.forEach((item, idx) => {
+        ledgerListContainer.appendChild(buildLedgerCard(item, idx));
+      });
+    }
 
     ledgerListContainer.querySelectorAll(".ledger-content-toggle").forEach((el) => {
       el.addEventListener("click", () => {
@@ -2560,6 +3135,8 @@ document.addEventListener("DOMContentLoaded", async () => {
         const idx = parseInt(btn.dataset.idx, 10);
         const item = filtered[idx];
         if (!item) return;
+        const cellInput = btn.parentElement?.querySelector?.(".ledger-retry-cell");
+        const overrideTargetCell = String(cellInput?.value || "").trim().toUpperCase();
         btn.disabled = true;
         btn.textContent = "⏳ 补写中...";
         try {
@@ -2571,6 +3148,7 @@ document.addEventListener("DOMContentLoaded", async () => {
               docName: item.docName,
               row: item.row,
               targetCell: item.targetCell,
+              overrideTargetCell: overrideTargetCell && overrideTargetCell !== item.targetCell ? overrideTargetCell : "",
               targetSheetId: item.targetSheetId,
               postUrl: item.postUrl,
             },
@@ -2586,6 +3164,22 @@ document.addEventListener("DOMContentLoaded", async () => {
       });
     });
 
+    ledgerListContainer.querySelectorAll(".btn-copy-ledger-url").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const idx = parseInt(btn.dataset.idx, 10);
+        const url = sanitizeHttpUrl(filtered[idx]?.postUrl);
+        if (!url) return;
+        const ok = await writeTextToClipboard(url);
+        if (ok) {
+          btn.textContent = "✅ 已复制";
+          setTimeout(() => { btn.textContent = "🔗 链接"; }, 1500);
+          appendLog(`🔗 已复制链接: ${url}`, "success");
+        } else {
+          appendLog("复制到剪贴板失败，请检查浏览器权限", "error");
+        }
+      });
+    });
+
     ledgerListContainer.querySelectorAll(".btn-copy-ledger-item").forEach((btn) => {
       btn.addEventListener("click", async () => {
         const idx = parseInt(btn.dataset.idx, 10);
@@ -2594,7 +3188,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         const ok = await writeTextToClipboard(line);
         if (ok) {
           btn.textContent = "✅ 已复制";
-          setTimeout(() => { btn.textContent = "📋 复制"; }, 1500);
+          setTimeout(() => { btn.textContent = "📋 账号+链接"; }, 1500);
           appendLog(`📋 已复制账号与链接: ${line}`, "success");
         } else {
           appendLog("复制到剪贴板失败，请检查浏览器权限", "error");
@@ -2635,11 +3229,13 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
   });
   ledgerDocFilter?.addEventListener("change", () => renderLedgerList());
+  ledgerAccountFilter?.addEventListener("change", () => renderLedgerList());
+  ledgerGroupMode?.addEventListener("change", () => renderLedgerList());
 
   btnExportLedgerCsv?.addEventListener("click", async () => {
     const publishLedger = await getVisibleLedger();
     if (publishLedger.length === 0) {
-      appendLog("当前账本为空，暂无可导出的数据", "warn");
+      appendLog("当前发博记录为空，暂无可导出的数据", "warn");
       return;
     }
     const headers = ["时间", "来源文档", "行号", "目标单元格", "发博账号", "博文正文", "回写博文链接", "执行模式", "触发来源"];
@@ -2662,18 +3258,28 @@ document.addEventListener("DOMContentLoaded", async () => {
     a.download = `weibo_publish_ledger_${new Date().toISOString().slice(0, 10)}.csv`;
     a.click();
     URL.revokeObjectURL(url);
-    appendLog(`✅ 账本数据已成功导出为 CSV (共 ${publishLedger.length} 条记录)`, "success");
+    appendLog(`✅ 发博记录已成功导出为 CSV (共 ${publishLedger.length} 条记录)`, "success");
+  });
+
+  btnClearPublishClaims?.addEventListener("click", async () => {
+    try {
+      const response = await chrome.runtime.sendMessage({ action: "CLEAR_PUBLISH_CLAIMS" });
+      if (!response?.ok) throw new Error(response?.error || "清除防重锁失败");
+      appendLog(`🔓 已清除 ${response.cleared || 0} 条残留发博防重锁，可重新发起发布`, "success");
+    } catch (error) {
+      appendLog(`清除防重锁失败: ${error?.message || String(error)}`, "error");
+    }
   });
 
   btnClearLedger?.addEventListener("click", async () => {
-    if (!confirm("确定要清空全部历史发博流水账本吗？清空后无法恢复。")) return;
+    if (!confirm("确定要清空全部历史发博记录吗？清空后无法恢复。")) return;
     try {
       const response = await chrome.runtime.sendMessage({ action: "CLEAR_PUBLISH_LEDGER" });
-      if (!response?.ok) throw new Error(response?.error || "清空账本失败");
+      if (!response?.ok) throw new Error(response?.error || "清空发博记录失败");
       await renderLedgerList();
-      appendLog(`已清空历史账本界面，保留 ${response.retained} 条待核对或未回写记录`, "info");
+      appendLog(`已清空历史发博记录界面，保留 ${response.retained} 条待核对或未回写记录`, "info");
     } catch (error) {
-      appendLog(`清空账本失败: ${error?.message || String(error)}`, "error");
+      appendLog(`清空发博记录失败: ${error?.message || String(error)}`, "error");
     }
   });
 
@@ -3113,7 +3719,8 @@ document.addEventListener("DOMContentLoaded", async () => {
         .replace(/@/g, "")
         .split(/[、，,\s]+/)
         .filter((s) => s && !/(辛苦|发下|发一下|发布)/.test(s))
-        .map((s) => resolveSingleAccountName(s, aliases));
+        .map((s) => resolveSingleAccountName(s, aliases))
+        .filter(Boolean);
       if (rawNames.length > 0) return { accounts: rawNames, content: "" };
     }
 
@@ -3197,7 +3804,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     // 2. 提取普通 @ 用户名（仅扫描未被已知含空格别名消费的 @ 片段，避免 "@新浪 AI" 误拆出 "新浪"）
     //    若整行仅指定 N小号/全部小号 且无“大号/+小号/和小号”意图，则 @xxx值班 仅视为群内呼叫，不计入发布账号
     for (const m of textForAtScan.matchAll(/@\s*([^\s、，,：:。！!~～)）；;]+)/g)) {
-      if (hasSmallAccountsOnly && /值班$/.test(m[1])) continue;
+      if (hasSmallAccountsOnly && /值班(?:老师)?$/.test(m[1])) continue;
       const name = resolveSingleAccountName(m[1], aliases);
       if (name && !found.includes(name)) found.push(name);
     }
@@ -3209,7 +3816,7 @@ document.addEventListener("DOMContentLoaded", async () => {
 
     // 4. 如果行中含已知账号名且带有账号指令/标签语境，补充匹配（最长优先并消费已匹配片段，避免子串误命中）
     if (/^(?:位置|账号|发稿账号|发博账号|转发账号|微博账号|发布账号|账户)[：:]/i.test(text) || found.length === 0) {
-      let scanLower = (hasSmallAccountsOnly ? text.replace(/@?\s*[^\s、，,：:。！!~～)）；;]*值班/g, " ") : text).toLowerCase();
+      let scanLower = (hasSmallAccountsOnly ? text.replace(/@?\s*[^\s、，,：:。！!~～)）；;]*值班(?:老师)?/g, " ") : text).toLowerCase();
       for (const key of keysSorted) {
         if (key.length < 2) continue;
         if (scanLower.includes(key)) {
@@ -3221,7 +3828,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
 
     // 4. 支持 "+其他所有小号" / "+全部小号" / "N个小号" / "N小号" 随机抽号（对齐 instant.html:6890-6908）
-    const pool = getActiveOfficialAccounts().filter((n) => n !== "新浪热点" && !found.includes(n));
+    const pool = getActiveOfficialAccounts().filter((n) => n !== "新浪热点" && n !== "新浪军事" && !found.includes(n));
     if (/[+＋]\s*(?:其他所有|全部)小号/.test(text)) {
       for (const n of pool) {
         if (!found.includes(n)) found.push(n);
@@ -3253,7 +3860,8 @@ document.addEventListener("DOMContentLoaded", async () => {
       }
     }
 
-    return found;
+    const skippedAccounts = new Set(["新浪运动"]);
+    return found.filter((n) => !skippedAccounts.has(String(n || "").trim()));
   }
 
   function isPureDirectiveLine(line, aliases) {
@@ -3273,7 +3881,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       .replace(/[+＋]?\s*(?:其他所有|全部)?\s*小号/g, " ")
       .replace(/[+＋]?\s*大号/g, " ")
       .replace(/\b\d+\b/g, " ")
-      .replace(/值班老师|值班|辛苦了|辛苦|老师|以上|麻烦|请|谢谢|查收|劳驾|帮忙|一起|各自|分别|同步|随机|另外|以及|还有|加上|带着|发布投票|发投票|投票|发布|发稿吧|发稿|发微博|发一下|发下|发吧|发这条|安排下|安排|账号|转发评论|转发并评论|转发|转评|评转|评论|和|与|跟|及|再|并|都|发|下|一下|了|吧/g, " ")
+      .replace(/值班老师|值班|辛苦了|辛苦|老师|以上|麻烦|请|谢谢|查收|劳驾|帮忙|一起|各自|分别|同步|随机|散列|分批|分散|错峰|轮流|批量|同时|全矩阵|矩阵|另外|以及|还有|加上|带着|发布投票|发投票|投票|原发|直发|主发|发布|发稿吧|发稿|发微博|发一下|发下|发吧|发这条|安排下|安排|账号|仅转发|仅原发|转发评论|转发并评论|转发博文|转发微博|转发|转评|评转|评论|博文|微博|和|与|跟|及|再|并|都|仅|发|下|一下|了|吧/g, " ")
       .replace(/[、，,\s:：;；。.!！？?~\-—_+＋()（）[\]【】]/g, "")
       .trim();
 
@@ -3284,6 +3892,7 @@ document.addEventListener("DOMContentLoaded", async () => {
 
     return (
       text.length <= 35 &&
+      /^(?:辛苦|麻烦|请|劳驾|谢谢|安排|发一下|发下|发这条|转发评论)/.test(text) &&
       /(辛苦|老师|发布|发稿|发吧|发下|发一下|安排下|发微博|发这条|转发评论|谢谢|劳驾)[~！!：:]*$/.test(text)
     );
   }
@@ -3327,11 +3936,12 @@ document.addEventListener("DOMContentLoaded", async () => {
   function looksLikePollQuestionLine(line) {
     const text = String(line || "").trim();
     if (!text) return false;
-    return /[？?]$/.test(text) || /投票/.test(text) || /(哪一个|哪个|你最|你会选|你更|评论区聊聊|你心中的|你支持)/.test(text);
+    const withoutTags = stripPollHashTitle(text);
+    return /[？?]$/.test(text) || /[？?]$/.test(withoutTags) || /投票/.test(text) || /(哪一个|哪个|你最|你会选|你更|评论区聊聊|你心中的|你支持)/.test(text);
   }
 
   function splitTrailingPollQuestion(text) {
-    const src = String(text || "").trim();
+    const src = stripPollHashTitle(text) || String(text || "").trim();
     if (!src) return null;
     const candidates = [];
     const punct = /[。！？!?；;]/g;
@@ -3508,19 +4118,21 @@ document.addEventListener("DOMContentLoaded", async () => {
       // 1. 优先识别纯派单指令行（如 "@xxx值班 辛苦大号+3小号发" 或 "@手机头条 @新浪新闻滚动"）
       if (isPureDirectiveLine(line, aliases)) {
         const accts = extractAccountsFromLine(line, aliases);
+        const lineScatter = /散列/.test(line);
         const hasContent = current && current.contentLines.some((l) => l.length > 0);
         if (hasContent && current.accounts.length === 0) {
           // 情况 A：前文尚无账号（如正文在上方、派单指令在末尾），将账号归属到当前正文并闭环
           if (accts.length > 0) {
             current.accounts = Array.from(new Set([...current.accounts, ...accts]));
           }
+          if (lineScatter) current.scatterPublish = true;
           current.closedByDirective = true;
           continue;
         }
         if (hasContent && current.accounts.length > 0) {
           // 情况 B：前文已有账号且已有正文，说明该指令行是下一组新任务的起点
           groups.push(current);
-          current = { accounts: accts, contentLines: [], closedByDirective: false };
+          current = { accounts: accts, contentLines: [], closedByDirective: false, scatterPublish: lineScatter };
           continue;
         }
         if (current) {
@@ -3528,10 +4140,11 @@ document.addEventListener("DOMContentLoaded", async () => {
           if (accts.length > 0) {
             current.accounts = Array.from(new Set([...current.accounts, ...accts]));
           }
+          if (lineScatter) current.scatterPublish = true;
           continue;
         }
         if (accts.length > 0) {
-          current = { accounts: accts, contentLines: [], closedByDirective: false };
+          current = { accounts: accts, contentLines: [], closedByDirective: false, scatterPublish: lineScatter };
           continue;
         }
       }
@@ -3545,12 +4158,14 @@ document.addEventListener("DOMContentLoaded", async () => {
         let accts = [...leading.accounts];
         let bodyLine = leading.content || "";
         let closed = false;
+        let lineScatter = /散列/.test(line) && !bodyLine;
         if (bodyLine) {
           const tailSplit = splitDirectiveSuffixFromContentLine(bodyLine, aliases);
           if (tailSplit) {
             const tailAccts = extractAccountsFromLine(tailSplit.directive, aliases);
             if (tailAccts.length > 0) {
               accts = Array.from(new Set([...accts, ...tailAccts]));
+              if (/散列/.test(tailSplit.directive)) lineScatter = true;
               bodyLine = tailSplit.content;
               closed = true;
             }
@@ -3560,6 +4175,7 @@ document.addEventListener("DOMContentLoaded", async () => {
           accounts: accts,
           contentLines: bodyLine ? [bodyLine] : [],
           closedByDirective: closed,
+          scatterPublish: lineScatter,
         };
         continue;
       }
@@ -3573,8 +4189,9 @@ document.addEventListener("DOMContentLoaded", async () => {
             groups.push(current);
             current = null;
           }
-          if (!current) current = { accounts: accts, contentLines: [], closedByDirective: false };
+          if (!current) current = { accounts: accts, contentLines: [], closedByDirective: false, scatterPublish: false };
           else current.accounts = Array.from(new Set([...current.accounts, ...accts]));
+          if (/散列/.test(suffixSplit.directive)) current.scatterPublish = true;
           current.contentLines.push(suffixSplit.content);
           current.closedByDirective = true;
           continue;
@@ -3616,6 +4233,7 @@ document.addEventListener("DOMContentLoaded", async () => {
           poll: poll ? { title: poll.title, options: poll.options, days: poll.days } : null,
           repostUrl: repostUrl || "",
           commentOriginal: !!commentOriginal,
+          scatterPublish: !!grp.scatterPublish,
           docName: repostUrl ? "转发解析" : "任务解析",
           row: "-",
           targetCell: "-",
@@ -3649,6 +4267,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       card.className = "sched-item-card";
       const pollTag = t.poll ? `<span class="sched-sub-meta" style="color:var(--primary);border-color:#C7D2FE;">📊 投票(${t.poll.options.length}项)</span>` : "";
       const repostTag = t.repostUrl ? `<span class="sched-sub-meta" style="color:#B45309;border-color:#FDE68A;background:#FEF3C7;">🔁 ${t.commentOriginal ? "转评原博" : "转发原博"}</span>` : "";
+      const scatterTag = t.scatterPublish ? `<span class="sched-sub-meta" style="color:#0369A1;border-color:#BAE6FD;background:#E0F2FE;">🔀 散列发布</span>` : "";
 
       const pollDetailHtml = t.poll ? `
         <div class="collapsible-box" style="margin: 4px 0 0 0; padding: 6px 8px;">
@@ -3685,7 +4304,7 @@ document.addEventListener("DOMContentLoaded", async () => {
             <div class="sched-card-left-meta">
               <span class="sched-sub-meta">第 ${idx + 1} 组</span>
               <input type="text" class="ui-input parsed-acct-input" data-idx="${idx}" value="${escapeHtml(t.account || "")}" placeholder="填写账号 (留空默认)" style="width: 140px; height: 22px; font-size: 11px; padding: 0 6px;">
-              ${pollTag}${repostTag}
+              ${pollTag}${repostTag}${scatterTag}
             </div>
             <div class="sched-card-right-status">
               <span class="sched-time-text parsed-char-count" data-idx="${idx}">${t.content.length} 字</span>
@@ -3805,7 +4424,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     });
   }
 
-  btnParseTasks?.addEventListener("click", async () => {
+  async function runParseTasksPreview() {
     const raw = (taskParserInput?.value || "").trim();
     if (!raw) {
       alert("请先粘贴需要解析的任务文本或单条微博链接！");
@@ -3819,8 +4438,10 @@ document.addEventListener("DOMContentLoaded", async () => {
 
     if (isSingleWeiboUrl) {
       const weiboUrl = lines[0];
-      btnParseTasks.disabled = true;
-      btnParseTasks.textContent = "⏳ 正在读取原博投票活动与正文...";
+      if (btnParseTasks) {
+        btnParseTasks.disabled = true;
+        btnParseTasks.textContent = "⏳ 正在读取原博投票活动与正文...";
+      }
       appendLog(`检测到单条微博链接，正在克隆提取原博正文与投票活动: ${weiboUrl.substring(0, 42)}...`, "info");
 
       try {
@@ -3858,12 +4479,14 @@ document.addEventListener("DOMContentLoaded", async () => {
       } catch (cloneErr) {
         console.warn("克隆投票通信异常:", cloneErr);
       } finally {
-        btnParseTasks.disabled = false;
-        btnParseTasks.textContent = "🔍 智能解析预览";
+        if (btnParseTasks) {
+          btnParseTasks.disabled = false;
+          btnParseTasks.textContent = "🔍 智能解析预览";
+        }
       }
     }
 
-    btnParseTasks.disabled = true;
+    if (btnParseTasks) btnParseTasks.disabled = true;
     try {
       parsedTaskGroups = await parseBatchTaskText(raw);
       renderParsedTasksPreview();
@@ -3874,9 +4497,11 @@ document.addEventListener("DOMContentLoaded", async () => {
       appendLog(`任务解析失败: ${err.message}`, "warn");
       alert(err.message);
     } finally {
-      btnParseTasks.disabled = false;
+      if (btnParseTasks) btnParseTasks.disabled = false;
     }
-  });
+  }
+
+  btnParseTasks?.addEventListener("click", runParseTasksPreview);
 
   btnPasteParser?.addEventListener("click", async () => {
     if (!taskParserInput) return;
@@ -3917,10 +4542,11 @@ document.addEventListener("DOMContentLoaded", async () => {
       }
       taskParserInput.value = text;
       taskParserInput.focus?.();
-      btnPasteParser.textContent = "✅ 已粘贴";
+      btnPasteParser.textContent = "✅ 已粘贴并解析";
       setTimeout(() => {
-        btnPasteParser.textContent = "📋 一键粘贴";
+        btnPasteParser.textContent = "📋 一键粘贴解析";
       }, 1500);
+      await runParseTasksPreview();
     } catch (err) {
       appendLog(`读取剪贴板失败: ${err.message || "请检查浏览器剪贴板权限"}`, "warn");
     }
@@ -3944,47 +4570,111 @@ document.addEventListener("DOMContentLoaded", async () => {
   });
 
   btnParserRunNow?.addEventListener("click", async () => {
-    if (parsedTaskGroups.length === 0) return;
+    if (btnParserRunNow.disabled || parsedTaskGroups.length === 0) return;
+    for (let i = 0; i < parsedTaskGroups.length; i++) {
+      const item = parsedTaskGroups[i];
+      if (!String(item?.content || "").trim()) {
+        appendLog(`第 ${i + 1} 组任务正文为空，请补充后再执行！`, "warn");
+        return;
+      }
+      if (item?.poll) {
+        const validOpts = (item.poll.options || []).map((o) => String(o || "").trim()).filter(Boolean);
+        if (validOpts.length < 2) {
+          appendLog(`第 ${i + 1} 组投票任务有效选项不足 2 个，请补充后再执行！`, "warn");
+          return;
+        }
+      }
+    }
     const isDryRun = dryRunToggle.checked;
+    const allowDupOnce = Boolean(parserAllowDuplicateOnceToggle?.checked);
+    const allowDuplicateBypass = Boolean(allowDupOnce || allowDuplicateBypassToggle?.checked);
 
+    const buildSelectedTasksPayload = (list) => list.map((t, idx) => ({
+      docName: t.docName || "任务解析",
+      row: `${idx + 1}`,
+      targetCell: "-",
+      account: String(t.account || "").trim(),
+      content: String(t.content || "").trim(),
+      poll: t.poll
+        ? {
+            ...t.poll,
+            title: String(t.poll.title || "").trim() || "参与投票",
+            options: (t.poll.options || []).map((o) => String(o || "").trim()).filter(Boolean),
+          }
+        : null,
+      repostUrl: t.repostUrl || "",
+      commentOriginal: !!t.commentOriginal,
+      scatterPublish: !!t.scatterPublish,
+      imgUrls: [],
+    }));
+
+    btnParserRunNow.disabled = true;
     updatePipelineControls(true);
-    appendLog(`🚀 开始批量执行任务解析生成的 ${parsedTaskGroups.length} 条任务 [${isDryRun ? "安全演练" : "真实发布"}]...`, "info");
+    syncProgressUI(`正在启动任务解析发布 (${parsedTaskGroups.length} 条)...`, 5, true);
+    appendLog(`🚀 开始批量执行任务解析生成的 ${parsedTaskGroups.length} 条任务 [${isDryRun ? "安全演练" : "真实发布"}${allowDupOnce ? " | 本次放行重发" : ""}]...`, "info");
 
     try {
-      const resp = await chrome.runtime.sendMessage({
+      let resp = await chrome.runtime.sendMessage({
         action: "START_PIPELINE",
         config: {
           docs: [],
           dryRun: isDryRun,
           silentMode: silentModeToggle ? silentModeToggle.checked : true,
-          selectedTasks: parsedTaskGroups.map((t, idx) => ({
-            docName: t.docName || "任务解析",
-            row: `${idx + 1}`,
-            targetCell: "-",
-            account: String(t.account || "").trim(),
-            content: String(t.content || "").trim(),
-            poll: t.poll
-              ? {
-                  ...t.poll,
-                  title: String(t.poll.title || "").trim() || "参与投票",
-                  options: (t.poll.options || []).map((o) => String(o || "").trim()).filter(Boolean),
-                }
-              : null,
-            repostUrl: t.repostUrl || "",
-            commentOriginal: !!t.commentOriginal,
-            imgUrls: [],
-          })),
+          allowDuplicateBypass,
+          selectedTasks: buildSelectedTasksPayload(parsedTaskGroups),
         },
       });
 
       if (resp && resp.ok) {
         appendLog(`任务解析批量执行完成！${formatPipelineSummary(resp.summary)}`, "success");
       } else {
-        appendLog(`批量执行报错: ${resp?.error || "未知异常"}`, "error");
+        const errMsg = String(resp?.error || "未知异常");
+        const dupMatch = errMsg.match(/账号 \[([^\]]+)\] 12小时内已发布过相同文案/);
+        if (dupMatch && typeof confirm === "function") {
+          const { publishLedger = [] } = await chrome.storage.local.get(["publishLedger"]);
+          const nowTs = Date.now();
+          const isRecentDupTask = (t) => {
+            const acct = String(t?.account || "").trim();
+            const body = String(t?.content || "").trim();
+            if (acct === dupMatch[1]) return true;
+            return publishLedger.some((item) =>
+              item && item.mode === "真实发布" && item.postUrl &&
+              item.resolvedAccount === acct &&
+              String(item.fullContent || "").trim() === body &&
+              (!item.timestamp || (nowTs - item.timestamp < 12 * 60 * 60 * 1000))
+            );
+          };
+          const remaining = parsedTaskGroups.filter((t) => !isRecentDupTask(t));
+          const skippedCount = parsedTaskGroups.length - remaining.length;
+          if (remaining.length > 0 && confirm(`账号 [${dupMatch[1]}] 12小时内已发布过相同文案。\n\n点击【确定】自动跳过 12 小时内已发过的 ${skippedCount} 条任务并继续发送其余 ${remaining.length} 条；\n点击【取消】停止（如需强制重发，请勾选【🔓 本次放行重发】后再点执行）。`)) {
+            appendLog(`已自动跳过 ${skippedCount} 条 12 小时内已发布任务，继续执行其余 ${remaining.length} 条...`, "warn");
+            resp = await chrome.runtime.sendMessage({
+              action: "START_PIPELINE",
+              config: {
+                docs: [],
+                dryRun: isDryRun,
+                silentMode: silentModeToggle ? silentModeToggle.checked : true,
+                allowDuplicateBypass,
+                selectedTasks: buildSelectedTasksPayload(remaining),
+              },
+            });
+            if (resp && resp.ok) {
+              appendLog(`任务解析批量执行完成！${formatPipelineSummary(resp.summary)}`, "success");
+            } else {
+              appendLog(`批量执行报错: ${resp?.error || "未知异常"}`, "error");
+            }
+          } else {
+            appendLog(`批量执行报错: ${errMsg}`, "error");
+          }
+        } else {
+          appendLog(`批量执行报错: ${errMsg}`, "error");
+        }
       }
     } catch (err) {
       appendLog(`通讯异常: ${err.message}`, "error");
     } finally {
+      if (parserAllowDuplicateOnceToggle) parserAllowDuplicateOnceToggle.checked = false;
+      if (btnParserRunNow) btnParserRunNow.disabled = false;
       await refreshPipelineControls();
     }
   });
@@ -3999,6 +4689,11 @@ document.addEventListener("DOMContentLoaded", async () => {
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
       .replace(/"/g, "&quot;");
+  }
+
+  function sanitizeHttpUrl(url) {
+    const raw = String(url || "").trim();
+    return /^https?:\/\//i.test(raw) ? raw : "";
   }
 
   // ── 话题置顶与主持人申请面板控制器 ──
@@ -4217,9 +4912,10 @@ document.addEventListener("DOMContentLoaded", async () => {
       const timeStamp = task.updatedAt || task.createdAt;
       const timeStr = timeStamp ? new Date(timeStamp).toLocaleTimeString("zh-CN", { hour12: false }) : "";
       const timeMeta = timeStr ? `<span class="sched-sub-meta">${timeStr}</span>` : "";
-      const postTitleHtml = task.postUrl
-        ? `<a href="${escapeHtml(task.postUrl)}" target="_blank" rel="noopener noreferrer" class="topic-post-link" title="点击在新标签页打开微博">${escapeHtml(task.postUrl)}</a>`
-        : `<span style="font-size:11px;color:var(--text-sub);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(task.text || "")}</span>`;
+      const safeTopicPostUrl = sanitizeHttpUrl(task.postUrl);
+      const postTitleHtml = safeTopicPostUrl
+        ? `<a href="${escapeHtml(safeTopicPostUrl)}" target="_blank" rel="noopener noreferrer" class="topic-post-link" title="点击在新标签页打开微博">${escapeHtml(task.postUrl)}</a>`
+        : `<span style="font-size:11px;color:var(--text-sub);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(task.text || task.postUrl || "")}</span>`;
       const textSnippet = task.postUrl && task.text
         ? `<div style="font-size:11px;color:var(--text-sub);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(task.text)}</div>`
         : "";
@@ -4367,7 +5063,9 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
   });
 
+  let manualTopicPinInFlight = false;
   async function submitManualPinUrls() {
+    if (manualTopicPinInFlight) return;
     const inp = document.getElementById("manualPinUrlInput");
     const raw = inp?.value.trim() || "";
     if (!raw) {
@@ -4378,6 +5076,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       raw.split(/[\s,，;；]+/).map((s) => s.trim()).filter(Boolean)
     ));
     const btn = document.getElementById("btnManualPinSubmit");
+    manualTopicPinInFlight = true;
     if (btn) btn.disabled = true;
     try {
       let okCount = 0;
@@ -4398,7 +5097,10 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (errors.length > 0) {
         appendLog(`[话题置顶] 手动置顶失败(${errors.length}条): ${errors[0]}`, "error");
       }
+    } catch (err) {
+      appendLog(`[话题置顶] 手动置顶通信失败: ${err.message || String(err)}`, "error");
     } finally {
+      manualTopicPinInFlight = false;
       if (btn) btn.disabled = false;
     }
   }
@@ -4518,4 +5220,1019 @@ document.addEventListener("DOMContentLoaded", async () => {
   });
 
   refreshTopicPinState();
+
+  // ── 热搜截图识别写入视图 ──
+  let cachedHotsearchConfig = null;
+  let cachedHotsearchHistory = [];
+  let hsHistoryFilter = "all";
+  const pendingHotsearchItems = [];
+  const hotsearchRetryPayloads = new Map();
+
+  function syncHotsearchBusinessPill() {
+    const toggle = document.getElementById("hsBusinessToggle");
+    const pill = document.getElementById("hsBusinessPill");
+    const tag = document.getElementById("hsBusinessTag");
+    const checked = Boolean(toggle?.checked);
+    if (pill) pill.classList.toggle("is-active", checked);
+    if (tag) tag.textContent = checked ? "商业" : "热点";
+  }
+
+  function renderHotsearchSummary(cfg) {
+    const pill = document.getElementById("hsModelSummaryPill");
+    const docText = document.getElementById("hsDocSummaryText");
+    if (pill) {
+      const pModel = cfg?.primary?.model || "未配置模型";
+      const fb = cfg?.fallback?.enabled && cfg?.fallback?.model ? ` · 兜底 ${cfg.fallback.model}` : "";
+      pill.textContent = `${pModel}${fb}`;
+    }
+    if (docText) {
+      const url = cfg?.docUrl || "";
+      const sheetId = cfg?.sheetId ? ` [${cfg.sheetId}]` : "";
+      docText.textContent = url ? `目标表：${url.replace(/^https?:\/\//, "")}${sheetId}` : "目标表：未配置";
+      docText.title = url;
+    }
+  }
+
+  function applyHotsearchConfigToForm(cfg) {
+    if (!cfg) return;
+    const setVal = (id, val) => {
+      const el = document.getElementById(id);
+      if (el) el.value = val ?? "";
+    };
+    setVal("hsPrimaryName", cfg.primary?.name || "");
+    setVal("hsPrimaryBase", cfg.primary?.apiBase || "");
+    setVal("hsPrimaryKey", cfg.primary?.apiKey || "");
+    setVal("hsPrimaryModel", cfg.primary?.model || "");
+    setVal("hsFallbackName", cfg.fallback?.name || "");
+    setVal("hsFallbackBase", cfg.fallback?.apiBase || "");
+    setVal("hsFallbackKey", cfg.fallback?.apiKey || "");
+    setVal("hsFallbackModel", cfg.fallback?.model || "");
+    setVal("hsDocUrl", cfg.docUrl || "");
+    setVal("hsSheetId", cfg.sheetId || "");
+
+    const fbToggle = document.getElementById("hsFallbackEnabled");
+    if (fbToggle) fbToggle.checked = Boolean(cfg.fallback?.enabled);
+    const bizToggle = document.getElementById("hsBusinessToggle");
+    if (bizToggle) bizToggle.checked = Boolean(cfg.businessDefault);
+    syncHotsearchBusinessPill();
+
+    renderHotsearchSummary(cfg);
+  }
+
+  function readHotsearchConfigFromForm() {
+    const getVal = (id) => String(document.getElementById(id)?.value || "").trim();
+    return {
+      docUrl: getVal("hsDocUrl"),
+      sheetId: getVal("hsSheetId"),
+      businessDefault: Boolean(document.getElementById("hsBusinessToggle")?.checked),
+      primary: {
+        name: getVal("hsPrimaryName"),
+        apiBase: getVal("hsPrimaryBase"),
+        apiKey: getVal("hsPrimaryKey"),
+        model: getVal("hsPrimaryModel"),
+      },
+      fallback: {
+        enabled: Boolean(document.getElementById("hsFallbackEnabled")?.checked),
+        name: getVal("hsFallbackName"),
+        apiBase: getVal("hsFallbackBase"),
+        apiKey: getVal("hsFallbackKey"),
+        model: getVal("hsFallbackModel"),
+      },
+    };
+  }
+
+  function renderHotsearchHistory() {
+    const container = document.getElementById("hsHistoryList");
+    const countEl = document.getElementById("hsHistoryCount");
+    if (!container) return;
+
+    const merged = [
+      ...pendingHotsearchItems,
+      ...cachedHotsearchHistory.filter((h) => h && !pendingHotsearchItems.some((p) => p.id === h.id)),
+    ];
+    if (countEl) countEl.textContent = `${merged.length} 条`;
+
+    const isSuccessStatus = (st) => st === "written" || st === "updated";
+    const counts = {
+      all: merged.length,
+      success: merged.filter((m) => isSuccessStatus(m.status)).length,
+      skipped: merged.filter((m) => m.status === "skipped").length,
+      error: merged.filter((m) => m.status === "error").length,
+    };
+    document.querySelectorAll("#hsFilterChips .filter-chip").forEach((chip) => {
+      const f = chip.getAttribute("data-hs-filter") || "all";
+      const labelMap = { all: "全部", success: "成功", skipped: "跳过", error: "失败" };
+      chip.textContent = `${labelMap[f] || f} (${counts[f] ?? 0})`;
+      chip.classList.toggle("active", f === hsHistoryFilter);
+    });
+
+    const filtered = merged.filter((item) => {
+      if (hsHistoryFilter === "success") return isSuccessStatus(item.status) || item.status === "pending";
+      if (hsHistoryFilter === "skipped") return item.status === "skipped";
+      if (hsHistoryFilter === "error") return item.status === "error";
+      return true;
+    });
+
+    if (!filtered.length) {
+      container.innerHTML = `<div class="empty-placeholder">${merged.length ? "当前筛选条件下暂无记录" : "暂无热搜写入记录，上传、多选或粘贴截图即可自动识别写入"}</div>`;
+      return;
+    }
+
+    const statusMap = {
+      pending: { cls: "is-pending", text: "⏳ 识别写入中" },
+      review: { cls: "is-review", text: "📝 待确认写入" },
+      written: { cls: "is-written", text: "✅ 新增写入" },
+      updated: { cls: "is-updated", text: "🔄 更新已有" },
+      skipped: { cls: "is-skipped", text: "⏭️ 已跳过" },
+      error: { cls: "is-error", text: "❌ 失败" },
+    };
+
+    const prevScrollTop = container.scrollTop || 0;
+    container.innerHTML = filtered.map((item) => {
+      const st = statusMap[item.status] || statusMap.error;
+      const rowBadge = item.rowNum ? `第 ${item.rowNum} 行` : "";
+      const title = item.topic || item.fileName || "未命名任务";
+      const thumbHtml = item.previewDataUrl
+        ? `<img class="hs-history-thumb is-clickable" data-hs-preview-id="${escapeHtml(item.id)}" src="${escapeHtml(item.previewDataUrl)}" alt="截图" title="点击放大查看">`
+        : `<div class="hs-history-thumb">${item.kind === "text" ? "📝" : "🖼️"}</div>`;
+
+      const metaParts = [];
+      if (rowBadge) metaParts.push(`<span>📍 ${escapeHtml(rowBadge)}</span>`);
+      if (item.duplicate) metaParts.push(`<span>♻️ 防重复用</span>`);
+      if (item.host) metaParts.push(`<span>👤 ${escapeHtml(item.host)}</span>`);
+      if (item.boardType) metaParts.push(`<span>🏷️ ${escapeHtml(item.boardType)}</span>`);
+      if (item.topicType) {
+        const cls = item.topicType === "商业" ? "is-biz" : "is-hot";
+        metaParts.push(`<span class="hs-tag-pill ${cls}">${escapeHtml(item.topicType)}</span>`);
+      }
+      if (item.listType) {
+        const cls = item.listType === "实时" ? "is-realtime" : "is-hotsearch";
+        metaParts.push(`<span class="hs-tag-pill ${cls}">${escapeHtml(item.listType)}</span>`);
+      }
+      if (item.model) {
+        metaParts.push(`<span>🤖 ${escapeHtml(item.model)}${item.usedFallback ? "(兜底)" : ""}</span>`);
+      }
+      if (item.elapsedMs) metaParts.push(`<span>${(item.elapsedMs / 1000).toFixed(1)}s</span>`);
+
+      const canRetry = item.status === "error" && (item.kind === "text" ? item.sourceText : hotsearchRetryPayloads.has(item.id));
+      const retryBtn = canRetry
+        ? `<button type="button" class="btn-xs btn-outline hs-retry-btn" data-hs-id="${escapeHtml(item.id)}">🔁 重试</button>`
+        : "";
+      const confirmBtn = item.status === "review"
+        ? `<button type="button" class="btn-xs btn-primary hs-confirm-btn" data-hs-id="${escapeHtml(item.id)}">✅ 确认写表</button>`
+        : "";
+      const errHtml = item.error ? `<div class="hs-history-error">${escapeHtml(item.error)}</div>` : "";
+      const reviewEditorHtml = item.status === "review" && Array.isArray(item.row) ? `
+        <div class="hs-review-editor" data-review-id="${escapeHtml(item.id)}">
+          <input type="text" class="ui-input hs-rev-topic" value="${escapeHtml(item.row[1] || "")}" placeholder="#话题词#">
+          <input type="text" class="ui-input hs-rev-host" value="${escapeHtml(item.row[2] || "")}" placeholder="主持人">
+          <input type="text" class="ui-input hs-rev-board" value="${escapeHtml(item.row[3] || "")}" placeholder="榜单类型">
+          <select class="ui-select hs-rev-topictype">
+            <option value="热点" ${item.row[7] !== "商业" ? "selected" : ""}>热点</option>
+            <option value="商业" ${item.row[7] === "商业" ? "selected" : ""}>商业</option>
+          </select>
+          <select class="ui-select hs-rev-listtype">
+            <option value="热搜" ${item.row[8] !== "实时" ? "selected" : ""}>热搜</option>
+            <option value="实时" ${item.row[8] === "实时" ? "selected" : ""}>实时</option>
+          </select>
+        </div>
+      ` : "";
+
+      return `
+        <div class="hs-history-item">
+          ${thumbHtml}
+          <div class="hs-history-body">
+            <div class="hs-history-top">
+              <span class="hs-history-topic" title="${escapeHtml(title)}">${escapeHtml(title)}</span>
+              <div style="display:flex;align-items:center;gap:4px;">
+                ${confirmBtn}
+                ${retryBtn}
+                <span class="hs-status-pill ${st.cls}">${st.text}</span>
+              </div>
+            </div>
+            <div class="hs-history-meta">${metaParts.join("")}</div>
+            ${reviewEditorHtml}
+            ${errHtml}
+          </div>
+        </div>
+      `;
+    }).join("");
+
+    const retryableErrors = merged.filter(
+      (item) => item.status === "error" && (item.kind === "text" ? item.sourceText : hotsearchRetryPayloads.has(item.id))
+    );
+    const retryAllBtn = document.getElementById("btnHsRetryAllFailed");
+    if (retryAllBtn) {
+      retryAllBtn.style.display = retryableErrors.length > 0 ? "inline-flex" : "none";
+      retryAllBtn.textContent = `🔁 重试失败 (${retryableErrors.length})`;
+    }
+
+    container.querySelectorAll(".hs-history-thumb.is-clickable").forEach((img) => {
+      img.addEventListener("click", () => {
+        const id = img.getAttribute("data-hs-preview-id");
+        const full = id && hotsearchRetryPayloads.get(id)?.imageDataUrl;
+        const src = full || img.getAttribute("src");
+        if (src && typeof openImagePreview === "function") {
+          openImagePreview([src], 0);
+        }
+      });
+    });
+
+    container.querySelectorAll(".hs-confirm-btn").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const id = btn.getAttribute("data-hs-id");
+        const item = cachedHotsearchHistory.find((h) => h.id === id);
+        const editor = container.querySelector(`.hs-review-editor[data-review-id="${id}"]`);
+        if (!item || !Array.isArray(item.row)) return;
+        const nextRow = [...item.row];
+        if (editor) {
+          nextRow[1] = String(editor.querySelector(".hs-rev-topic")?.value || nextRow[1]).trim();
+          nextRow[2] = String(editor.querySelector(".hs-rev-host")?.value || "").trim();
+          nextRow[3] = String(editor.querySelector(".hs-rev-board")?.value || "").trim();
+          nextRow[7] = String(editor.querySelector(".hs-rev-topictype")?.value || "热点").trim();
+          nextRow[8] = String(editor.querySelector(".hs-rev-listtype")?.value || "热搜").trim();
+        }
+        btn.disabled = true;
+        btn.textContent = "⏳ 写入中...";
+        try {
+          const resp = await chrome.runtime.sendMessage({
+            action: "WRITE_HOTSEARCH_PREPARED_ROW",
+            payload: {
+              id,
+              row: nextRow,
+              fileName: item.fileName,
+              previewDataUrl: item.previewDataUrl || "",
+              model: item.model || "",
+              providerName: item.providerName || "",
+              usedFallback: Boolean(item.usedFallback),
+            },
+          });
+          if (resp?.record) {
+            cachedHotsearchHistory = [
+              resp.record,
+              ...cachedHotsearchHistory.filter((h) => h && h.id !== resp.record.id),
+            ].slice(0, 50);
+            renderHotsearchHistory();
+          }
+        } finally {
+          btn.disabled = false;
+        }
+      });
+    });
+
+    container.querySelectorAll(".hs-retry-btn").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const id = btn.getAttribute("data-hs-id");
+        const item = cachedHotsearchHistory.find((h) => h.id === id);
+        if (!item) return;
+        if (item.kind === "text" && item.sourceText) {
+          await submitHotsearchText(item.sourceText, id);
+        } else if (hotsearchRetryPayloads.has(id)) {
+          const savedPayload = hotsearchRetryPayloads.get(id);
+          await submitHotsearchImagePayload({ ...savedPayload, id });
+        }
+      });
+    });
+
+    if (prevScrollTop > 0) {
+      container.scrollTop = prevScrollTop;
+    }
+  }
+
+  function renderHotsearchBatchProgress(batchState) {
+    const progressWrap = document.getElementById("hsBatchProgressWrap");
+    const progressText = document.getElementById("hsBatchProgressText");
+    const progressPct = document.getElementById("hsBatchProgressPct");
+    const progressBar = document.getElementById("hsBatchProgressBar");
+    if (!progressWrap || !batchState || !batchState.total) return;
+
+    const total = Number(batchState.total) || 0;
+    const completed = Number(batchState.completed) || 0;
+    const pct = total > 0 ? Math.min(100, Math.round((completed / total) * 100)) : 0;
+    progressWrap.style.display = "block";
+    if (progressPct) progressPct.textContent = `${pct}%`;
+    if (progressBar) progressBar.style.width = `${pct}%`;
+    if (progressText) {
+      if (batchState.isRunning) {
+        progressText.textContent = `⏳ 后台并发处理中 (${completed}/${total})，关闭弹窗也不会中断...`;
+      } else {
+        progressText.textContent = `✅ 本批 ${total} 项处理完成：成功 ${batchState.written || 0} · 跳过 ${batchState.skipped || 0} · 失败 ${batchState.error || 0}`;
+      }
+    }
+  }
+
+  async function refreshHotsearchState() {
+    try {
+      const resp = await chrome.runtime.sendMessage({ action: "GET_HOTSEARCH_STATE" });
+      if (resp?.ok) {
+        cachedHotsearchConfig = resp.config || null;
+        cachedHotsearchHistory = Array.isArray(resp.history) ? resp.history : [];
+        if (resp.batchState && resp.batchState.isRunning) {
+          pendingHotsearchItems.length = 0;
+          pendingHotsearchItems.push(...(resp.batchState.pendingItems || []));
+          renderHotsearchBatchProgress(resp.batchState);
+        }
+        applyHotsearchConfigToForm(cachedHotsearchConfig);
+        renderHotsearchHistory();
+      }
+    } catch (err) {
+      appendLog(`[热搜写入] 读取状态失败: ${err?.message || err}`, "error");
+    }
+  }
+
+  async function compressHotsearchImageFile(file) {
+    const rawUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ""));
+      reader.onerror = () => reject(new Error("读取图片文件失败"));
+      reader.readAsDataURL(file);
+    });
+
+    if (typeof Image === "undefined" || typeof document === "undefined") {
+      return { imageDataUrl: rawUrl, previewDataUrl: rawUrl };
+    }
+
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const maxW = 1280;
+          const scale = img.width > maxW ? maxW / img.width : 1;
+          const w = Math.max(1, Math.round(img.width * scale));
+          const h = Math.max(1, Math.round(img.height * scale));
+          const canvas = document.createElement("canvas");
+          canvas.width = w;
+          canvas.height = h;
+          const ctx = canvas.getContext("2d");
+          ctx.fillStyle = "#FFFFFF";
+          ctx.fillRect(0, 0, w, h);
+          ctx.drawImage(img, 0, 0, w, h);
+          const imageDataUrl = canvas.toDataURL("image/jpeg", 0.8);
+
+          const thumbMax = 96;
+          const tScale = Math.min(1, thumbMax / Math.max(img.width, img.height));
+          const tw = Math.max(1, Math.round(img.width * tScale));
+          const th = Math.max(1, Math.round(img.height * tScale));
+          const tCanvas = document.createElement("canvas");
+          tCanvas.width = tw;
+          tCanvas.height = th;
+          const tCtx = tCanvas.getContext("2d");
+          tCtx.fillStyle = "#FFFFFF";
+          tCtx.fillRect(0, 0, tw, th);
+          tCtx.drawImage(img, 0, 0, tw, th);
+          const previewDataUrl = tCanvas.toDataURL("image/jpeg", 0.65);
+
+          resolve({ imageDataUrl, previewDataUrl });
+        } catch (_) {
+          resolve({ imageDataUrl: rawUrl, previewDataUrl: "" });
+        }
+      };
+      img.onerror = () => resolve({ imageDataUrl: rawUrl, previewDataUrl: "" });
+      img.src = rawUrl;
+    });
+  }
+
+  async function submitHotsearchImagePayload(payload) {
+    const id = payload.id || `hs_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    hotsearchRetryPayloads.set(id, { ...payload, id });
+    const pendingItem = {
+      id,
+      kind: "image",
+      fileName: payload.fileName || "截图.png",
+      previewDataUrl: payload.previewDataUrl || "",
+      status: "pending",
+      topic: payload.fileName || "正在识图...",
+      createdAt: Date.now(),
+    };
+    const existingIdx = pendingHotsearchItems.findIndex((p) => p.id === id);
+    if (existingIdx >= 0) pendingHotsearchItems[existingIdx] = pendingItem;
+    else pendingHotsearchItems.unshift(pendingItem);
+    renderHotsearchHistory();
+
+    try {
+      const resp = await chrome.runtime.sendMessage({
+        action: "PROCESS_HOTSEARCH_IMAGE",
+        payload: { ...payload, id },
+      });
+      const doneIdx = pendingHotsearchItems.findIndex((p) => p.id === id);
+      if (doneIdx >= 0) pendingHotsearchItems.splice(doneIdx, 1);
+
+      if (resp?.record) {
+        cachedHotsearchHistory = [
+          resp.record,
+          ...cachedHotsearchHistory.filter((h) => h && h.id !== resp.record.id),
+        ].slice(0, 50);
+        if (resp.record.status !== "error") {
+          hotsearchRetryPayloads.delete(id);
+        }
+      }
+      renderHotsearchHistory();
+    } catch (err) {
+      const doneIdx = pendingHotsearchItems.findIndex((p) => p.id === id);
+      if (doneIdx >= 0) pendingHotsearchItems.splice(doneIdx, 1);
+      cachedHotsearchHistory = [
+        {
+          id,
+          kind: "image",
+          fileName: payload.fileName,
+          previewDataUrl: payload.previewDataUrl || "",
+          status: "error",
+          error: err?.message || String(err),
+          createdAt: Date.now(),
+        },
+        ...cachedHotsearchHistory.filter((h) => h && h.id !== id),
+      ].slice(0, 50);
+      renderHotsearchHistory();
+    }
+  }
+
+  const hsStagedImages = [];
+
+  function updateHotsearchSubmitBtn() {
+    const btn = document.getElementById("btnHsProcessText");
+    if (!btn || btn.disabled) return;
+    const imgCount = hsStagedImages.length;
+    const hasText = Boolean(String(document.getElementById("hsTextInput")?.value || "").trim());
+    if (imgCount > 0 && hasText) {
+      btn.textContent = `🚀 写入 (${imgCount}图+文字)`;
+    } else if (imgCount > 0) {
+      btn.textContent = `🚀 写入 (${imgCount}张)`;
+    } else {
+      btn.textContent = "🚀 立即写入";
+    }
+  }
+
+  function renderHotsearchStaged() {
+    const wrap = document.getElementById("hsPendingWrap");
+    const countEl = document.getElementById("hsStagedCount");
+    const listEl = document.getElementById("hsThumbsList");
+    if (!wrap || !listEl) return;
+
+    if (!hsStagedImages.length) {
+      wrap.style.display = "none";
+      listEl.innerHTML = "";
+      if (countEl) countEl.textContent = "0";
+      updateHotsearchSubmitBtn();
+      return;
+    }
+
+    wrap.style.display = "block";
+    if (countEl) countEl.textContent = String(hsStagedImages.length);
+    listEl.innerHTML = hsStagedImages.map((item, idx) => `
+      <div class="hs-thumb-card" title="${escapeHtml(item.fileName)}（点击放大预览）">
+        <img src="${escapeHtml(item.previewUrl)}" data-stage-idx="${idx}" alt="${escapeHtml(item.fileName)}">
+        <button type="button" class="hs-thumb-remove" data-stage-id="${escapeHtml(item.id)}" title="移除这张截图">✕</button>
+      </div>
+    `).join("");
+
+    listEl.querySelectorAll("img[data-stage-idx]").forEach((img) => {
+      img.addEventListener("click", () => {
+        const idx = Number(img.getAttribute("data-stage-idx")) || 0;
+        const urls = hsStagedImages.map((it) => it.previewUrl).filter(Boolean);
+        if (urls.length && typeof openImagePreview === "function") {
+          openImagePreview(urls, idx);
+        }
+      });
+    });
+
+    listEl.querySelectorAll(".hs-thumb-remove").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const sid = btn.getAttribute("data-stage-id");
+        const idx = hsStagedImages.findIndex((it) => it.id === sid);
+        if (idx >= 0) {
+          hsStagedImages.splice(idx, 1);
+          renderHotsearchStaged();
+        }
+      });
+    });
+
+    updateHotsearchSubmitBtn();
+  }
+
+  async function stageHotsearchFiles(files) {
+    const imageFiles = Array.from(files || []).filter((f) => f && /^image\//i.test(f.type || ""));
+    if (!imageFiles.length) return;
+
+    for (let i = 0; i < imageFiles.length; i++) {
+      const f = imageFiles[i];
+      const isFileDup = f.name && f.size > 0 && f.lastModified > 0 && hsStagedImages.some(
+        (q) => q.fileName === f.name && q.file.size === f.size && q.file.lastModified === f.lastModified
+      );
+      if (isFileDup) continue;
+
+      const previewUrl = await new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ""));
+        reader.onerror = () => resolve("");
+        reader.readAsDataURL(f);
+      });
+      if (!previewUrl) continue;
+
+      hsStagedImages.push({
+        id: `stg_${Date.now()}_${i}_${Math.random().toString(36).slice(2, 6)}`,
+        file: f,
+        fileName: f.name || `截图_${hsStagedImages.length + 1}.png`,
+        previewUrl,
+      });
+    }
+    renderHotsearchStaged();
+  }
+
+  async function handleHotsearchFiles(files) {
+    const imageFiles = Array.from(files || []).filter((f) => f && /^image\//i.test(f.type || ""));
+    if (!imageFiles.length) return;
+    const business = Boolean(document.getElementById("hsBusinessToggle")?.checked);
+
+    const progressWrap = document.getElementById("hsBatchProgressWrap");
+    const progressText = document.getElementById("hsBatchProgressText");
+    const progressPct = document.getElementById("hsBatchProgressPct");
+    const progressBar = document.getElementById("hsBatchProgressBar");
+
+    const total = imageFiles.length;
+    if (progressWrap) progressWrap.style.display = "block";
+    if (progressText) progressText.textContent = `⏳ 正在准备 ${total} 张截图...`;
+    if (progressPct) progressPct.textContent = "0%";
+    if (progressBar) progressBar.style.width = "0%";
+
+    const prepared = await Promise.all(
+      imageFiles.map(async (file, idx) => {
+        const { imageDataUrl, previewDataUrl } = await compressHotsearchImageFile(file);
+        const id = `hs_${Date.now()}_${idx}_${Math.random().toString(36).slice(2, 6)}`;
+        return {
+          id,
+          fileName: file.name || `截图_${idx + 1}.jpg`,
+          imageDataUrl,
+          previewDataUrl,
+          business,
+        };
+      })
+    );
+
+    // 全部压缩完成后立即在列表中占位显示，随后并发识图写入
+    for (const item of prepared) {
+      hotsearchRetryPayloads.set(item.id, item);
+      pendingHotsearchItems.unshift({
+        id: item.id,
+        kind: "image",
+        fileName: item.fileName,
+        previewDataUrl: item.previewDataUrl || "",
+        status: "pending",
+        topic: item.fileName,
+        createdAt: Date.now(),
+      });
+    }
+    renderHotsearchHistory();
+
+    let completed = 0;
+    let writtenCount = 0;
+    let skippedCount = 0;
+    let errorCount = 0;
+    const updateBatchProgress = () => {
+      const pct = Math.round((completed / total) * 100);
+      if (progressPct) progressPct.textContent = `${pct}%`;
+      if (progressBar) progressBar.style.width = `${pct}%`;
+      if (progressText) {
+        if (completed < total) {
+          progressText.textContent = `⏳ 正在并发识图与写表 (${completed}/${total})...`;
+        } else {
+          progressText.textContent = `✅ 本批 ${total} 张处理完成：成功 ${writtenCount} · 跳过 ${skippedCount} · 失败 ${errorCount}`;
+        }
+      }
+    };
+    updateBatchProgress();
+
+    const concurrency = Math.min(3, prepared.length);
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < prepared.length) {
+        const current = prepared[cursor++];
+        try {
+          const resp = await chrome.runtime.sendMessage({
+            action: "PROCESS_HOTSEARCH_IMAGE",
+            payload: current,
+          });
+          const doneIdx = pendingHotsearchItems.findIndex((p) => p.id === current.id);
+          if (doneIdx >= 0) pendingHotsearchItems.splice(doneIdx, 1);
+
+          if (resp?.record) {
+            cachedHotsearchHistory = [
+              resp.record,
+              ...cachedHotsearchHistory.filter((h) => h && h.id !== resp.record.id),
+            ].slice(0, 50);
+            if (resp.record.status === "written" || resp.record.status === "updated") {
+              writtenCount += 1;
+              hotsearchRetryPayloads.delete(current.id);
+            } else if (resp.record.status === "skipped") {
+              skippedCount += 1;
+              hotsearchRetryPayloads.delete(current.id);
+            } else {
+              errorCount += 1;
+            }
+          } else {
+            errorCount += 1;
+          }
+        } catch (err) {
+          errorCount += 1;
+          const doneIdx = pendingHotsearchItems.findIndex((p) => p.id === current.id);
+          if (doneIdx >= 0) pendingHotsearchItems.splice(doneIdx, 1);
+          cachedHotsearchHistory = [
+            {
+              id: current.id,
+              kind: "image",
+              fileName: current.fileName,
+              previewDataUrl: current.previewDataUrl || "",
+              status: "error",
+              error: err?.message || String(err),
+              createdAt: Date.now(),
+            },
+            ...cachedHotsearchHistory.filter((h) => h && h.id !== current.id),
+          ].slice(0, 50);
+        }
+        completed += 1;
+        updateBatchProgress();
+        renderHotsearchHistory();
+      }
+    };
+
+    await Promise.all(Array.from({ length: concurrency }, () => worker()));
+  }
+
+  async function submitHotsearchText(text, customId = "") {
+    const clean = String(text || "").trim();
+    if (!clean) return;
+    const business = Boolean(document.getElementById("hsBusinessToggle")?.checked);
+    const id = customId || `hs_txt_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const resp = await chrome.runtime.sendMessage({
+      action: "PROCESS_HOTSEARCH_TEXT",
+      payload: { id, text: clean, business },
+    });
+    if (resp?.record) {
+      cachedHotsearchHistory = [
+        resp.record,
+        ...cachedHotsearchHistory.filter((h) => h && h.id !== resp.record.id),
+      ].slice(0, 50);
+      renderHotsearchHistory();
+    }
+    return resp;
+  }
+
+  document.getElementById("btnHsToggleConfig")?.addEventListener("click", () => {
+    const drawer = document.getElementById("hsConfigDrawer");
+    if (!drawer) return;
+    drawer.style.display = drawer.style.display === "none" ? "block" : "none";
+  });
+
+  document.getElementById("btnHsOpenDoc")?.addEventListener("click", () => {
+    const url = String(document.getElementById("hsDocUrl")?.value || cachedHotsearchConfig?.docUrl || "").trim();
+    if (url.startsWith("http")) {
+      chrome.tabs.create({ url });
+    }
+  });
+
+  document.querySelectorAll(".hs-toggle-eye").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const targetId = btn.getAttribute("data-target");
+      const input = targetId ? document.getElementById(targetId) : null;
+      if (!input) return;
+      input.type = input.type === "password" ? "text" : "password";
+    });
+  });
+
+  document.getElementById("btnHsSaveConfig")?.addEventListener("click", async () => {
+    const nextCfg = readHotsearchConfigFromForm();
+    const resp = await chrome.runtime.sendMessage({ action: "SAVE_HOTSEARCH_CONFIG", config: nextCfg });
+    if (resp?.ok) {
+      cachedHotsearchConfig = resp.config;
+      applyHotsearchConfigToForm(resp.config);
+      appendLog("[热搜写入] 模型与表格配置已保存", "success");
+    } else {
+      appendLog(`[热搜写入] 保存配置失败: ${resp?.error || "未知错误"}`, "error");
+    }
+  });
+
+  document.getElementById("btnHsResetConfig")?.addEventListener("click", async () => {
+    const resp = await chrome.runtime.sendMessage({ action: "RESET_HOTSEARCH_CONFIG" });
+    if (resp?.ok) {
+      cachedHotsearchConfig = resp.config;
+      applyHotsearchConfigToForm(resp.config);
+      appendLog("[热搜写入] 已恢复默认大模型与表格配置", "info");
+    }
+  });
+
+  document.getElementById("btnHsFetchPrimaryModels")?.addEventListener("click", async () => {
+    const apiBase = String(document.getElementById("hsPrimaryBase")?.value || "").trim();
+    const apiKey = String(document.getElementById("hsPrimaryKey")?.value || "").trim();
+    const sel = document.getElementById("hsPrimaryModelSelect");
+    try {
+      const resp = await chrome.runtime.sendMessage({
+        action: "FETCH_HOTSEARCH_MODELS",
+        endpoint: { apiBase, apiKey },
+      });
+      if (!resp?.ok || !Array.isArray(resp.models) || !resp.models.length) {
+        appendLog(`[热搜写入] 拉取模型列表失败: ${resp?.error || "未返回模型"}`, "warn");
+        return;
+      }
+      if (sel) {
+        sel.innerHTML = `<option value="">-- 选择已拉取的模型 (${resp.models.length}) --</option>` +
+          resp.models.map((m) => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join("");
+        sel.style.display = "block";
+      }
+      appendLog(`[热搜写入] 已拉取 ${resp.models.length} 个可用模型`, "success");
+    } catch (err) {
+      appendLog(`[热搜写入] 拉取模型失败: ${err?.message || err}`, "error");
+    }
+  });
+
+  document.getElementById("hsPrimaryModelSelect")?.addEventListener("change", (e) => {
+    const val = String(e.target?.value || "").trim();
+    const input = document.getElementById("hsPrimaryModel");
+    if (val && input) input.value = val;
+  });
+
+  const hsDropzone = document.getElementById("hsDropzone");
+  const hsFileInput = document.getElementById("hsFileInput");
+  hsFileInput?.addEventListener("change", (e) => {
+    stageHotsearchFiles(e.target?.files);
+    e.target.value = "";
+  });
+  hsDropzone?.addEventListener("dragover", (e) => {
+    e.preventDefault();
+    hsDropzone.classList.add("is-dragover");
+  });
+  hsDropzone?.addEventListener("dragleave", () => {
+    hsDropzone.classList.remove("is-dragover");
+  });
+  hsDropzone?.addEventListener("drop", (e) => {
+    e.preventDefault();
+    hsDropzone.classList.remove("is-dragover");
+    stageHotsearchFiles(e.dataTransfer?.files);
+  });
+
+  document.addEventListener("paste", (e) => {
+    if (activeTabName !== "hotsearch") return;
+    const items = Array.from(e.clipboardData?.items || []);
+    const imgFiles = items
+      .filter((it) => it.kind === "file" && /^image\//i.test(it.type))
+      .map((it) => it.getAsFile())
+      .filter(Boolean);
+    if (imgFiles.length) {
+      e.preventDefault();
+      stageHotsearchFiles(imgFiles);
+    }
+  });
+
+  document.getElementById("btnHsClearStaged")?.addEventListener("click", () => {
+    hsStagedImages.length = 0;
+    renderHotsearchStaged();
+  });
+
+  document.getElementById("hsTextInput")?.addEventListener("input", updateHotsearchSubmitBtn);
+  document.getElementById("hsTextInput")?.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+      e.preventDefault();
+      document.getElementById("btnHsProcessText")?.click();
+    }
+  });
+
+  document.getElementById("hsBusinessToggle")?.addEventListener("change", syncHotsearchBusinessPill);
+
+  document.getElementById("btnHsPickImages")?.addEventListener("click", () => {
+    hsFileInput?.click();
+  });
+
+  document.querySelectorAll("#hsFilterChips .filter-chip").forEach((chip) => {
+    chip.addEventListener("click", () => {
+      hsHistoryFilter = chip.getAttribute("data-hs-filter") || "all";
+      renderHotsearchHistory();
+    });
+  });
+
+  async function runHotsearchEndpointTest(prefix) {
+    const resultEl = document.getElementById(`hs${prefix}TestResult`);
+    const btn = document.getElementById(`btnHsTest${prefix}`);
+    const apiBase = String(document.getElementById(`hs${prefix}Base`)?.value || "").trim();
+    const apiKey = String(document.getElementById(`hs${prefix}Key`)?.value || "").trim();
+    const model = String(document.getElementById(`hs${prefix}Model`)?.value || "").trim();
+    if (resultEl) {
+      resultEl.className = "hs-test-result";
+      resultEl.textContent = "测试中...";
+    }
+    if (btn) btn.disabled = true;
+    try {
+      const resp = await chrome.runtime.sendMessage({
+        action: "TEST_HOTSEARCH_ENDPOINT",
+        endpoint: { apiBase, apiKey, model },
+      });
+      if (resp?.ok) {
+        if (resultEl) {
+          resultEl.className = "hs-test-result is-ok";
+          resultEl.textContent = `✅ 连通 (${resp.latencyMs}ms)`;
+        }
+      } else {
+        if (resultEl) {
+          resultEl.className = "hs-test-result is-err";
+          resultEl.textContent = `❌ ${resp?.error || "失败"}`.slice(0, 42);
+        }
+      }
+    } catch (err) {
+      if (resultEl) {
+        resultEl.className = "hs-test-result is-err";
+        resultEl.textContent = `❌ ${err?.message || err}`.slice(0, 42);
+      }
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  document.getElementById("btnHsTestPrimary")?.addEventListener("click", () => runHotsearchEndpointTest("Primary"));
+  document.getElementById("btnHsTestFallback")?.addEventListener("click", () => runHotsearchEndpointTest("Fallback"));
+
+  onHotsearchBatchProgress = (msg) => {
+    if (msg.batchState) {
+      pendingHotsearchItems.length = 0;
+      pendingHotsearchItems.push(...(msg.batchState.pendingItems || []));
+      renderHotsearchBatchProgress(msg.batchState);
+    }
+    if (msg.record) {
+      cachedHotsearchHistory = [
+        msg.record,
+        ...cachedHotsearchHistory.filter((h) => h && h.id !== msg.record.id),
+      ].slice(0, 50);
+      if (msg.record.status !== "error") {
+        hotsearchRetryPayloads.delete(msg.record.id);
+      }
+    }
+    renderHotsearchHistory();
+  };
+
+  document.getElementById("btnHsProcessText")?.addEventListener("click", async () => {
+    const input = document.getElementById("hsTextInput");
+    const btn = document.getElementById("btnHsProcessText");
+    const text = String(input?.value || "").trim();
+    const stagedFiles = hsStagedImages.map((s) => s.file);
+    if (!text && !stagedFiles.length) return;
+
+    const business = Boolean(document.getElementById("hsBusinessToggle")?.checked);
+    const autoWriteEl = document.getElementById("hsAutoWriteToggle");
+    const autoWrite = autoWriteEl ? Boolean(autoWriteEl.checked) : true;
+
+    hsStagedImages.length = 0;
+    renderHotsearchStaged();
+    if (input && text) input.value = "";
+
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "⏳ 提交中...";
+    }
+    try {
+      if (stagedFiles.length > 0) {
+        const prepared = await Promise.all(
+          stagedFiles.map(async (file, idx) => {
+            const { imageDataUrl, previewDataUrl } = await compressHotsearchImageFile(file);
+            const id = `hs_${Date.now()}_${idx}_${Math.random().toString(36).slice(2, 6)}`;
+            const payload = {
+              id,
+              fileName: file.name || `截图_${idx + 1}.jpg`,
+              imageDataUrl,
+              previewDataUrl,
+              business,
+            };
+            hotsearchRetryPayloads.set(id, payload);
+            return payload;
+          })
+        );
+        const resp = await chrome.runtime.sendMessage({
+          action: "PROCESS_HOTSEARCH_BATCH",
+          payload: { items: prepared, text, business, autoWrite },
+        });
+        if (!resp?.ok) {
+          appendLog(`[热搜写入] 批量提交失败: ${resp?.error || "未知错误"}`, "error");
+        }
+      } else if (text) {
+        await submitHotsearchText(text);
+      }
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+      }
+      updateHotsearchSubmitBtn();
+    }
+  });
+
+  document.getElementById("btnHsRetryAllFailed")?.addEventListener("click", async () => {
+    const retryable = cachedHotsearchHistory.filter(
+      (item) => item && item.status === "error" && (item.kind === "text" ? item.sourceText : hotsearchRetryPayloads.has(item.id))
+    );
+    if (!retryable.length) return;
+    await Promise.all(
+      retryable.map((item) => {
+        if (item.kind === "text" && item.sourceText) {
+          return submitHotsearchText(item.sourceText, item.id);
+        }
+        const savedPayload = hotsearchRetryPayloads.get(item.id);
+        return savedPayload ? submitHotsearchImagePayload({ ...savedPayload, id: item.id }) : Promise.resolve();
+      })
+    );
+  });
+
+  document.getElementById("btnHsClearHistory")?.addEventListener("click", async () => {
+    const resp = await chrome.runtime.sendMessage({ action: "CLEAR_HOTSEARCH_HISTORY" });
+    if (resp?.ok) {
+      cachedHotsearchHistory = [];
+      pendingHotsearchItems.length = 0;
+      hotsearchRetryPayloads.clear();
+      renderHotsearchHistory();
+    }
+  });
+
+  // ── 全套配置导出与导入 ──
+  const EXPORT_CONFIG_KEYS = [
+    "docSlots",
+    "docUrl",
+    "linkCol",
+    "dryRun",
+    "silentMode",
+    "supportedAccounts",
+    "disabledAccounts",
+    "accountAliases",
+    "taskParserStripKeywords",
+    "topicPinConfig",
+    "hotsearchConfig",
+  ];
+
+  async function buildAllConfigPayload() {
+    const data = await chrome.storage.local.get(EXPORT_CONFIG_KEYS);
+    return {
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      config: data,
+    };
+  }
+
+  document.getElementById("btnExportAllConfig")?.addEventListener("click", async () => {
+    const payload = await buildAllConfigPayload();
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const d = new Date();
+    const ymd = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`;
+    a.href = url;
+    a.download = `weibo-sync-config-${ymd}.json`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    appendLog("已导出全套配置 JSON", "success");
+  });
+
+  document.getElementById("btnCopyAllConfig")?.addEventListener("click", async () => {
+    const payload = await buildAllConfigPayload();
+    const ok = await writeTextToClipboard(JSON.stringify(payload, null, 2));
+    appendLog(ok ? "已复制全套配置 JSON 到剪贴板" : "复制配置失败，请检查剪贴板权限", ok ? "success" : "error");
+  });
+
+  const importAllInput = document.getElementById("importAllConfigInput");
+  document.getElementById("btnImportAllConfig")?.addEventListener("click", () => {
+    importAllInput?.click();
+  });
+
+  importAllInput?.addEventListener("change", async (e) => {
+    const file = e.target?.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    try {
+      const rawText = await file.text();
+      const parsed = JSON.parse(rawText);
+      const src = parsed && typeof parsed.config === "object" ? parsed.config : parsed;
+      if (!src || typeof src !== "object") {
+        throw new Error("配置文件格式无效");
+      }
+      const next = {};
+      for (const key of EXPORT_CONFIG_KEYS) {
+        if (src[key] !== undefined) next[key] = src[key];
+      }
+      if (!Object.keys(next).length) {
+        throw new Error("未在文件中找到可导入的配置项");
+      }
+      await chrome.storage.local.set(next);
+      if (next.topicPinConfig) {
+        await chrome.runtime.sendMessage({ action: "SAVE_TOPIC_PIN_CONFIG", config: next.topicPinConfig }).catch(() => {});
+      }
+      if (next.hotsearchConfig) {
+        await chrome.runtime.sendMessage({ action: "SAVE_HOTSEARCH_CONFIG", config: next.hotsearchConfig }).catch(() => {});
+      }
+      appendLog(`成功导入 ${Object.keys(next).length} 项配置，正在刷新界面...`, "success");
+      setTimeout(() => {
+        if (typeof location !== "undefined" && location.reload) location.reload();
+      }, 600);
+    } catch (err) {
+      appendLog(`导入配置失败: ${err?.message || err}`, "error");
+    }
+  });
+
+  chrome?.storage?.local?.get?.(["lastActivePopupTab"]).then((res) => {
+    const savedTab = res?.lastActivePopupTab;
+    if (savedTab && tabOrder.includes(savedTab) && savedTab !== activeTabName) {
+      switchTab(savedTab, false);
+    }
+  }).catch(() => {});
 });

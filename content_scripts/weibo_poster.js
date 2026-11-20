@@ -7,6 +7,8 @@
 (function () {
   console.log("[WeiboPoster] Content script loaded on AI publish platform:", window.location.href);
 
+  let postInFlight = false;
+
   chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (request.action === "PING_WEIBO") {
       const isPlatform = window.location.hostname.includes("ai-publish-platform.weibo.com");
@@ -19,9 +21,19 @@
     }
 
     if (request.action === "POST_WEIBO_TASK") {
+      if (postInFlight) {
+        sendResponse({ ok: false, error: "已有发布任务正在执行，请等待完成后重试" });
+        return true;
+      }
+      postInFlight = true;
       handlePostOnPlatform(request.task || {}, request.dryRun !== false)
-        .then((result) => sendResponse({ ok: true, data: result }))
-        .catch((err) => sendResponse({ ok: false, error: err.message || String(err) }));
+        .then((result) => {
+          postInFlight = false;
+          sendResponse({ ok: true, data: result });
+        }, (err) => {
+          postInFlight = false;
+          sendResponse({ ok: false, error: err.message || String(err) });
+        });
       return true;
     }
   });
@@ -110,19 +122,33 @@
     return false;
   }
 
-  /**
-   * 取消当前所有已选中的账号（防串号多发）
-   */
+  const CHECKED_ACCOUNT_SELECTOR = '.n-checkbox.n-checkbox--checked, .n-checkbox.is-checked, [role="checkbox"][aria-checked="true"]';
+
+  /** 逐分类取消选中，覆盖仅在切换后挂载的账号。 */
   async function clearAllCheckedAccounts() {
-    const checkedBoxes = document.querySelectorAll(
-      '.n-checkbox.n-checkbox--checked, .n-checkbox.is-checked, [role="checkbox"][aria-checked="true"]'
-    );
-    for (const cb of checkedBoxes) {
-      cb.click();
+    for (const tab of [null, ...ACCOUNT_TABS]) {
+      if (tab && !(await switchAccountTab(tab))) continue;
+      const checkedBoxes = document.querySelectorAll(CHECKED_ACCOUNT_SELECTOR);
+      for (const cb of checkedBoxes) cb.click();
+      if (checkedBoxes.length > 0) await new Promise((r) => setTimeout(r, 200));
     }
-    if (checkedBoxes.length > 0) {
-      await new Promise((r) => setTimeout(r, 200));
+  }
+
+  /** 跨分类只读校验，不用重新勾选掩盖账号状态变化。 */
+  async function assertOnlyTargetAccount(targetAccount) {
+    const target = normalizeText(targetAccount);
+    let foundTarget = false;
+    for (const tab of [null, ...ACCOUNT_TABS]) {
+      if (tab && !(await switchAccountTab(tab))) continue;
+      for (const cb of document.querySelectorAll(CHECKED_ACCOUNT_SELECTOR)) {
+        const name = cb.innerText || cb.textContent || "";
+        if (normalizeText(name) !== target) {
+          throw new Error(`存在其他已选账号 [${name.trim()}]，无法确认唯一目标账号，已阻断发送`);
+        }
+        foundTarget = true;
+      }
     }
+    if (!foundTarget) throw new Error(`目标账号 [${targetAccount}] 未选中，已阻断发送`);
   }
 
   /**
@@ -246,9 +272,10 @@
    * 中台发稿总流程
    */
   async function handlePostOnPlatform(task, isDryRun) {
-    const targetAccount = (task.account || "").trim();
+    const targetAccount = typeof task.account === "string" ? task.account.trim() : "";
     const content = (task.content || "").trim();
 
+    if (!targetAccount) throw new Error("必须明确指定发布账号，禁止沿用页面已选账号");
     if (!content) throw new Error("待发内容为空");
     if (window.location.hostname !== "ai-publish-platform.weibo.com") throw new Error("当前页面不是发稿中台，已阻断操作");
     if (task.poll || task.imgUrls?.length || task.imagesData?.length) {
@@ -268,8 +295,10 @@
       }
     }
 
-    // 2. 填充正文内容
+    // 2. 填充前与提交前均跨分类校验，任何残留或账号丢失都阻断。
+    await assertOnlyTargetAccount(targetAccount);
     await fillContentTextarea(content);
+    await assertOnlyTargetAccount(targetAccount);
 
     // 3. 检查最终发布按钮
     const publishBtn = findFinalPublishButton();
